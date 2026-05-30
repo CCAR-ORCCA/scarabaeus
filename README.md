@@ -46,12 +46,11 @@ SCB interfaces with [NASA SPICE](https://naif.jpl.nasa.gov/naif/toolkit.html) fo
 4. [Installation](#installation)
    - [User Installation](#user-installation)
    - [Developer Installation](#developer-installation)
-5. [Quick Start](#quick-start)
-6. [Tutorials](#tutorials)
-7. [Testing](#testing)
-8. [Contributing](#contributing)
-9. [Citing Scarabaeus](#citing-scarabaeus)
-10. [License](#license)
+5. [Tutorials](#tutorials)
+6. [Testing](#testing)
+7. [Contributing](#contributing)
+8. [Citing Scarabaeus](#citing-scarabaeus)
+9. [License](#license)
 
 ---
 
