@@ -74,9 +74,10 @@ Performance
 Real Measurement Models
 ^^^^^^^^^^^^^^^^^^^^^^^
 
-- Real radiometric measurement models do not yet fully support proper
-  geocentric-frame computations
-- Partial derivatives with respect to light-time corrections are not yet implemented
+- Real radiometric measurement models assume the spacecraft is outside Earth's
+  sphere of influence.  Geocentric-frame corrections required are not yet fully supported.
+- Partial derivatives of media corrections (tropospheric and ionospheric
+  parameters) with respect to filter solve-for parameters are not yet implemented.
 - Ground-station and bias partial derivatives for real radiometric measurements
   remain cumbersome and require refactoring
 

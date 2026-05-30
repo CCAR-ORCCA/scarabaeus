@@ -253,56 +253,6 @@ This installs `nbstripout` and other hooks that run before each commit.
 
 ---
 
-## Quick Start
-
-```python
-import scarabaeus as scb
-import numpy as np
-
-# --- Units & frames ---
-kg, km, sec = scb.Units.get_units(["kg", "km", "sec"])
-J2000, *_ = scb.Frame.generate_common_frames()
-
-# --- Load SPICE kernels ---
-scb.SpiceManager.load_kernel_from_mkfile("data/kernels/locked/locked_generic.tm")
-
-# --- Define a spacecraft ---
-sc = scb.Spacecraft(
-    name     = "Orbiter",
-    spice_id = -1000,
-    tot_mass = scb.ArrayWUnits(2000.0, kg),
-    area     = scb.ArrayWUnits(1e-6, km**2),
-    ref_coeff= 1.5,
-)
-
-# --- Define origin body ---
-earth = scb.CelestialBody.from_constants("EARTH")
-
-# --- Initial state (position [km], velocity [km/s]) ---
-r0 = scb.ArrayWUnits(np.array([6778.0, 0.0, 0.0]), km)
-v0 = scb.ArrayWUnits(np.array([0.0, 7.784, 0.0]), km / sec)
-state = scb.StateArray(earth, J2000, sc, r0, v0)
-
-# --- Define epochs ---
-t0 = scb.EpochArray("2024-JAN-01 00:00:00.000 TDB", "TDB")
-tf = scb.EpochArray("2024-JAN-01 01:30:00.000 TDB", "TDB")
-
-# --- Build force model and propagate ---
-gravity = scb.PointMassGravity(earth)
-fm = scb.ForceModelTranslation([gravity])
-
-prop = scb.Propagator(
-    spacecraft  = sc,
-    force_model = fm,
-    epoch_start = t0,
-    epoch_end   = tf,
-)
-traj = prop.propagate(state)
-print(traj)
-```
-
----
-
 ## Tutorials
 
 A tiered tutorial suite lives in [`tutorials/`](tutorials/) as Jupyter Notebooks (`.ipynb`).

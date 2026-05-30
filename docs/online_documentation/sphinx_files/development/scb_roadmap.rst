@@ -31,6 +31,13 @@ Measurement and Filtering V&V
 - Compare covariance analysis results to state-of-the-art OD software
 - Document data processing and filter results for multiple missions
 
+Real Measurement Model Enhancements
+--------------------------------------
+- Extend geocentric-frame support so real radiometric models operate correctly
+  inside Earth's sphere of influence; implement partial derivatives of tropospheric
+  and ionospheric media corrections to enable atmospheric parameter estimation
+  alongside the spacecraft state
+
 Finite-Burn Targeting
 ------------------------
 - Use Scarabaeus as a local targeting and optimization framework
