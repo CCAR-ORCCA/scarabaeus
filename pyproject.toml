@@ -1,0 +1,67 @@
+# SPDX-FileCopyrightText: 2026 Orbital Research Cluster for Celestial Applications (ORCCA) Lab, University of Colorado at Boulder
+# SPDX-License-Identifier: ISC
+[build-system]
+requires = ["maturin>=1.0,<2.0"]
+build-backend = "maturin"
+
+[project]
+name = "scarabaeus"
+version = "2026.0.0"
+description = "Open-source Python framework for spacecraft navigation and orbit determination"
+license = { file = "LICENSE" }
+# requires-python = "==3.11.9"
+dependencies = [
+    "numpy",
+    "scikit-learn",
+    "spiceypy",
+    "matplotlib",
+    "scipy",
+    "pymongo", "ssh_pymongo", "paramiko==3.5.1",
+    "pandas",
+    "trimesh",
+    "mpld3",
+    "tqdm",
+    "autograd",
+    "py-cpuinfo",
+    "setuptools", "wheel",
+    "ipykernel", "pyproject-local-kernel", "ipympl",
+]
+
+[dependency-groups]
+dev = [
+    "pre-commit", "nbstripout", "reuse",
+    "numpydoc", "sphinx-design", "sphinx-copybutton", "pydata_sphinx_theme",
+    "sphinxext-opengraph", "nbsphinx", "sphinx-collections", "sphinx-gallery",
+    "sphinx-tabs", "myst-parser", "sphinx-autobuild",
+    "pytest", "pytest-mock", "pytest-dependency", "pytest-order",
+    "pytest-cov", "pytest-profiling", "snakeviz", "pytest-timeout",
+    "maturin",
+]
+
+[project.urls]
+Homepage = "https://ccar-orcca.github.io/scarabaeus-docs/index.html"
+
+[tool.maturin]
+python-source = "src"
+manifest-path = "src/scarabaeus_rust/Cargo.toml"
+module-name = "scarabaeus.scarabaeus_rust"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = ["-s", "-ra", "-v", "--cov", "--cov-report=xml:tests/reports/coverage.xml", "--junit-xml=tests/reports/junit.xml"]
+timeout = 999
+
+[tool.coverage.run]
+source_pkgs = ["scarabaeus"]
+omit = [
+    "src/scarabaeus_rust/*",
+    "tests/*",
+    "src/scarabaeus/**/__init__.py",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+
+[tool.coverage.html]
+directory = "tests/reports/coverage"

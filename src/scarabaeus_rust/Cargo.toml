@@ -1,0 +1,17 @@
+[package]
+name = "scarabaeus_rust"
+version = "1.0.0"
+edition = "2024"
+license = "ISC"
+authors = ["Orbital Research Cluster for Celestial Applications (ORCCA) Lab, University of Colorado at Boulder"]
+
+[lib]
+name = "scarabaeus_rust"
+crate-type = ["cdylib"]
+
+[dependencies]
+pyo3 = {version = "0.27.2", features = ["extension-module"]}
+numpy = {version = "0.27"}
+ndarray = {version = "0.17"}
+itertools = {version = "0.12"}
+nalgebra = {version = "0.34"}

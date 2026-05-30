@@ -1,0 +1,11 @@
+.. SPDX-FileCopyrightText: 2026 Orbital Research Cluster for Celestial Applications (ORCCA) Lab, University of Colorado at Boulder
+.. SPDX-License-Identifier: ISC
+``ArrayWUnits``
+===============
+
+.. _docs-arraywunits:
+.. autoclass:: scarabaeus.ArrayWUnits
+    :members:
+    :undoc-members:
+    :show-inheritance:
+    :inherited-members:

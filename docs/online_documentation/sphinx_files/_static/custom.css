@@ -1,0 +1,265 @@
+/* SPDX-FileCopyrightText: 2026 Orbital Research Cluster for Celestial Applications (ORCCA) Lab, University of Colorado at Boulder */
+/* SPDX-License-Identifier: ISC */
+/*******************************************************************************
+* light theme
+*
+* all the variables used for light theme coloring
+*/
+html[data-theme="light"] {
+    /*****************************************************************************
+    * main colors
+    */
+    --pst-color-primary: rgb(207 184 124);
+    --pst-color-secondary: rgb(2 119 189);
+    --pst-color-success: rgb(40, 167, 69);
+    --pst-color-info: var(--pst-color-primary);
+    --pst-color-warning: var(--pst-color-secondary);
+    --pst-color-danger: rgb(220, 53, 69);
+    --pst-color-text-base: rgb(51, 51, 51);
+    --pst-color-text-muted: rgb(77, 77, 77);
+    --pst-color-border: rgb(201, 201, 201);
+    --pst-color-shadow: rgb(216, 216, 216);
+  
+    /*****************************************************************************
+    * depth colors
+    *
+    * background: the more in depth color
+    * on-background: the object directly set on the background, use of shadows in light theme
+    * surface: object set on the background (without shadows)
+    * on_surface: object set on surface object (without shadows)
+    */
+    --pst-color-background: rgb(255, 255, 255);
+    --pst-color-on-background: rgb(255, 255, 255);
+    --pst-color-surface: rgb(240, 240, 240);
+    --pst-color-on-surface: rgba(67, 181, 248, 0.483);
+  
+    /*****************************************************************************
+    * extentions
+    */
+  
+    --pst-color-panel-background: var(--pst-color-background);
+  
+    /*****************************************************************************
+    * layout
+    */
+  
+    /* links */
+    --pst-color-link: var(--pst-color-primary);
+    --pst-color-link-hover: var(--pst-color-secondary);
+  
+    /* inline code */
+    --pst-color-inline-code: rgb(2 119 189);
+  
+    /* targeted content */
+    --pst-color-target: rgb(251, 229, 78);
+  
+    /* hide any content that should not be displayed in the light theme */
+    .only-dark {
+      display: none !important;
+    }
+  }
+  
+  /*******************************************************************************
+  * dark theme
+  *
+  * all the variables used for dark theme coloring
+  */
+  html[data-theme="dark"] {
+    /*****************************************************************************
+    * main colors
+    */
+    --pst-color-primary: rgb(207 184 124);
+    --pst-color-secondary: rgb(2 119 189);
+    --pst-color-success: rgb(72, 135, 87);
+    --pst-color-info: var(--pst-color-primary);
+    --pst-color-warning: rgb(155, 82, 37);
+    --pst-color-danger: rgb(255, 0, 25);
+    --pst-color-text-base: rgb(201, 209, 217);
+    --pst-color-text-muted: rgb(207 184 124);
+    --pst-color-border: rgb(207 184 124);
+    --pst-color-shadow: var(--pst-color-background);
+  
+    /*****************************************************************************
+    * depth colors
+    *
+    * background: the more in depth color
+    * on-background: the object directly set on the background, use of a light grey in dark theme
+    * surface: object set on the background (without shadows)
+    * on_surface: object set on surface object (without shadows)
+    */
+    --pst-color-background: rgb(18, 18, 18);
+    --pst-color-on-background: rgb(30, 30, 30);
+    --pst-color-surface: rgb(41, 41, 41);
+    --pst-color-on-surface: rgb(55, 55, 55);
+  
+    /*****************************************************************************
+    * extentions
+    */
+  
+    --pst-color-panel-background: var(--pst-color-background-up);
+  
+    /*****************************************************************************
+    * layout
+    */
+  
+    /* links */
+    --pst-color-link: var(--pst-color-primary);
+    --pst-color-link-hover: var(--pst-color-secondary);
+  
+    /* inline code */
+    --pst-color-inline-code: var(--pst-color-primary);
+  
+    /* targeted content */
+    --pst-color-target: rgb(71, 39, 0);
+  
+    /* hide any content that should not be displayed in the dark theme */
+    .only-light {
+      display: none !important;
+    }
+  
+    /* specific brightness applied on images */
+    /* img {
+      filter: brightness(0.8) contrast(1.2);
+    } */
+  }
+  
+  /* fix for transparency with dark theme */
+  html[data-theme="dark"] img {
+    filter: none;
+  }
+  html[data-theme="dark"] .bd-content img:not(.only-dark):not(.dark-light) {
+    background: unset;
+  }
+
+  /* hide duplicate toctrees to get around nbgallery always making one */
+  /* .bd-toc-item .bd-sidenav:nth-of-type(even) {
+    display: none;
+  } */
+  /* body[data-page="examples/examples_frontpage"] .bd-toc-item .bd-sidenav:nth-of-type(even) {
+    display: none;
+  } */
+  
+/* .bd-sidebar-primary {
+   width: 18%;
+   min-width: 250px;
+   max-width: 350px;
+   padding-left: 2%;
+}
+
+.bd-sidebar-secondary {
+   width: 18%;
+   min-width: 250px;
+   max-width: 350px;
+   overflow-x: hidden;
+   word-break: break-all;
+   overflow-wrap: break-word;
+} */
+ 
+/* .bd-sidebar-secondary .toc-entry a,
+.bd-sidebar-secondary .nav-link,
+.bd-sidebar-secondary span {
+   word-break: break-word !important;
+   overflow-wrap: break-word !important;
+   white-space: normal !important;
+   display: inline-block;
+   max-width: 100%;
+} */
+
+.bd-sidebar-secondary code {
+   display: block !important;
+   word-break: break-word !important;
+   overflow-wrap: break-word !important;
+   white-space: normal !important;
+   max-width: 100%;
+}
+
+/* custom class for toctrees to be multicolumn */
+.two-column-toc ul {
+    column-count: 2;
+    column-gap: 2rem;
+    list-style: none;
+    padding: 0;
+}
+  
+  html {
+    /*****************************************************************************
+    * Overall Layout Variables
+    */
+  
+    /* Header height will impact the top offset for many sections */
+    /* Article header is 66% of Header */
+    --pst-header-height: 6rem;
+    --pst-header-article-height: calc(var(--pst-header-height) * 2 / 3);
+    --pst-sidebar-secondary: 25%
+  }
+  
+  html {
+    /*****************************************************************************
+    * Icon
+    */
+  
+    /* Font size across all icons */
+    --pst-font-size-icon: 1.5rem;
+  
+    /* Font Awesome default icons */
+    --pst-icon-check-circle: "\f058";
+    --pst-icon-info-circle: "\f05a";
+    --pst-icon-exclamation-triangle: "\f071";
+    --pst-icon-exclamation-circle: "\f06a";
+    --pst-icon-times-circle: "\f057";
+    --pst-icon-lightbulb: "\f0eb";
+    --pst-icon-download: "\f019";
+    --pst-icon-angle-left: "\f104";
+    --pst-icon-angle-right: "\f105";
+    --pst-icon-external-link: "\f35d";
+    --pst-icon-search-minus: "\f010";
+    --pst-icon-github: "\f09b";
+    --pst-icon-gitlab: "\f296";
+    --pst-icon-share: "\f064";
+    --pst-icon-bell: "\f0f3";
+    --pst-icon-pencil: "\f303";
+  
+    /* Font Awesome main page icons */
+    --pst-icon-code: "\f000";
+  
+    /* Bootstrap icons */
+    --pst-breadcrumb-divider: "\f105";
+  }
+
+/* SPHINX-TABS Buttons */
+/* Styling for all tab buttons */
+.sphinx-tabs-panel {
+    background: transparent !important;
+}
+
+/* Styling for all tab buttons */
+.sphinx-tabs-tab {
+    background-color: var(--pst-color-surface) !important;
+    color: var(--pst-color-text-base) !important;
+}
+
+/* Styling for the currently selected (active) tab */
+.sphinx-tabs-tab[aria-selected="true"] {
+    background-color: rgb(207 184 124) !important; /* Your chosen accent color */
+    color: var(--pst-color-secondary) !important;              /* text color */
+}
+
+/* The line under the active tab */
+.sphinx-tabs-tab[aria-selected="true"] {
+    border-bottom: 2px solid rgb(207 184 124) !important;
+}
+
+/* The border around the code block area itself */
+.sphinx-tabs-panel {
+    border: 1px solid rgb(207 184 124) !important;
+}
+
+/* The horizontal line under all tab buttons */
+.sphinx-tabs {
+    border-bottom: 1px solid rgb(207 184 124) !important;
+}
+
+/* Hover effect for better interactivity */
+.sphinx-tabs-tab:hover {
+    background-color: var(--pst-color-on-surface) !important;
+}
