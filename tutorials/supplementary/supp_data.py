@@ -37,16 +37,20 @@ from enum import Enum
 from typing import Literal, Callable, Optional, List
 
 from supplementary import file_gen
+
+
 @dataclass
 class FileInfo:
-    """ File structure. """
-    path       : str
-    comes_from : Literal['gen', 'download', 'existing']
-    generator  : Optional[Callable] = None
-    link       : Optional[str]      = None
+    """File structure."""
+
+    path: str
+    comes_from: Literal["gen", "download", "existing"]
+    generator: Optional[Callable] = None
+    link: Optional[str] = None
+
 
 class Data(Enum):
-    """ Data manager for SCB tutorials. """
+    """Data manager for SCB tutorials."""
 
     # general
     mk = FileInfo(
@@ -106,33 +110,33 @@ class Data(Enum):
     """ JPL planetary ephemeris DE432s. """
 
     mars_spk = FileInfo(
-        path = 'kernels/locked/spk/mar099s.bsp',
-        comes_from = 'download',
-        link       = 'https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/satellites/mar099s.bsp',
+        path="kernels/locked/spk/mar099s.bsp",
+        comes_from="download",
+        link="https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/satellites/mar099s.bsp",
     )
 
     jupiter_spk = FileInfo(
-        path = 'kernels/locked/spk/jup348.bsp',
-        comes_from = 'download',
-        link       = 'https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/satellites/jup348.bsp',
+        path="kernels/locked/spk/jup348.bsp",
+        comes_from="download",
+        link="https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/satellites/jup348.bsp",
     )
 
     saturn_spk = FileInfo(
-        path = 'kernels/locked/spk/sat456.bsp',
-        comes_from = 'download',
-        link       = 'https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/satellites/sat456.bsp',
+        path="kernels/locked/spk/sat456.bsp",
+        comes_from="download",
+        link="https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/satellites/sat456.bsp",
     )
 
     uranus_spk = FileInfo(
-        path = 'kernels/locked/spk/ura184_part-3.bsp',
-        comes_from = 'download',
-        link       = 'https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/satellites/ura184_part-3.bsp',
+        path="kernels/locked/spk/ura184_part-3.bsp",
+        comes_from="download",
+        link="https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/satellites/ura184_part-3.bsp",
     )
 
     neptune_spk = FileInfo(
-        path = 'kernels/locked/spk/nep097.bsp',
-        comes_from = 'download',
-        link       = 'https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/satellites/nep097.bsp',
+        path="kernels/locked/spk/nep097.bsp",
+        comes_from="download",
+        link="https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/satellites/nep097.bsp",
     )
 
     Cassini_sclk = FileInfo(
@@ -158,38 +162,38 @@ class Data(Enum):
 
     # provided files
     earth_sph_config = FileInfo(
-        path       = 'dynamic_setup/sph_coefficients/Earth_100.json',
-        comes_from = 'gen',
-        generator  = file_gen.gen_earth_sph_config,
+        path="dynamic_setup/sph_coefficients/Earth_100.json",
+        comes_from="gen",
+        generator=file_gen.gen_earth_sph_config,
     )
 
     example_meas_spec = FileInfo(
-        path = 'dynamic_setup/thruster_coefficients/example.mission_maneuver_spec',
-        comes_from = 'existing'
+        path="dynamic_setup/thruster_coefficients/example.mission_maneuver_spec",
+        comes_from="existing",
     )
 
     """ Seasonal tropospheric coefficients. """
     tropo_seasonal = FileInfo(
-        path = 'measurements/media_correction/2018_152_2018_182_tro.json',
-        comes_from = 'existing'
+        path="measurements/media_correction/2018_152_2018_182_tro.json",
+        comes_from="existing",
     )
 
     """ Seasonal tropospheric coefficients. """
     tropo_seasonal_new = FileInfo(
-        path = 'measurements/media_correction/1972_001_2048_001_tro_modified.json',
-        comes_from = 'existing'
+        path="measurements/media_correction/1972_001_2048_001_tro_modified.json",
+        comes_from="existing",
     )
 
     """Non-seasonal tropospheric"""
     tropo_nonseasonal = FileInfo(
-        path = 'measurements/media_correction/2010_001_2010_032_tro.json',
-        comes_from = 'existing'
+        path="measurements/media_correction/2010_001_2010_032_tro.json",
+        comes_from="existing",
     )
 
     """ Radiometric tracking file """
     trk_file = FileInfo(
-        path = 'measurements/radiometric/orex_beno_2018_159_054533_2018_159_104001_35.json',
-        comes_from = 'existing'
+        path="measurements/radiometric/orex_beno_2018_159_054533_2018_159_104001_35.json",
+        comes_from="existing",
     )
 
     # OSIRIS-REx scenario kernels
@@ -347,6 +351,7 @@ class Data(Enum):
         """Absolute path to this data file."""
         return str(file_gen.DATA_PATH / self.value.path)
 
+
 def load_data() -> type[Data]:
     """
     Ensure all tutorial data files are present under ``data/``.
@@ -366,7 +371,7 @@ def load_data() -> type[Data]:
     #     # already have tutorial data folder -> check for missing files
 
     missing_folders = []
-    missing_files: List[FileInfo]   = []
+    missing_files: List[FileInfo] = []
 
     # check folders
     for folder in file_gen.DATA_SKELETON:
@@ -381,18 +386,32 @@ def load_data() -> type[Data]:
 
     if not missing_folders and not missing_files:
         #  have everything -> notify and return data
-        print('SCB supplementary data up to date.')
+        print("SCB supplementary data up to date.")
         return data
 
     else:
         # missing one or more things -> ask if ok to download/gen
-        print('SCB supplementary data out of date.')
+        print("SCB supplementary data out of date.")
         waiting = True
         while waiting:
-            response = input('\nDownload and generate missing files? (y/n): ')
+            response = input("\nDownload and generate missing files? (y/n): ")
             match response.strip().lower():
-                case 'y':
-                    print('Received: (y), retrieving/generating missing files...')
+                case "y":
+                    n_downloads = sum(
+                        1 for e in missing_files if e.value.comes_from == "download"
+                    )
+                    print("Received: (y), retrieving/generating missing files...")
+                    if n_downloads >= 8:
+                        print(
+                            f"\n  Heads up: {n_downloads} kernels to download from NAIF. "
+                            "This could take up to 20 minutes depending on your connection.\n"
+                            "  Go grab a coffee!\n"
+                        )
+                    elif n_downloads >= 3:
+                        print(
+                            f"\n  Downloading {n_downloads} kernels from NAIF. "
+                            "Sit tight, this may take a few minutes.\n"
+                        )
 
                     # generate missing folders
                     for folder in missing_folders:
@@ -401,24 +420,29 @@ def load_data() -> type[Data]:
                     # then files
                     for entry in missing_files:
                         match entry.value.comes_from:
-                            case 'gen':
+                            case "gen":
                                 entry.value.generator()
-                                print(f'  | Generated:  {entry.value.path}')
-                            case 'download':
+                                print(f"  | Generated:  {entry.value.path}")
+                            case "download":
                                 try:
-                                    urllib.request.urlretrieve(entry.value.link, file_gen.DATA_PATH / entry.value.path)
+                                    urllib.request.urlretrieve(
+                                        entry.value.link,
+                                        file_gen.DATA_PATH / entry.value.path,
+                                    )
                                 except Exception:
-                                    print(f'  | FAILED download: {entry.value.path}')
+                                    print(f"  | FAILED download: {entry.value.path}")
                                 else:
-                                    print(f'  | Downloaded: {entry.value.path}')
-                            case 'existing':
-                                print(f'  | Missing provided file: {entry.value.path}. Pull from repository.')
+                                    print(f"  | Downloaded: {entry.value.path}")
+                            case "existing":
+                                print(
+                                    f"  | Missing provided file: {entry.value.path}. Pull from repository."
+                                )
                     waiting = False
 
-                    print('SCB supplementary data up to date.')
+                    print("SCB supplementary data up to date.")
                     return data
-                case 'n':
-                    print('Received: (n), exiting...')
+                case "n":
+                    print("Received: (n), exiting...")
                     sys.exit()
                 case _:
-                    print(f'Unknown response: ({response})')
+                    print(f"Unknown response: ({response})")
