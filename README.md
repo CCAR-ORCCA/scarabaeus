@@ -318,18 +318,27 @@ Open a GitHub Issue and include: a short title, steps to reproduce (minimal work
 
 ## Citing Scarabaeus
 
-If you use Scarabaeus in academic work, please cite it as:
+If you use Scarabaeus in academic work, please cite the following conference paper:
+
+> McMahon J., Fereoli G., Wolf T., Ellis Z., Aldhanhani B., Kuleib M., Frank W., Pugliatti M., Almashjari M., Knittel J. (2026).
+> **Scarabaeus: An Open-Source Tool for Interplanetary Spacecraft Navigation.**
+> *30th International Symposium on Space Flight Dynamics (ISSFD)*, Toulouse, France, June 1–5, 2026. Organized by CNES.
 
 ```bibtex
-@software{scarabaeus2026,
-  author       = {ORCCA Lab, University of Colorado Boulder},
-  title        = {Scarabaeus: Open-source spacecraft navigation \& orbit determination framework},
-  year         = {2026},
-  version      = {2026.0.0},
-  url          = {https://ccar-orcca.github.io/scarabaeus-docs/},
-  license      = {ISC},
+@inproceedings{mcmahon2026scarabaeus,
+  author    = {McMahon, J. and Fereoli, G. and Wolf, T. and Ellis, Z. and
+               Aldhanhani, B. and Kuleib, M. and Frank, W. and Pugliatti, M. and
+               Almashjari, M. and Knittel, J.},
+  title     = {Scarabaeus: An Open-Source Tool for Interplanetary Spacecraft Navigation},
+  booktitle = {30th International Symposium on Space Flight Dynamics (ISSFD)},
+  year      = {2026},
+  address   = {Toulouse, France},
+  note      = {Organized by CNES. A formal DOI (Zenodo or JOSS) is forthcoming.},
+  url       = {https://www.researchgate.net/publication/404941039_Scarabaeus_An_Open-Source_Tool_for_Interplanetary_Spacecraft_Navigation},
 }
 ```
+
+> **Note:** A formal DOI (Zenodo or JOSS) is forthcoming. When available, add a `doi:` field to [CITATION.cff](CITATION.cff) and update the `note` field in the BibTeX entry above.
 
 ---
 
