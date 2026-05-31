@@ -1,0 +1,75 @@
+**/__pycache__
+kernels/*
+.hypothesis/*
+.venv/
+.venv2/
+data/*
+ntes/*
+downloads/*
+*.DS_Store
+config/*.json
+**/target/
+report.html
+.vscode/
+**/.vscode/
+
+# docs builds
+docs/online_documentation/_build/
+docs/online_documentation/sphinx_files/_build/
+docs/online_documentation/sphinx_files/_collections
+
+# Rust build artifacts
+**/Cargo.lock
+*.so
+*.dylib.yml
+*.dll
+*.dSYM
+*.pyd
+*.pdb
+*.dwp
+
+### tutorial data and results
+tutorials/supplementary/supp_data/**
+
+## dynamic setup
+!tutorials/supplementary/supp_data/dynamic_setup/
+tutorials/supplementary/supp_data/dynamic_setup/**
+# sph coeffs
+!tutorials/supplementary/supp_data/dynamic_setup/sph_coefficients/
+tutorials/supplementary/supp_data/dynamic_setup/sph_coefficients/**
+!tutorials/supplementary/supp_data/dynamic_setup/sph_coefficients/Earth_100.json
+# thruster coeffs
+!tutorials/supplementary/supp_data/dynamic_setup/thruster_coefficients/
+tutorials/supplementary/supp_data/dynamic_setup/thruster_coefficients/**
+!tutorials/supplementary/supp_data/dynamic_setup/thruster_coefficients/example.mission_maneuver_spec
+
+## measurements
+!tutorials/supplementary/supp_data/measurements/
+tutorials/supplementary/supp_data/measurements/**
+
+## media corr 1
+!tutorials/supplementary/supp_data/measurements/media_correction
+tutorials/supplementary/supp_data/measurements/media_correction/**
+!tutorials/supplementary/supp_data/measurements/media_correction/2018_152_2018_182_tro.json
+!tutorials/supplementary/supp_data/measurements/media_correction/1972_001_2048_001_tro_modified.json
+!tutorials/supplementary/supp_data/measurements/media_correction/2010_001_2010_032_tro.json
+
+## radiometric data
+!tutorials/supplementary/supp_data/measurements/radiometric
+tutorials/supplementary/supp_data/measurements/radiometric/**
+!tutorials/supplementary/supp_data/measurements/radiometric/orex_beno_2018_159_054533_2018_159_104001_35.json
+
+## results
+tutorials/tutorial_results/*
+
+## miscellaneous file types
+*.png
+*.log
+*.gz
+
+## test output (coverage + profiling)
+.coverage
+prof/
+tests/reports/
+*.prof
+flamegraph.svg
