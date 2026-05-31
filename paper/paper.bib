@@ -1,0 +1,229 @@
+% SPDX-FileCopyrightText: 2026 Orbital Research Cluster for Celestial Applications (ORCCA) Lab, University of Colorado at Boulder
+% SPDX-License-Identifier: ISC
+
+% ---- Core dependencies ----
+
+@article{rein2015ias15,
+  author  = {Rein, H. and Spiegel, D. S.},
+  title   = {{IAS15}: a fast, adaptive high-order integrator for gravitational dynamics,
+             accurate to machine precision over a billion orbits},
+  journal = {Monthly Notices of the Royal Astronomical Society},
+  year    = {2015},
+  volume  = {446},
+  number  = {2},
+  pages   = {1424--1437},
+  doi     = {10.1093/mnras/stu2164}
+}
+
+@article{virtanen2020scipy,
+  author  = {Virtanen, P. and Gommers, R. and Oliphant, T. E. and Haberland, M. and
+             Reddy, T. and Cournapeau, D. and Burovski, E. and Peterson, P. and
+             Weckesser, W. and Bright, J. and {van der Walt}, S. J. and Brett, M. and
+             Wilson, J. and Millman, K. J. and Mayorov, N. and Nelson, A. R. J. and
+             Jones, E. and Kern, R. and Larson, E. and Carey, C. J. and Polat, I. and
+             Feng, Y. and Moore, E. W. and VanderPlas, J. and Laxalde, D. and
+             Perktold, J. and Cimrman, R. and Henriksen, I. and Quintero, E. A. and
+             Harris, C. R. and Archibald, A. M. and Ribeiro, A. H. and Pedregosa, F.
+             and {van Mulbregt}, P. and {SciPy 1.0 Contributors}},
+  title   = {{SciPy} 1.0: Fundamental Algorithms for Scientific Computing in {Python}},
+  journal = {Nature Methods},
+  year    = {2020},
+  volume  = {17},
+  number  = {3},
+  pages   = {261--272},
+  doi     = {10.1038/s41592-019-0686-2}
+}
+
+@article{harris2020numpy,
+  author  = {Harris, C. R. and Millman, K. J. and {van der Walt}, S. J. and Gommers, R.
+             and Virtanen, P. and Cournapeau, D. and Wieser, E. and Taylor, J. and
+             Berg, S. and Smith, N. J. and Kern, R. and Picus, M. and Hoyer, S. and
+             {van Kerkwijk}, M. H. and Brett, M. and Haldane, A. and {del R{\'i}o}, J. F.
+             and Wiebe, M. and Peterson, P. and G{\'e}rard-Marchant, P. and
+             Sheppard, K. and Reddy, T. and Weckesser, W. and Abbasi, H. and
+             Gohlke, C. and Oliphant, T. E.},
+  title   = {Array programming with {NumPy}},
+  journal = {Nature},
+  year    = {2020},
+  volume  = {585},
+  pages   = {357--362},
+  doi     = {10.1038/s41586-020-2649-2}
+}
+
+% ---- SPICE ----
+
+@article{acton1996,
+  author  = {Acton, C. H.},
+  title   = {Ancillary data services of {NASA}'s Navigation and Ancillary Information
+             Facility},
+  journal = {Planetary and Space Science},
+  year    = {1996},
+  volume  = {44},
+  number  = {1},
+  pages   = {65--70},
+  doi     = {10.1016/0032-0633(95)00107-7}
+}
+
+@article{acton2018spice,
+  author  = {Acton, C. and Bachman, N. and Semenov, B. and Wright, E.},
+  title   = {A look towards the future in the handling of space science mission geometry},
+  journal = {Planetary and Space Science},
+  year    = {2018},
+  volume  = {150},
+  pages   = {9--12},
+  doi     = {10.1016/j.pss.2017.02.013}
+}
+
+@article{annex2020spiceypy,
+  author  = {Annex, A. and Pearson, B. and Seignovert, B. and Carcich, B. and
+             Koh, H. and Stefko, M. and {de Val-Borro}, M. and Shaughnessy, J.},
+  title   = {{SpiceyPy}: a Pythonic Wrapper for the {SPICE} Toolkit},
+  journal = {Journal of Open Source Software},
+  year    = {2020},
+  volume  = {5},
+  number  = {46},
+  pages   = {2050},
+  doi     = {10.21105/joss.02050}
+}
+
+% ---- Measurement formulation ----
+
+@book{moyer2000,
+  author    = {Moyer, T. D.},
+  title     = {Formulation for Observed and Computed Values of {Deep Space Network}
+               Data Types for Navigation},
+  series    = {{JPL} Deep Space Communications and Navigation Series},
+  publisher = {Wiley-Interscience},
+  year      = {2003},
+  address   = {Hoboken, NJ},
+  isbn      = {978-0-471-44534-3}
+}
+
+% ---- Filter references ----
+
+@book{bierman1977,
+  author    = {Bierman, G. J.},
+  title     = {Factorization Methods for Discrete Sequential Estimation},
+  publisher = {Academic Press},
+  year      = {1977},
+  address   = {New York}
+}
+
+% ---- Related astrodynamics tools ----
+
+@article{monte2018,
+  author  = {Evans, S. and Taber, W. and Drain, T. and Smith, J. and Wu, H.-C. and
+             Guevara, M. and Suhandani, D. and Bonfiglio, E. and others},
+  title   = {{MONTE}: The next generation of mission design and navigation software},
+  journal = {CEAS Space Journal},
+  year    = {2018},
+  volume  = {10},
+  number  = {1},
+  pages   = {3--14},
+  doi     = {10.1007/s12567-017-0171-7}
+}
+
+@software{gmat2022,
+  author    = {{GMAT Development Team}},
+  title     = {General Mission Analysis Tool ({GMAT})},
+  year      = {2022},
+  publisher = {NASA Goddard Space Flight Center},
+  url       = {https://gmat.gsfc.nasa.gov}
+}
+
+@inproceedings{maisonobe2010orekit,
+  author    = {Maisonobe, L. and Pommier, V. and Parraud, P.},
+  title     = {Orekit: An open source library for operational flight dynamics applications},
+  booktitle = {Proceedings of the 4th International Conference on Astrodynamics Tools
+               and Techniques},
+  year      = {2010},
+  address   = {Madrid, Spain}
+}
+
+@misc{dirkx2024tudat,
+  author = {Dirkx, D. and Fayolle, M. and Garrett, M. and Melman, J. and
+            Musegaas, P. and others},
+  title  = {{TudatPy}: The {Tudat} Space Toolbox {Python} API},
+  year   = {2024},
+  url    = {https://github.com/tudat-team/tudatpy}
+}
+
+@article{kenneally2020basilisk,
+  author  = {Kenneally, P. W. and Piggott, S. and Schaub, H.},
+  title   = {Basilisk: A Flexible, Scalable and Modular Astrodynamics Simulation
+             Framework},
+  journal = {Journal of Aerospace Information Systems},
+  year    = {2020},
+  volume  = {17},
+  number  = {9},
+  pages   = {496--507},
+  doi     = {10.2514/1.I010762}
+}
+
+@inproceedings{cubenav2023,
+  author    = {Bhaskaran, S. and Ryne, M. and others},
+  title     = {{CubeNav}: A Small Spacecraft Navigation Tool},
+  booktitle = {AAS/AIAA Astrodynamics Specialist Conference},
+  year      = {2023}
+}
+
+@techreport{copernicus2010,
+  author      = {Ocampo, C.},
+  title       = {Copernicus: A Generalized Trajectory Design and Optimization System},
+  institution = {NASA Johnson Space Center},
+  year        = {2010},
+  url         = {https://software.nasa.gov/software/MSC-24630-1}
+}
+
+% ---- EMA mission ----
+
+@inproceedings{ema2021,
+  author    = {Gavin, P. and Alloghani, M. and others},
+  title     = {The {Emirates Mission to the Asteroid Belt}: Overview and Science Objectives},
+  booktitle = {Lunar and Planetary Science Conference},
+  year      = {2021},
+  address   = {The Woodlands, TX}
+}
+
+% ---- Scarabaeus publications ----
+
+@inproceedings{mcmahon2025gnc,
+  author    = {McMahon, J. W. and Pugliatti, M. and Baker, D. and Faura-Pedros, A. and
+               Fereoli, G. and Shakerin, K. and Pattamudu-Manoharan, S. and Ellis, Z.
+               and Cabra, A. and Almashjari, M. and Kuleib, M. and Frank, W. and
+               Villa, J. and Knittel, J.},
+  title     = {Design and Preliminary Results of {Scarabaeus}: A New Open-Source
+               Navigation Tool for Interplanetary Spacecraft Navigation},
+  booktitle = {47th AAS Guidance, Navigation and Control Conference},
+  year      = {2025},
+  address   = {Breckenridge, Colorado}
+}
+
+@inproceedings{mcmahon2025astro,
+  author    = {McMahon, J. W. and Pugliatti, M. and Fereoli, G. and Knittel, J. and
+               others},
+  title     = {The {Scarabaeus} Open-Source Navigation Tool: Preliminary Results and
+               Real Measurements},
+  booktitle = {AAS/AIAA Astrodynamics Specialist Conference},
+  year      = {2025},
+  address   = {Boston, MA}
+}
+
+@inproceedings{mcmahon2026issfd,
+  author    = {McMahon, J. W. and Fereoli, G. and Wolff, T. N. and Knittel, J. and
+               others},
+  title     = {{Scarabaeus}: An Open-Source Tool for Interplanetary Spacecraft Navigation},
+  booktitle = {30th International Symposium on Space Flight Dynamics},
+  year      = {2026},
+  address   = {Toulouse, France}
+}
+
+@inproceedings{kuleib2026maneuver,
+  author    = {Kuleib, M. and Knittel, J. and Fereoli, G. and Aldhanhani, B. and
+               others},
+  title     = {Operational Maneuver Targeting Framework for the {Emirates Mission to
+               the Asteroid Belt}},
+  booktitle = {30th International Symposium on Space Flight Dynamics},
+  year      = {2026},
+  address   = {Toulouse, France}
+}
