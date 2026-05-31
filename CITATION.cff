@@ -1,0 +1,69 @@
+cff-version: 1.2.0
+message: "If you use Scarabaeus in academic work, please cite the paper below."
+title: "Scarabaeus: An Open-Source Tool for Interplanetary Spacecraft Navigation"
+version: "2026.0.0"
+date-released: "2026-06-01"
+license: ISC
+url: "https://www.researchgate.net/publication/404941039_Scarabaeus_An_Open-Source_Tool_for_Interplanetary_Spacecraft_Navigation"
+repository-code: "https://github.com/ccar-orcca/scarabaeus"
+abstract: >
+  Scarabaeus (SCB) is an open-source Python framework for interplanetary spacecraft
+  navigation and orbit determination. Its architecture is based on a modular,
+  object-oriented Python front-end with a Rust back-end for computationally intensive
+  components. SCB supports radiometric and optical navigation measurement processing,
+  sequential and batch orbit determination filters, maneuver planning, and force
+  modelling, and is designed for direct applicability to the Emirates Mission to
+  Explore the Asteroid Belt (EMA) and other interplanetary missions.
+type: conference-paper
+conference:
+  name: "30th International Symposium on Space Flight Dynamics (ISSFD)"
+  city: Toulouse
+  country: FR
+  date-start: "2026-06-01"
+  date-end: "2026-06-05"
+institution:
+  name: "CNES (Centre National d'Etudes Spatiales)"
+notes: "A formal DOI (Zenodo or Journal of Open Source Software) is forthcoming."
+authors:
+  - family-names: McMahon
+    given-names: J.
+    affiliation: "University of Colorado Boulder, Boulder, United States"
+  - family-names: Fereoli
+    given-names: G.
+    affiliation: "University of Colorado Boulder, Boulder, United States"
+  - family-names: Wolf
+    given-names: T.
+    affiliation: "University of Colorado Boulder, Boulder, United States"
+  - family-names: Ellis
+    given-names: Z.
+    affiliation: "University of Colorado Boulder, Boulder, United States"
+  - family-names: Aldhanhani
+    given-names: B.
+    affiliation: "Technology Innovation Institute, Abu Dhabi, United Arab Emirates"
+  - family-names: Kuleib
+    given-names: M.
+    affiliation: "Technology Innovation Institute, Abu Dhabi, United Arab Emirates"
+  - family-names: Frank
+    given-names: W.
+    affiliation: "Laboratory for Atmospheric and Space Physics (LASP), Boulder, United States"
+  - family-names: Pugliatti
+    given-names: M.
+    affiliation: "University of Colorado Boulder, Boulder, United States"
+  - family-names: Almashjari
+    given-names: M.
+    affiliation: "UAE Space Agency, Abu Dhabi, United Arab Emirates"
+  - family-names: Knittel
+    given-names: J.
+    affiliation: "Laboratory for Atmospheric and Space Physics (LASP), Boulder, United States"
+keywords:
+  - spacecraft navigation
+  - orbit determination
+  - astrodynamics
+  - interplanetary navigation
+  - SPICE
+  - Kalman filter
+  - batch estimation
+  - Python
+  - Rust
+  - Emirates Mission to Explore the Asteroid Belt
+  - EMA

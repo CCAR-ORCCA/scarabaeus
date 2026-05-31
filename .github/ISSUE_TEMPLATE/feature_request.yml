@@ -1,0 +1,42 @@
+name: Feature Request
+description: Suggest a new feature or enhancement for Scarabaeus
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting an improvement. Please describe the use case and motivation clearly.
+
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: A brief description of the feature you'd like to see.
+    validations:
+      required: true
+
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation
+      description: Why is this feature needed? What problem does it solve? What mission or use case drives it?
+    validations:
+      required: true
+
+  - type: textarea
+    id: existing
+    attributes:
+      label: Current Workaround
+      description: How are you handling this today, if at all?
+
+  - type: textarea
+    id: proposed
+    attributes:
+      label: Proposed API / Interface
+      description: If you have a specific API in mind, sketch it out here (pseudocode or description is fine).
+
+  - type: textarea
+    id: additional
+    attributes:
+      label: Additional Context
+      description: References, papers, related issues, or any other context.
