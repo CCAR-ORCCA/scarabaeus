@@ -13,7 +13,7 @@ authors:
     affiliation: 1
   - name: Giovanni Fereoli
     affiliation: 1
-  - name: Trevor N. Wolff
+  - name: Trevor N. Wolf
     affiliation: 1
   - name: Zachary Ellis
     affiliation: 1
@@ -44,8 +44,8 @@ bibliography: paper.bib
 
 # Summary
 
-Scarabaeus (SCB) is an open-source Python framework for interplanetary spacecraft
-navigation and orbit determination (OD), developed by the Orbital Research Cluster for
+Scarabaeus (SCB) is an open-source Python framework for spacecraft
+orbit determination (OD), developed by the Orbital Research Cluster for
 Celestial Applications (ORCCA) at the University of Colorado Boulder. It provides a
 unified, mission-agnostic environment for end-to-end spacecraft navigation: trajectory
 propagation under a configurable suite of force models, simulation and ingestion of
@@ -56,7 +56,7 @@ Rust back-end for performance-critical numerical integration. The framework is d
 to be accessible to graduate students and astrodynamics researchers while remaining
 capable enough for operational mission support. Its development is driven by the
 Emirates Mission to the Asteroid Belt (EMA) [@ema2021], while remaining general enough
-for broad interplanetary navigation use cases.
+for broad navigation use cases.
 
 # Statement of Need
 
@@ -70,17 +70,9 @@ reference frames, and planetary ephemerides.
 
 The state of the art in OD software for deep-space and Earth-orbiting applications is
 well established. Mature tools include MONTE [@monte2018], GEODYN, ODTBX, ODTK, GMAT
-[@gmat2022], TudatPy [@dirkx2024tudat], GODOT, CubeNav [@cubenav2023], and Orbit14.
-Among these, only GMAT, ODTBX, and TudatPy are open-source, underscoring the value of
-additional shared, community-supported development. SCB addresses this gap by providing,
-in a single Python-native package: a library of force models and high-order numerical
-integrators; measurement models for both simulated and real radiometric and optical data,
-including actual Deep Space Network (DSN) and ESTRACK formats; sequential and batch orbit
-determination filters validated against real mission data; maneuver planning tools; and a
-SPICE-integrated time and frame management system. The primary audience is the
-astrodynamics research community and mission teams requiring a flexible, auditable,
-open-source navigation platform.
-
+[@gmat2022], Tudat [@dirkx2024tudat], GODOT, CubeNav [@cubenav2023], and Orbit14.
+Among these, only GMAT, ODTBX, GODOT, and Tudat are open-source, underscoring the value of
+additional shared, community-supported development. SCB addresses this gap by providing ETC.ETC.ETC.
 # State of the Field
 
 Among the open-source tools listed above, SCB is most directly compared to GMAT and
@@ -90,17 +82,14 @@ TudatPy:
 propagation and maneuver targeting capabilities. Its OD functionality is limited and
 it does not provide a modular Python API suited to research-level algorithm development.
 
-**TudatPy** [@dirkx2024tudat] provides a well-documented Python interface to the Tudat
+**Tudat** [@dirkx2024tudat] provides a well-documented Python interface to the Tudat
 C++ astrodynamics library with strengths in trajectory propagation and optimization, but
-limited orbit determination capabilities and no support for real DSN data ingestion.
-
-**Basilisk** [@kenneally2020basilisk], developed at the same institution as SCB,
-addresses spacecraft attitude dynamics and control system simulation rather than
-navigation and OD, making the tools complementary. SCB's design was directly inspired
-by Basilisk's modular, open-source approach [@mcmahon2025gnc].
+limited operational capabilities and ETC.ETC.ETC.
 
 **ODTBX** is an open-source MATLAB/Java tool for OD analysis developed at NASA
 Goddard; its development has been inactive in recent years.
+
+**GODOT** is ETC.ETC.ETC.
 
 None of these tools offer a complete, Python-native OD pipeline combining real
 radiometric data ingestion (DSN TRK-2-34 and ESTRACK formats), multiple filter types
@@ -109,14 +98,13 @@ DMC), consider parameters, measurement editing, and SPICE-native time and frame
 management throughout. Contributing a capability of this scope to any existing tool
 would have required restructuring its fundamental architecture; SCB was designed from
 the ground up around interplanetary mission navigation requirements, building on the
-scientific Python ecosystem [@virtanen2020scipy; @harris2020numpy] rather than
-re-implementing general numerical infrastructure.
+scientific Python ecosystem [@virtanen2020scipy; @harris2020numpy].
 
 # Software Design
 
 **Python/Rust hybrid architecture.** The primary API is written in Python using an
 object-oriented design. Users configure dynamics models, measurement types, and
-estimation filters as Python objects, compose them into a `MissionSequence`, and
+estimation filters as Python objects, compose them, and
 execute the navigation pipeline with minimal boilerplate. The Rust back-end is reserved
 for the performance-critical integration hot path. The IAS15 integrator
 [@rein2015ias15]—an implicit adaptive 15th-order method suited for long-arc deep-space
@@ -176,11 +164,8 @@ validation arc uses Emirates Mars Mission (EMM) tracking data through multiple D
 exercising different measurement geometries and ground-station antenna configurations.
 These cases provide reproducible benchmarks for external users.
 
-The software has been presented at three peer-reviewed conference proceedings since 2025:
-the 47th AAS Guidance, Navigation and Control Conference [@mcmahon2025gnc], the AAS/AIAA
-Astrodynamics Specialist Conference [@mcmahon2025astro], and the 30th International
-Symposium on Space Flight Dynamics [@mcmahon2026issfd]. SCB is developed collaboratively
-across four institutions in two countries, and its twelve-notebook tutorial suite—covering
+SCB is developed collaboratively
+across three institutions in two countries, and its twelve-notebook tutorial suite—covering
 basics through real-data OD—lowers the barrier to entry for new research groups.
 
 # AI Usage Disclosure
