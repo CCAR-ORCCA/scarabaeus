@@ -9,7 +9,7 @@ name = "scarabaeus"
 version = "2026.0.0"
 description = "Open-source Python framework for spacecraft navigation and orbit determination"
 license = { file = "LICENSE" }
-# requires-python = "==3.11.9"
+requires-python = "==3.11.9"
 dependencies = [
     "numpy",
     "scikit-learn",
