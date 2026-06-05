@@ -25,6 +25,8 @@ authors:
     affiliation: 3
   - name: Mattia Pugliatti
     affiliation: 1
+  - name: Jacopo Villa
+    affiliation: 3
   - name: Mohamed Almashjari
     affiliation: 4
   - name: Jeremy Knittel
