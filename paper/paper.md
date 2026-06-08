@@ -101,37 +101,44 @@ accelerations. Process noise uses State Noise Compensation, with Dynamical Model
 Compensation and a batch stochastic mode, and outlier rejection is supported between
 iterations.
 
-**Verification and documentation.** Unit, integration, and functional tests (Pytest)
-cover object construction, methods, and exception handling; dynamics are validated
-against Copernicus, measurement partials against finite differencing, and the filters
-against real tracking data and public OD solutions. Documentation is generated with
-Sphinx and published online, complemented by tutorial notebooks spanning basics through
-real-data OD.
+**Verification and documentation.** TODO ZACK
 
 # Research Impact Statement
 
-SCB is developed in direct support of the Emirates Mission to the Asteroid Belt (EMA)
-[@parker2024ema], led by the UAE Space Agency, and is designed to process its radiometric
-and optical-navigation measurements across all mission phases. Its measurement and
-filtering implementations have been exercised against real and simulated data in three
-validation cases [@mcmahon2026issfd]: two-way sequential ranging and Doppler from
-OSIRIS-REx DSN passes (DSS-35, Canberra, July 2018) processed against the publicly
-archived reference trajectory; Emirates Mars Mission (EMM) tracking arcs through multiple
-DSN stations; and a fully simulated asteroid flyby that jointly estimates the spacecraft
-state and two trajectory-correction maneuvers from combined radiometric and optical data.
-In each case the post-fit residuals are centered and statistically consistent with the
-assigned measurement noise (\autoref{fig:residuals}), indicating that systematic effects
-are absorbed into the estimated parameters.
+SCB is developed in direct support of the Emirates Mission to the Asteroid Belt
+(EMA) [@parker2024ema], led by the UAE Space Agency, and is designed to process the
+mission's radiometric and optical-navigation measurements across all flight phases. Its
+dynamical models, together with their associated partial derivatives, have been validated
+against the state-of-the-art high-fidelity propagator Copernicus [@williams2025copernicus]
+across more than a dozen test cases spanning a range of dynamical combinations. A
+representative comparison is shown in \autoref{fig:copernicus} for Case 8, a two-body
+problem with the Sun as the central body augmented by an impulsive maneuver.
+
+The measurement and filtering implementations have been exercised against both real and
+simulated data in three validation cases [@mcmahon2026issfd]: (i) two-way sequential
+ranging and Doppler from OSIRIS-REx DSN passes (DSS-35, Canberra, July 2018), processed
+against the publicly archived reference trajectory; (ii) Emirates Mars Mission (EMM)
+tracking arcs collected through multiple DSN stations; and (iii) a fully simulated asteroid
+flyby that jointly estimates the spacecraft state and two trajectory-correction maneuvers
+from combined radiometric and optical data. In each case the post-fit residuals are
+centered and statistically consistent with the assigned measurement noise
+(\autoref{fig:residuals}), indicating that systematic effects are absorbed into the
+estimated parameters.
+
+![Comparison of SCB against Copernicus for Case 8: a two-body problem with the Sun as the
+central body and an impulsive maneuver.\label{fig:copernicus}](figures/picture1.png)
 
 ![Example post-fit two-way sequential range and Doppler residuals from an OSIRIS-REx DSN
 tracking pass (DSS-35, Canberra), estimated with the least-squares batch filter. Residuals
-are centered and statistically consistent with the assigned measurement noise.\label{fig:residuals}](figures/osirisrex_residuals.png)
+are centered and statistically consistent with the assigned measurement noise.\label{fig:residuals}](figures/picture2.png)
 
-SCB has been presented at peer-reviewed conference proceedings since 2025
-[@mcmahon2025gnc; @mcmahon2026issfd], and supports the ongoing development of the EMA
-flight-dynamics pipeline [@kuleib2026maneuver]. Developed collaboratively across four
-institutions in two countries, with public Sphinx documentation and tutorial notebooks,
-it lowers the barrier to entry for new research groups.
+SCB has been presented in several conference proceedings [@mcmahon2026issfd]. While the
+software is already well suited to interplanetary navigation, future development will focus
+on improved models for small-body proximity operations. This work will introduce
+new terrain-relative navigation observables, estimation of asteroid-specific parameters,
+enhanced multi-arc filtering, and, potentially, support for binary asteroid systems. Real
+Delta-DOR measurements using quasar references are also under development, alongside
+finite-burn targeting capabilities [@kuleib2026maneuver].
 
 # AI Usage Disclosure
 

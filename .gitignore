@@ -67,6 +67,9 @@ tutorials/tutorial_results/*
 *.log
 *.gz
 
+## JOSS paper figures must be tracked (override *.png above)
+!paper/figures/*.png
+
 ## test output (coverage + profiling)
 .coverage
 prof/
