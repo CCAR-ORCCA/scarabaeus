@@ -94,9 +94,28 @@
                Data Types for Navigation},
   series    = {{JPL} Deep Space Communications and Navigation Series},
   publisher = {Wiley-Interscience},
-  year      = {2003},
+  year      = {2000},
   address   = {Hoboken, NJ},
   isbn      = {978-0-471-44534-3}
+}
+
+@software{pytrk234,
+  author    = {{NASA Planetary Data System} and {Planetary Radar and Radio Sciences Group, Jet Propulsion Laboratory}},
+  title     = {{PyTrk234}: Python Reader Library for the {Deep Space Network}'s
+               {TRK 2-34} Tracking and Navigation Files},
+  publisher = {NASA-PDS},
+  url       = {https://github.com/NASA-PDS/PyTrk234},
+  note      = {Accessed: 2026-06-08}
+}
+
+@techreport{mco1999,
+  author      = {{Mars Climate Orbiter Mishap Investigation Board}},
+  title       = {{Mars Climate Orbiter} Mishap Investigation Board Phase {I} Report},
+  institution = {National Aeronautics and Space Administration},
+  year        = {1999},
+  month       = nov,
+  address     = {Washington, DC},
+  note        = {November 10, 1999}
 }
 
 % ---- Filter references ----
@@ -107,6 +126,37 @@
   publisher = {Academic Press},
   year      = {1977},
   address   = {New York}
+}
+
+% ---- Infrastructure / tooling ----
+
+@misc{mongodb,
+  author       = {{MongoDB, Inc.}},
+  title        = {{MongoDB}},
+  howpublished = {\url{https://www.mongodb.com}},
+  note         = {Accessed: 2026-06-08}
+}
+
+@misc{pymongo,
+  author       = {{MongoDB, Inc.}},
+  title        = {{PyMongo}: The Official {MongoDB} {Python} Driver},
+  howpublished = {\url{https://pymongo.readthedocs.io}},
+  note         = {Accessed: 2026-06-08}
+}
+
+@misc{sphinx,
+  author       = {Brandl, Georg and {the Sphinx team}},
+  title        = {{Sphinx} Documentation Generator},
+  howpublished = {\url{https://www.sphinx-doc.org}},
+  note         = {Accessed: 2026-06-08}
+}
+
+@misc{pytest,
+  author       = {Krekel, Holger and Oliveira, Bruno and Pfannschmidt, Ronny and
+                  Bruynooghe, Floris and Laugher, Brianna and Bruhin, Florian},
+  title        = {{pytest}},
+  howpublished = {\url{https://docs.pytest.org}},
+  note         = {Accessed: 2026-06-08}
 }
 
 % ---- Related astrodynamics tools ----
@@ -131,21 +181,50 @@
   url       = {https://gmat.gsfc.nasa.gov}
 }
 
-@inproceedings{maisonobe2010orekit,
-  author    = {Maisonobe, L. and Pommier, V. and Parraud, P.},
-  title     = {Orekit: An open source library for operational flight dynamics applications},
-  booktitle = {Proceedings of the 4th International Conference on Astrodynamics Tools
-               and Techniques},
-  year      = {2010},
-  address   = {Madrid, Spain}
+@misc{gisolfi2025tudat,
+  author        = {Gisolfi, Luigi and Dirkx, Dominic and Fayolle, Sam and
+                   Filice, Valerio and Alkahal, Riva and Avillez, Miguel and
+                   Dijkstra, Tristan and Hener, Jonas and Hin{\"u}ber, Lars and
+                   Langbroek, Marco and Maistri, Nicol{\`o} and Plumaris, Michael and
+                   Sanchez Rodriguez, Alfonso and Cim{\`o}, Giuseppe and Cowan, Kevin and
+                   Dahmani, Fabien and Encarnacao, Jo{\~a}o and Garrett, Geoffrey and
+                   Gehly, Steve and Hu, Xuanyu and Jeanjean, Marceau and
+                   L{\'o}pez Rivera, Antonio and Minervino Amodio, Andrea and
+                   Molera Calv{\'e}s, Guifre and Reichel, Markus and Root, Bart and
+                   S{\o}ndergaard, Martin and Stiller, Dominik and {Van Hulle}, Simon and
+                   {Verdoes Kleijn}, Gijs and Williams, Rees and Witte, Daan},
+  title         = {Open-Source High-Fidelity Orbit Estimation for Planetary Science and
+                   Space Situational Awareness Using the {Tudat} Software},
+  year          = {2025},
+  eprint        = {2510.23179},
+  archivePrefix = {arXiv},
+  primaryClass  = {astro-ph.EP},
+  doi           = {10.48550/arXiv.2510.23179}
 }
 
-@misc{dirkx2024tudat,
-  author = {Dirkx, D. and Fayolle, M. and Garrett, M. and Melman, J. and
-            Musegaas, P. and others},
-  title  = {{TudatPy}: The {Tudat} Space Toolbox {Python} API},
-  year   = {2024},
-  url    = {https://github.com/tudat-team/tudatpy}
+@misc{godot,
+  author = {{ESA/ESOC Flight Dynamics}},
+  title  = {{GODOT}: Generic Orbit Determination and Optimization Toolkit},
+  howpublished = {\url{https://godot.io.esa.int/docs/}},
+  note   = {Accessed: 2026-06-08}
+}
+
+@inproceedings{vallado2010odtk,
+  author    = {Vallado, David A. and Hujsak, Richard S. and Johnson, Thomas M. and
+               Seago, John H. and Woodburn, James W.},
+  title     = {Orbit Determination Using {ODTK} Version 6},
+  booktitle = {4th International Conference on Astrodynamics Tools and Techniques},
+  year      = {2010},
+  address   = {European Space Astronomy Centre (ESA/ESAC), Madrid, Spain}
+}
+
+@article{nicholas2025geodyn,
+  author  = {Nicholas, Joseph B. and Rowlands, David D. and Luthcke, Scott B. and others},
+  title   = {The {GEODYN} Precision Orbit Determination Software},
+  journal = {ESS Open Archive},
+  year    = {2025},
+  month   = feb,
+  doi     = {10.22541/essoar.174051780.04684918/v1}
 }
 
 @article{kenneally2020basilisk,
@@ -160,29 +239,27 @@
   doi     = {10.2514/1.I010762}
 }
 
-@inproceedings{cubenav2023,
-  author    = {Bhaskaran, S. and Ryne, M. and others},
-  title     = {{CubeNav}: A Small Spacecraft Navigation Tool},
+@inproceedings{williams2025copernicus,
+  author    = {Williams, J. and Senent, J. S. and Mathur, R. and Stewart, S. M.},
+  title     = {A History of {Copernicus}: The Origin, Development, and Evolution of
+               {JSC}'s Spacecraft Trajectory Design and Optimization System},
   booktitle = {AAS/AIAA Astrodynamics Specialist Conference},
-  year      = {2023}
-}
-
-@techreport{copernicus2010,
-  author      = {Ocampo, C.},
-  title       = {Copernicus: A Generalized Trajectory Design and Optimization System},
-  institution = {NASA Johnson Space Center},
-  year        = {2010},
-  url         = {https://software.nasa.gov/software/MSC-24630-1}
+  year      = {2025},
+  address   = {Boston, MA},
+  note      = {AAS 25-576}
 }
 
 % ---- EMA mission ----
 
-@inproceedings{ema2021,
-  author    = {Gavin, P. and Alloghani, M. and others},
-  title     = {The {Emirates Mission to the Asteroid Belt}: Overview and Science Objectives},
-  booktitle = {Lunar and Planetary Science Conference},
-  year      = {2021},
-  address   = {The Woodlands, TX}
+@inproceedings{parker2024ema,
+  author    = {Parker, Jeffrey and Hameli, Fatema and Knittel, Jeremy and
+               Caudill, Michael and Chikine, Sai and Baskar, Sandeep and
+               Koehler, Andrew and Imler, Paul},
+  title     = {The Preliminary Mission Design of the {Emirates Mission to Explore the
+               Asteroids (EMA)}},
+  booktitle = {AAS/AIAA Space Flight Mechanics Meeting},
+  year      = {2024},
+  note      = {AAS 24-064}
 }
 
 % ---- Scarabaeus publications ----
@@ -199,19 +276,10 @@
   address   = {Breckenridge, Colorado}
 }
 
-@inproceedings{mcmahon2025astro,
-  author    = {McMahon, J. W. and Pugliatti, M. and Fereoli, G. and Knittel, J. and
-               others},
-  title     = {The {Scarabaeus} Open-Source Navigation Tool: Preliminary Results and
-               Real Measurements},
-  booktitle = {AAS/AIAA Astrodynamics Specialist Conference},
-  year      = {2025},
-  address   = {Boston, MA}
-}
-
 @inproceedings{mcmahon2026issfd,
-  author    = {McMahon, J. W. and Fereoli, G. and Wolff, T. N. and Knittel, J. and
-               others},
+  author    = {McMahon, J. W. and Fereoli, G. and Wolf, T. and Ellis, Z. and
+               Aldhanhani, B. S. and Kuleib, M. and Frank, W. and Pugliatti, M. and
+               Almashjari, M. H. and Knittel, J.},
   title     = {{Scarabaeus}: An Open-Source Tool for Interplanetary Spacecraft Navigation},
   booktitle = {30th International Symposium on Space Flight Dynamics},
   year      = {2026},
@@ -219,8 +287,8 @@
 }
 
 @inproceedings{kuleib2026maneuver,
-  author    = {Kuleib, M. and Knittel, J. and Fereoli, G. and Aldhanhani, B. and
-               others},
+  author    = {Kuleib, M. and Knittel, J. and Fereoli, G. and McMahon, J. and
+               Frank, W. and Ellis, Z. and Wolf, T. and Aldhanhani, B.},
   title     = {Operational Maneuver Targeting Framework for the {Emirates Mission to
                the Asteroid Belt}},
   booktitle = {30th International Symposium on Space Flight Dynamics},
