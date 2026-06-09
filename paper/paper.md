@@ -33,8 +33,6 @@ authors:
     affiliation: 1
   - name: Jacopo Villa
     orcid: 0009-0009-9491-8317
-    affiliation: 1
-  - name: Jacopo Villa
     affiliation: 3
   - name: Mohamed Almashjari
     affiliation: 4
