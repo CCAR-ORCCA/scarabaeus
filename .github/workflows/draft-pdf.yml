@@ -1,0 +1,28 @@
+name: Draft PDF
+on:
+  push:
+    paths:
+      - paper/**
+      - .github/workflows/draft-pdf.yml
+
+jobs:
+  paper:
+    runs-on: ubuntu-latest
+    name: Paper Draft
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Open Journals PDF Generator
+        uses: openjournals/openjournals-draft-action@v1.0
+        with:
+          journal: joss
+          # Path to the paper relative to the repository root.
+          paper-path: paper/paper.md
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: paper
+          # Pandoc writes the PDF next to paper.md.
+          path: paper/paper.pdf
