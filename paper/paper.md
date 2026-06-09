@@ -116,11 +116,11 @@ centered and statistically consistent with the assigned measurement noise
 estimated parameters.
 
 ![Comparison of SCB against Copernicus for Case 8: a two-body problem with the Sun as the
-central body and an impulsive maneuver.\label{fig:copernicus}](figures/picture1.png)
+central body and an impulsive maneuver.\label{fig:copernicus}](figures/Picture1.png)
 
 ![Example post-fit two-way sequential range and Doppler residuals from an OSIRIS-REx DSN
 tracking pass (DSS-35, Canberra), estimated with the least-squares batch filter. Residuals
-are centered and statistically consistent with the assigned measurement noise.\label{fig:residuals}](figures/picture2.png)
+are centered and statistically consistent with the assigned measurement noise.\label{fig:residuals}](figures/Picture2.png)
 
 SCB has been presented in several conference proceedings [@mcmahon2026issfd]. While the
 software is already well suited to interplanetary navigation, future development will focus
