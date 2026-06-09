@@ -1,5 +1,5 @@
 ---
-title: 'Scarabaeus: An Open-Source Tool for Interplanetary Spacecraft Navigation'
+title: 'Scarabaeus: a Modular Orbit Determination Framework for Deep-Space and Small-Body Missions'
 tags:
   - Python
   - Rust
