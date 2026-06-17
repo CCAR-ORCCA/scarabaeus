@@ -89,7 +89,13 @@ SCB's capabilities provide the core functionality required for both operational 
 
 **Filtering framework.** Four estimators are currently implemented: a linearized Kalman filter, a least-squares batch estimator, and sequential and batch square-root information filters [@bierman1977], with smoothing capabilities available for both sequential formulations. Estimable parameters include spacecraft states as well as a broad range of dynamical and measurement model parameters. SCB also supports consider parameters. Several approaches are available for modeling process uncertainty. Sequential filters support both State Noise Compensation (SNC) and Dynamical Model Compensation (DMC), while batch estimators support stochastic parameters through piecewise empirical accelerations. Measurement editing can be performed between filter iterations using interactive lasso selection, statistical editing based on residual consistency tests, or user-defined data ranges. All estimation solutions can be mapped to arbitrary epochs and reference frames and exported for downstream analysis. SCB supports multi-leg and multi-arc estimation problems.
 
-**Verification and documentation.** TODO ZACK
+**Testing.** Scarabaues utilizes Pytest to run its testing suite, comprised of three main components:
+- unit testing: small, per class/function tests designed to isolate low level issues.
+- integration testing: intermediate tests that ensure proper passing of data and interactions between classes.
+- functional testing: full scale tests that ensure functionality end-to-end across the entire tool.
+These tests are run on every merge, along with a performance check to ensure computational efficiency hasn't been lost as well. When new classes or functions are added, unit tests are written for them, as well as intergration and functional tests when/if necessary.
+
+**Documentation.** Scarabaeus' documentation is maintained on two fronts: the source code documentation via docstrings, and the online documentation via Sphinx , Jupyter Notebooks, and .rst files. Source code documentation is defined within the Scarabaeus style guide, maintaining a standardized format across the codebase that also is guaranteed to function correctly with the online documentation that is automatically generated for all classes using Sphinx. In addition to the generated documentation, tutorials and additional articles and guides are maintained on the online documentation using a combination of Jupyter Notebooks for tutorials and .rst files for any other necessary guides.
 
 # Research Impact Statement
 
