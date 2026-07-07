@@ -145,9 +145,9 @@ work and judgment.
 
 # Acknowledgements
 
-The development of Scarabaeus was supported by the United Arab Emirates Space Agency
-through its knowledge partnership with the University of Colorado Boulder's Laboratory
-for Atmospheric and Space Physics. The authors thank past members of the ORCCA
+Funding for the co-development of the Emirates Mission to Explore the Asteroid Belt is provided 
+by the United Arab Emirates Space Agency to its knowledge partner, the University of Colorado 
+Boulder’s Laboratory for Atmospheric and Space Physics. The authors thank past members of the ORCCA
 laboratory who contributed to earlier versions of the codebase: Ms. Annalise Cabra, Dr. Anivid
 Faura-Pedros, Mr. Kian Shakerin, Dr. Chloe Long, Dr. Dahlia Baker, Dr. Matthew Givens, Dr. Spencer Boone,
 Mr. Santhosh Pattamudu-Manoharan, and Mr. Lars Hinüber.
