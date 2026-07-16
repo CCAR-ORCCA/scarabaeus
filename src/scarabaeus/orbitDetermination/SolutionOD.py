@@ -1866,8 +1866,16 @@ class SolutionOD:
             For sequences, returns a list with one deviation per leg if not mapping back.
             Otherwise returns a single deviation vector.
         """
-        # If smoothed solution is available and requested, use first deviation directly
+        # If smoothed solution is available and requested, use the first smoothed
+        # deviation. It lives at the first measurement epoch, which may be later
+        # than t0, so map it back via Phi(t_first_meas, t0)^-1 (identity when they
+        # coincide).
         if use_smoothed and self.deviation_smooth is not None:
+            if not self.filter.flag_sequence:
+                STM_t1_t0 = self.filter.trajectory.get_STM(
+                    epoch=float(self.timestamps[0]), idx=None
+                )
+                return self.filter._safe_inv(STM_t1_t0) @ self.deviation_smooth[0]
             return self.deviation_smooth[0]
 
         deviation_source = self.deviation_est
@@ -1881,8 +1889,11 @@ class SolutionOD:
         # Non-sequence: unchanged
         # -------------------------
         if not self.filter.flag_sequence:
+            # deviation_source[-1] lives at the last measurement epoch, which may
+            # precede the trajectory end when the reference is propagated with
+            # padding, so take the STM at that epoch (not STMs_timestamp[-1]).
             STM_tend_t0 = self.filter.trajectory.get_STM(
-                epoch=self.filter.trajectory.STMs_timestamp[-1], idx=None
+                epoch=float(self.timestamps[-1]), idx=None
             )
             return self.filter._safe_inv(STM_tend_t0) @ deviation_source[-1]
 
@@ -1891,7 +1902,9 @@ class SolutionOD:
         # -------------------------
         nlegs = len(self.filter.legs_epochs)
 
-        # 1) Last STM for each leg (AT LEG END) using idx_leg (no direct _STMs access)
+        # 1) Leg-end STM for each leg, Phi_leg(leg_end, leg_start), using idx_leg (no
+        #    direct _STMs access). Only valid for deviations that live at the leg-end
+        #    (node) epoch; deviations at a leg's last measurement epoch use stm_at_dev.
         last_STMs_legs = [
             self.filter.trajectory.get_STM_sequence(
                 epoch=float(self.filter.legs_epochs[i][-1]),
@@ -1918,12 +1931,18 @@ class SolutionOD:
         else:
             timeline_sorted = t2_sorted
 
-        # Helper: index of last timeline time <= t (indexes into deviation_source)
-        def _last_timeline_idx_before(t: float) -> int:
-            j = int(np.searchsorted(timeline_sorted, float(t), side="right") - 1)
+        # Helper: index into deviation_source of the last timeline epoch belonging to
+        # leg i. An entry recorded exactly at an event-node epoch belongs to the next
+        # leg (the filter increments its leg counter at the node), so skip it.
+        def _last_dev_idx_for_leg(i: int) -> int:
+            le = float(self.filter.legs_epochs[i][-1])
+            j = int(np.searchsorted(timeline_sorted, le, side="right") - 1)
+            if j >= 0 and i < nlegs - 1 and np.isclose(timeline_sorted[j], le):
+                j -= 1  # skip the node entry (it belongs to leg i+1)
             if j < 0:
                 raise ValueError(
-                    f"No timeline time <= {t} (first time is {timeline_sorted[0]})."
+                    f"No timeline time within leg {i} (leg end {le}, first time "
+                    f"{timeline_sorted[0]})."
                 )
             return j
 
@@ -1936,11 +1955,14 @@ class SolutionOD:
             dev_n = _trim(dev, n)
             return np.linalg.solve(Phi, dev_n)
 
-        # 3) For each leg, get the deviation at the last timeline epoch <= the leg end.
-        #    Since event epochs are included in timeline_sorted, this correctly skips
-        #    them when searching for the last measurement epoch.
-        idx_leg_end = [
-            _last_timeline_idx_before(self.filter.legs_epochs[i][-1])
+        # 3) For each leg, the deviation-history index that belongs to it (its last
+        #    measurement epoch) and the STM evaluated at that same epoch (a leg may be
+        #    propagated past its last measurement).
+        idx_leg_end = [_last_dev_idx_for_leg(i) for i in range(nlegs)]
+        stm_at_dev = [
+            self.filter.trajectory.get_STM_sequence(
+                epoch=float(timeline_sorted[idx_leg_end[i]]), idx_leg=i
+            )
             for i in range(nlegs)
         ]
 
@@ -1951,10 +1973,10 @@ class SolutionOD:
             # deviation at leg end, mapped to leg start, one per leg
             dev_end_list = [deviation_source[idx_leg_end[i]] for i in range(nlegs)]
 
-            # Map each leg independently: end -> start
+            # Map each leg independently: last-measurement epoch -> leg start.
             # NOTE: this returns deviations at each leg start in that leg's own definition.
             new_prior_deviation = [
-                _map_back(last_STMs_legs[i], dev_end_list[i], self.filter.legs_n[i])
+                _map_back(stm_at_dev[i], dev_end_list[i], self.filter.legs_n[i])
                 for i in range(nlegs)
             ]
             return new_prior_deviation
@@ -1962,10 +1984,11 @@ class SolutionOD:
         # -------------------------
         # Case B: map back through entire sequence (return list, one per leg start)
         # -------------------------
-        # Start from last leg end deviation
+        # Start from the last leg's deviation at its last-measurement epoch, mapped
+        # to the leg start with the STM at that same epoch.
         dev_end = deviation_source[idx_leg_end[-1]]
         n_last = self.filter.legs_n[-1]
-        dev_start = _map_back(last_STMs_legs[-1], dev_end, n_last)
+        dev_start = _map_back(stm_at_dev[-1], dev_end, n_last)
 
         new_prior_deviation = [dev_start]
 
@@ -1983,7 +2006,9 @@ class SolutionOD:
                 dev_in_prev_def_at_node, self.filter.legs_n[k - 1]
             )
 
-            # 4) map within previous leg: node(end) -> start
+            # 4) map within previous leg: node(end) -> start (after the definition
+            #    reduction the deviation lives at the node epoch, so the leg-end STM
+            #    applies here).
             dev_start = _map_back(
                 last_STMs_legs[k - 1],
                 dev_in_prev_def_at_node,

@@ -382,11 +382,21 @@ class SphericalHarmonicsGravity(DynamicModel):
             R_b2rf
             if R_b2rf is not None
             else SpiceManager.get_xfrm(
-                self._body["ref_name"], self._ref_frame.name, epoch
+                self._sph_body_fixed_frame(), self._ref_frame.name, epoch
             )
         )
         acceleration_rf = body_fixed_to_ext_DCM @ acceleration_bf.reshape((3, 1))
         return acceleration_rf.flatten()
+
+    def _sph_body_fixed_frame(self):
+        """Body-fixed (rotating) frame name of the SPH gravity body.
+
+        ``self._body`` may be either a ``dict`` (frame under the ``"ref_name"``
+        key) or a ``CelestialBody`` (frame is the ``.base_frame`` attribute).
+        """
+        if isinstance(self._body, dict):
+            return self._body["ref_name"]
+        return self._body.base_frame
 
     def _jacobian_C_transform_rf(
         self, jacobian_C_bf: np.ndarray, epoch: float, R_b2rf=None
@@ -416,7 +426,7 @@ class SphericalHarmonicsGravity(DynamicModel):
             R_b2rf
             if R_b2rf is not None
             else SpiceManager.get_xfrm(
-                self._body["ref_name"], self._ref_frame.name, epoch
+                self._sph_body_fixed_frame(), self._ref_frame.name, epoch
             )
         )
         jacobian_C_rf = np.tensordot(bodyFixed_to_ext_DCM, jacobian_C_bf, axes=(1, 0))
@@ -448,7 +458,7 @@ class SphericalHarmonicsGravity(DynamicModel):
             R_b2rf
             if R_b2rf is not None
             else SpiceManager.get_xfrm(
-                self._body["ref_name"], self._ref_frame.name, epoch
+                self._sph_body_fixed_frame(), self._ref_frame.name, epoch
             )
         )
         jacobian_rf = bodyFixed_to_ext_DCM @ jacobian_bf @ bodyFixed_to_ext_DCM.T
@@ -488,7 +498,7 @@ class SphericalHarmonicsGravity(DynamicModel):
         else:
             ext_to_bodyFixed_DCM = SpiceManager.get_xfrm(
                 frame_from=self._ref_frame.name,
-                frame_to=self.SPH_body["ref_name"],
+                frame_to=self._sph_body_fixed_frame(),
                 epoch=epoch,
             )
 
@@ -543,6 +553,10 @@ class SphericalHarmonicsGravity(DynamicModel):
             bnm_ext_imag.append([])
 
         if not self.normalized:
+            # This branch indexes with tuple subscripts, so it needs (N, N) arrays
+            # rather than the lists-of-lists allocated above.
+            bnm_ext_real = np.zeros((N, N))
+            bnm_ext_imag = np.zeros((N, N))
             for m in range(self.order + 3):
                 for n in range(m, self.order + 3):
                     if m == n:
