@@ -1866,25 +1866,16 @@ class SolutionOD:
             For sequences, returns a list with one deviation per leg if not mapping back.
             Otherwise returns a single deviation vector.
         """
-        # If smoothed solution is available and requested, use the first smoothed deviation.
-        # deviation_smooth is indexed by get_spacecraft_times(), so deviation_smooth[0] lives at
-        # the FIRST MEASUREMENT epoch -- which is only the reference epoch t0 when the reference
-        # is not propagated before the first observation. When t0 precedes the first measurement
-        # (e.g. an a-priori epoch state ahead of the first tracking pass, or a padded reference
-        # arc), map it back to t0 via Phi(t_first_meas, t0)^-1, mirroring the filtered branch
-        # below. When they coincide Phi = I and this is a no-op.
+        # If smoothed solution is available and requested, use the first smoothed
+        # deviation. It lives at the first measurement epoch, which may be later
+        # than t0, so map it back via Phi(t_first_meas, t0)^-1 (identity when they
+        # coincide).
         if use_smoothed and self.deviation_smooth is not None:
             if not self.filter.flag_sequence:
                 STM_t1_t0 = self.filter.trajectory.get_STM(
                     epoch=float(self.timestamps[0]), idx=None
                 )
                 return self.filter._safe_inv(STM_t1_t0) @ self.deviation_smooth[0]
-            # Sequence / multi-leg smoother: currently UNREACHABLE -- both the LKF and
-            # SRIF smoothers raise ValueError when flag_sequence is True (sequence mode
-            # is unsupported), so deviation_smooth is never populated for a sequence and
-            # this branch cannot be hit. If sequence smoothing is ever implemented, the
-            # first smoothed deviation must be mapped back to leg 0's start with
-            # Phi_leg0(t_first_meas, leg0_start)^-1, analogous to the single-arc branch.
             return self.deviation_smooth[0]
 
         deviation_source = self.deviation_est
@@ -1898,14 +1889,9 @@ class SolutionOD:
         # Non-sequence: unchanged
         # -------------------------
         if not self.filter.flag_sequence:
-            # deviation_source[-1] is the filtered deviation at the LAST MEASUREMENT
-            # epoch (deviation_est is indexed by get_spacecraft_times()). The STM used
-            # to map it back to t0 must therefore be Phi(t_last_meas, t0), i.e. taken at
-            # the last measurement epoch -- NOT STMs_timestamp[-1], which is the last
-            # TRAJECTORY epoch and can be later than the last measurement (e.g. when the
-            # reference is propagated with padding past the measurement arc). Using the
-            # trajectory-end STM injects a spurious Phi(t_last_meas, t_traj_end) factor
-            # that corrupts the re-linearization correction and diverges on iterate.
+            # deviation_source[-1] lives at the last measurement epoch, which may
+            # precede the trajectory end when the reference is propagated with
+            # padding, so take the STM at that epoch (not STMs_timestamp[-1]).
             STM_tend_t0 = self.filter.trajectory.get_STM(
                 epoch=float(self.timestamps[-1]), idx=None
             )
@@ -1916,13 +1902,9 @@ class SolutionOD:
         # -------------------------
         nlegs = len(self.filter.legs_epochs)
 
-        # 1) Leg-END STM for each leg, Phi_leg(leg_end, leg_start), using idx_leg (no
-        #    direct _STMs access). This is ONLY correct for mapping a deviation that
-        #    genuinely lives at the leg-end (node) epoch -- i.e. the Case-B intermediate
-        #    node->start reductions below. The Case-A per-leg map-back and the first
-        #    Case-B step instead use stm_at_dev (built further down), evaluated at the
-        #    leg's actual last-measurement epoch, because a padded leg's deviation lives
-        #    BEFORE its leg-end (see the single-arc fix for the same STM-epoch mismatch).
+        # 1) Leg-end STM for each leg, Phi_leg(leg_end, leg_start), using idx_leg (no
+        #    direct _STMs access). Only valid for deviations that live at the leg-end
+        #    (node) epoch; deviations at a leg's last measurement epoch use stm_at_dev.
         last_STMs_legs = [
             self.filter.trajectory.get_STM_sequence(
                 epoch=float(self.filter.legs_epochs[i][-1]),
@@ -1949,12 +1931,9 @@ class SolutionOD:
         else:
             timeline_sorted = t2_sorted
 
-        # Helper: index into deviation_source of the last timeline epoch that BELONGS
-        # to leg i. Start from the last timeline time <= the leg end, but when the leg
-        # ends at an event node (every leg except the last) drop that node epoch: the
-        # sequence filter increments its leg counter AT the node before it stores the
-        # deviation, so the entry recorded at the node epoch already holds the NEXT
-        # leg's start deviation, not this leg's end deviation.
+        # Helper: index into deviation_source of the last timeline epoch belonging to
+        # leg i. An entry recorded exactly at an event-node epoch belongs to the next
+        # leg (the filter increments its leg counter at the node), so skip it.
         def _last_dev_idx_for_leg(i: int) -> int:
             le = float(self.filter.legs_epochs[i][-1])
             j = int(np.searchsorted(timeline_sorted, le, side="right") - 1)
@@ -1977,11 +1956,8 @@ class SolutionOD:
             return np.linalg.solve(Phi, dev_n)
 
         # 3) For each leg, the deviation-history index that belongs to it (its last
-        #    measurement epoch), and the STM evaluated at THAT epoch. Using the STM at
-        #    the deviation's own epoch -- rather than at the leg-end trajectory epoch --
-        #    removes the spurious Phi(t_last_meas, leg_end) factor that otherwise
-        #    corrupts the map-back whenever a leg is propagated past its last
-        #    measurement (a PAD gap). Mirrors the single-arc fix in the branches above.
+        #    measurement epoch) and the STM evaluated at that same epoch (a leg may be
+        #    propagated past its last measurement).
         idx_leg_end = [_last_dev_idx_for_leg(i) for i in range(nlegs)]
         stm_at_dev = [
             self.filter.trajectory.get_STM_sequence(
@@ -1997,8 +1973,7 @@ class SolutionOD:
             # deviation at leg end, mapped to leg start, one per leg
             dev_end_list = [deviation_source[idx_leg_end[i]] for i in range(nlegs)]
 
-            # Map each leg independently: last-measurement epoch -> leg start, using the
-            # STM at the deviation's actual epoch (stm_at_dev), NOT the leg-end STM.
+            # Map each leg independently: last-measurement epoch -> leg start.
             # NOTE: this returns deviations at each leg start in that leg's own definition.
             new_prior_deviation = [
                 _map_back(stm_at_dev[i], dev_end_list[i], self.filter.legs_n[i])
@@ -2009,9 +1984,8 @@ class SolutionOD:
         # -------------------------
         # Case B: map back through entire sequence (return list, one per leg start)
         # -------------------------
-        # Start from the last leg's deviation at its last-measurement epoch, mapped to
-        # the last leg's start with the STM at that same epoch (stm_at_dev), NOT the
-        # leg-end STM -- otherwise a padded last leg re-introduces the STM-epoch mismatch.
+        # Start from the last leg's deviation at its last-measurement epoch, mapped
+        # to the leg start with the STM at that same epoch.
         dev_end = deviation_source[idx_leg_end[-1]]
         n_last = self.filter.legs_n[-1]
         dev_start = _map_back(stm_at_dev[-1], dev_end, n_last)
@@ -2032,11 +2006,9 @@ class SolutionOD:
                 dev_in_prev_def_at_node, self.filter.legs_n[k - 1]
             )
 
-            # 4) map within previous leg: node(end) -> start. Here the deviation
-            #    genuinely lives at leg (k-1)'s END (node) epoch after the definition
-            #    reduction, so the leg-END STM Phi_leg(k-1)(leg_end, leg_start) is the
-            #    correct one (unlike Case A / the last-leg step, which map from a
-            #    last-measurement epoch that may precede the leg end).
+            # 4) map within previous leg: node(end) -> start (after the definition
+            #    reduction the deviation lives at the node epoch, so the leg-end STM
+            #    applies here).
             dev_start = _map_back(
                 last_STMs_legs[k - 1],
                 dev_in_prev_def_at_node,

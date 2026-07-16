@@ -382,7 +382,7 @@ class SphericalHarmonicsGravity(DynamicModel):
             R_b2rf
             if R_b2rf is not None
             else SpiceManager.get_xfrm(
-                self._sph_body_fixed_frame(), self._ref_frame.name, epoch  # BUGFIX: guard dict vs CelestialBody
+                self._sph_body_fixed_frame(), self._ref_frame.name, epoch
             )
         )
         acceleration_rf = body_fixed_to_ext_DCM @ acceleration_bf.reshape((3, 1))
@@ -391,18 +391,8 @@ class SphericalHarmonicsGravity(DynamicModel):
     def _sph_body_fixed_frame(self):
         """Body-fixed (rotating) frame name of the SPH gravity body.
 
-        BUGFIX: ``self._body`` (aka the ``SPH_body`` property) may be either a
-        ``dict`` (which carries the frame under the ``"ref_name"`` key) or a
-        ``CelestialBody`` (whose body-fixed frame is the ``.base_frame``
-        attribute). Several SPICE ``get_xfrm`` call sites subscripted
-        ``self._body["ref_name"]`` unconditionally, so they raised
-        ``TypeError: 'CelestialBody' object is not subscriptable`` whenever the
-        force model was built the normal, documented way with a ``CelestialBody``.
-        That broke the coefficient-partial path (``_compute_partial_by_C`` ->
-        ``_jacobian_C_transform_rf``) and the position-partial / acceleration
-        transforms, i.e. exactly the STM propagation needed to estimate J2/C20.
-        Centralize the guard here (mirrors the spice_name guard in
-        ``_rf_transform`` and ``_bodyFixed_to_rf_dcm``).
+        ``self._body`` may be either a ``dict`` (frame under the ``"ref_name"``
+        key) or a ``CelestialBody`` (frame is the ``.base_frame`` attribute).
         """
         if isinstance(self._body, dict):
             return self._body["ref_name"]
@@ -436,7 +426,7 @@ class SphericalHarmonicsGravity(DynamicModel):
             R_b2rf
             if R_b2rf is not None
             else SpiceManager.get_xfrm(
-                self._sph_body_fixed_frame(), self._ref_frame.name, epoch  # BUGFIX: guard dict vs CelestialBody
+                self._sph_body_fixed_frame(), self._ref_frame.name, epoch
             )
         )
         jacobian_C_rf = np.tensordot(bodyFixed_to_ext_DCM, jacobian_C_bf, axes=(1, 0))
@@ -468,7 +458,7 @@ class SphericalHarmonicsGravity(DynamicModel):
             R_b2rf
             if R_b2rf is not None
             else SpiceManager.get_xfrm(
-                self._sph_body_fixed_frame(), self._ref_frame.name, epoch  # BUGFIX: guard dict vs CelestialBody
+                self._sph_body_fixed_frame(), self._ref_frame.name, epoch
             )
         )
         jacobian_rf = bodyFixed_to_ext_DCM @ jacobian_bf @ bodyFixed_to_ext_DCM.T
@@ -508,7 +498,7 @@ class SphericalHarmonicsGravity(DynamicModel):
         else:
             ext_to_bodyFixed_DCM = SpiceManager.get_xfrm(
                 frame_from=self._ref_frame.name,
-                frame_to=self._sph_body_fixed_frame(),  # BUGFIX: guard dict vs CelestialBody
+                frame_to=self._sph_body_fixed_frame(),
                 epoch=epoch,
             )
 
@@ -563,14 +553,8 @@ class SphericalHarmonicsGravity(DynamicModel):
             bnm_ext_imag.append([])
 
         if not self.normalized:
-            # BUGFIX: the unnormalized branch indexes bnm_ext_real/imag with tuple
-            # subscripts (e.g. [n, n], [n-1, m], [n-2, m]), but the shared allocation
-            # above builds Python lists-of-lists, so every tuple index raised
-            # "TypeError: list indices must be integers or slices, not tuple". Re-allocate
-            # as (N, N) numpy arrays here (matching what the normalized branch produces
-            # after its np.array(...) at the end). Sub-diagonal entries (n < m) stay 0.0,
-            # which is correct, and the recursion order (outer m, inner n>=m) only reads
-            # entries already written. np.array(...) at the end is then a no-op copy.
+            # This branch indexes with tuple subscripts, so it needs (N, N) arrays
+            # rather than the lists-of-lists allocated above.
             bnm_ext_real = np.zeros((N, N))
             bnm_ext_imag = np.zeros((N, N))
             for m in range(self.order + 3):
