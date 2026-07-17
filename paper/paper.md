@@ -54,99 +54,92 @@ bibliography: paper.bib
 
 # Summary
 
-Scarabaeus (SCB) is an open-source spacecraft orbit determination (OD) software package developed by the Orbital Research Cluster for Celestial Applications (ORCCA) at the University of Colorado Boulder. The framework combines a modular, object-oriented Python front end with a hybrid Python and Rust back end for computationally intensive routines, providing a complete end-to-end navigation environment. SCB supports high-fidelity trajectory propagation using a configurable suite of dynamical models; simulation, ingestion, and processing of radiometric measurements, including two-way coherent Doppler, sequential ranging, range and range-rate; as well as optical measurements such as center-finding and landmark observations. The software includes a comprehensive estimation framework spanning batch and sequential filtering, consider and stochastic parameters, multi-arc estimation, square-root information filters and smoothers, and multiple process noise formulations. SCB leverages NASA's SPICE toolkit [@acton1996] for mission-grade handling of time systems, reference frames, and ephemerides.
+Scarabaeus (SCB) is an open-source spacecraft orbit determination (OD) package developed by the Orbital Research Cluster for Celestial Applications (ORCCA) at the University of Colorado Boulder. A modular, object-oriented Python front end and a hybrid Python-Rust back end for intensive computations form a complete end-to-end navigation environment. SCB provides high-fidelity trajectory propagation with configurable dynamical models; simulation, ingestion, and processing of radiometric measurements (two-way coherent Doppler, sequential ranging, range, and range-rate) and optical measurements (center-finding and landmark observations); and comprehensive estimation spanning batch and sequential filtering, consider and stochastic parameters, multi-arc estimation, square-root information filters and smoothers, and multiple process noise formulations. NASA's SPICE toolkit [@acton1996] supplies mission-grade time systems, reference frames, and ephemerides.
 
-Development of SCB is primarily motivated by the Emirates Mission to the Asteroid Belt (EMA) [@parker2024ema], which will launch the MBR Explorer spacecraft in 2028 to conduct six main belt asteroid flybys before rendezvous with asteroid (269) Justitia. Consequently, the software has been designed with a strong emphasis on interplanetary navigation and proximity operations around small bodies. At the same time, its modular architecture and broad measurement model support make it applicable to a wide range of navigation problems, including cislunar missions; while models such as GNSS measurement types and atmospheric drag are not yet implemented, the architecture enables their rapid development, making extension to Earth-orbiting applications straightforward.
+Development is primarily motivated by the Emirates Mission to the Asteroid Belt (EMA) [@parker2024ema], whose MBR Explorer spacecraft launches in 2028 for six main belt asteroid flybys before rendezvous with asteroid (269) Justitia. SCB therefore emphasizes interplanetary navigation and small-body proximity operations, yet its modular architecture and broad measurement support suit many other navigation problems, including cislunar missions; GNSS measurement types and atmospheric drag are not yet implemented but can be rapidly developed, making Earth-orbiting extension straightforward.
 
 
 # Statement of Need
 
-Spacecraft navigation requires solving a complex estimation problem that spans nearly every aspect of astrodynamics. High-fidelity trajectory propagation must account for gravitational and non-gravitational perturbations, while heterogeneous tracking data must be modeled and processed with comparable levels of fidelity. Orbit determination algorithms must then iteratively estimate the spacecraft state, dynamical and measurement model parameters, and associated uncertainties, ultimately producing statistically consistent state estimates and covariance information.
+Spacecraft navigation poses a complex estimation problem spanning nearly every aspect of astrodynamics: high-fidelity propagation must capture gravitational and non-gravitational perturbations, heterogeneous tracking data must be modeled and processed with comparable fidelity, and OD algorithms must iteratively estimate the spacecraft state, dynamical and measurement model parameters, and associated uncertainties, producing statistically consistent estimates and covariance information.
 
-The state of the art in spacecraft orbit determination software is well established. Mature and comprehensive tools include MONTE [@monte2018], GEODYN [@nicholas2025geodyn], ODTK [@vallado2010odtk], Tudat [@gisolfi2025tudat], and GODOT [@godot]. While other navigation tools exist, many are developed for specific classes of spacecraft missions or for individual organizations and are not intended to serve as general-purpose, mission-agnostic frameworks. Among the major publicly available systems, Tudat is currently the only fully open-source solution, highlighting the need for additional community-developed and openly accessible navigation software.
+The state of the art is well established: mature, comprehensive tools include MONTE [@monte2018], GEODYN [@nicholas2025geodyn], ODTK [@vallado2010odtk], Tudat [@gisolfi2025tudat], and GODOT [@godot]. Many other tools target specific mission classes or organizations rather than general-purpose, mission-agnostic use, and among major publicly available systems only Tudat is fully open source — highlighting the need for more community-developed, openly accessible navigation software.
 
-SCB contributes to this ecosystem by providing a comprehensive orbit determination framework that combines the flexibility required for research with the robustness needed for real mission applications. Its development is driven by the requirements of the Emirates Mission to the Asteroid Belt, ensuring that the software is continuously exercised against realistic operational scenarios. The primary audience for SCB includes the astrodynamics research community and mission teams seeking a flexible, transparent, and extensible open-source platform for navigation analysis.
+SCB contributes a comprehensive OD framework combining research flexibility with the robustness real missions need. Driven by EMA requirements, it is continuously exercised against realistic operational scenarios. Its audience is the astrodynamics research community and mission teams seeking a flexible, transparent, extensible open-source platform for navigation analysis.
 
 # State of the Field
 
-Among open-source orbit determination frameworks, the most comprehensive alternative is **Tudat** [@gisolfi2025tudat], a mature astrodynamics and estimation toolkit built around a C++ core with a Python interface (TudatPy) that now supports radiometric tracking data analysis. SCB is best viewed as a complementary effort, developed natively in Python and Rust and driven by the operational requirements of an active deep-space mission.
+Among open-source OD frameworks, the most comprehensive alternative is **Tudat** [@gisolfi2025tudat], a mature astrodynamics and estimation toolkit with a C++ core and Python interface (TudatPy) that now supports radiometric tracking data analysis. SCB is a complementary effort, developed natively in Python and Rust and driven by an active deep-space mission's operational requirements.
 
-While both frameworks provide high-fidelity dynamical modeling and estimation capabilities, SCB places particular emphasis on the day-to-day needs of spacecraft navigation and flight dynamics teams. Beyond orbit determination itself, the software includes tools for measurement editing and solution quality control, B-plane mapping and targeting, database-backed mission infrastructure to support multiple operators working simultaneously, and maneuver design capabilities including local optimization of finite burns. The goal is to provide a coherent environment in which the full navigation workflow can be performed, from data processing and state estimation to operational analysis and trajectory design. Moreover, SCB currently provides a broader orbit determination framework, including sequential filtering architectures, process noise modeling, and multi-leg and multi-arc estimation capabilities.
+While both provide high-fidelity dynamical modeling and estimation, SCB emphasizes the day-to-day needs of navigation and flight dynamics teams. Beyond OD itself, it offers measurement editing and solution quality control, B-plane mapping and targeting, database-backed mission infrastructure supporting multiple simultaneous operators, and maneuver design with local optimization of finite burns — a coherent environment for the full workflow, from data processing and state estimation to operational analysis and trajectory design. SCB also currently offers a broader OD framework: sequential filtering architectures, process noise modeling, and multi-leg and multi-arc estimation.
 
 
-Rather than reimplementing general numerical infrastructure, SCB builds upon a mature open-source ecosystem. The software leverages SpiceyPy [@annex2020spiceypy] for geometry, reference frames, and ephemerides; SciPy [@virtanen2020scipy] and PyASA [@rein2015ias15] for numerical methods and high-accuracy propagation; MongoDB [@mongodb] and PyMongo [@pymongo] for data management; Sphinx [@sphinx] for documentation; and Pytest [@pytest] for testing and verification.
+Rather than reimplement general numerical infrastructure, SCB builds on mature open-source tools: SpiceyPy [@annex2020spiceypy] for geometry, reference frames, and ephemerides; SciPy [@virtanen2020scipy] and PyASA [@rein2015ias15] for numerical methods and high-accuracy propagation; MongoDB [@mongodb] and PyMongo [@pymongo] for data management; Sphinx [@sphinx] for documentation; and Pytest [@pytest] for testing and verification.
 
-SCB's capabilities provide the core functionality required for both operational spacecraft navigation and scientific investigations, enabling applications ranging from precise orbit determination to radio science analyses.
+These capabilities support both operational navigation and scientific investigations, from precise OD to radio science analyses.
 
 # Software Design
 
-**Architecture and design principles.** SCB combines an object-oriented Python front end, which exposes user-facing classes and scripting interfaces, with Python and Rust back-end components reserved for performance-critical tasks such as numerical propagation, dynamical model evaluation, and estimation algorithms. The codebase is guided by a small set of design principles: modularity through clear class responsibilities; *contextualization*, whereby every piece of data is owned by a specific object and remains traceable throughout its lifecycle; *unit typing*, in which physical units are attached to quantities through the `ArrayWUnits` abstraction and propagated through computations; and *frame awareness*, in which vectors carry explicit information about the reference frame and origin in which they are defined through the `ArrayWFrame` abstraction. SCB also emphasizes the reuse of mature open-source libraries whenever possible. Unit and frame awareness are particularly important in spacecraft navigation, where subtle inconsistencies can lead to significant operational consequences. A well-known example is the loss of the Mars Climate Orbiter, whose failure was ultimately traced to a mismatch between metric and imperial units in ground software used for trajectory modeling [@mco1999]. By explicitly associating units, reference frames, and origins with numerical quantities, SCB aims to reduce the likelihood of such errors and improve the transparency and safety of navigation analyses.
+**Architecture and design principles.** SCB's object-oriented Python front end exposes user-facing classes and scripting interfaces, while Python and Rust back-end components handle performance-critical tasks: numerical propagation, dynamical model evaluation, and estimation. Four design principles guide the codebase: modularity through clear class responsibilities; *contextualization* — each datum is owned by a specific object and traceable throughout its lifecycle; *unit typing* — physical units attach to quantities via `ArrayWUnits` and propagate through computations; and *frame awareness* — vectors carry explicit frame and origin information via `ArrayWFrame`. SCB also reuses mature open-source libraries where possible. Unit and frame awareness matter especially in navigation, where subtle inconsistencies carry major operational consequences — notably the Mars Climate Orbiter loss, traced to a metric-imperial mismatch in ground trajectory software [@mco1999]. Explicitly attaching units, frames, and origins to numerical quantities reduces such risks and improves navigation-analysis transparency and safety.
 
 
-**Dynamical models.** SCB implements point-mass and N-body gravity, spherical-harmonic gravity, cannonball and N-plate solar radiation pressure, impulsive and finite-burn maneuvers, and stochastic acceleration models through piecewise first-order Gauss-Markov processes. These models, including their associated partial derivatives, have been validated against other state-of-the-art tools [@williams2025copernicus]. Future releases will place greater emphasis on the modeling of additional dynamical environments around small bodies (e.g., coupled binary-asteroid systems). In addition to state propagation, all dynamical models provide the partial derivatives required for propagation of the variational equations used in orbit determination.
+**Dynamical models.** SCB implements point-mass and N-body gravity, spherical-harmonic gravity, cannonball and N-plate solar radiation pressure, impulsive and finite-burn maneuvers, and stochastic accelerations via piecewise first-order Gauss-Markov processes; these models and their partial derivatives have been validated against other state-of-the-art tools [@williams2025copernicus]. Future releases will emphasize additional small-body dynamical environments (e.g., coupled binary-asteroid systems). Every model also supplies partial derivatives for the variational equations used in OD.
 
-**Measurement models.** SCB supports (1) ideal range, range-rate, and differential one-way ranging (DOR) measurements; (2) operational two-way coherent Doppler and sequential ranging observables; and (3) optical measurements expressed either in sample/line coordinates or right ascension and declination, enabling both center-finding and landmark-based observations. Therefore, SCB can ingest and process real Doppler and sequential ranging tracking data, while operational Delta-DOR support is currently under active development. Radiometric observables follow the formulations of Moyer [@moyer2000], with round-trip light times computed iteratively from SPICE-based ground station and spacecraft states. The measurement models account for relativistic light-time corrections, antenna and transponder delays, solar corona path delays, and time system conversions, while tropospheric and ionospheric effects are applied as measurement corrections. Real tracking data are preprocessed by the Deep Whale Network (DWN), a companion ORCCA Python library that parses TRK-2-34 Tracking and Navigation Files using PyTrk234 [@pytrk234] into a standardized JSON representation, while preserving the original observables and appending metadata such as SPICE station identifiers and outlier flags.
+**Measurement models.** SCB supports (1) ideal range, range-rate, and differential one-way ranging (DOR) measurements; (2) operational two-way coherent Doppler and sequential ranging observables; and (3) optical measurements in sample/line coordinates or right ascension and declination, for center-finding and landmark-based observations. SCB thus ingests and processes real Doppler and sequential ranging data; operational Delta-DOR support is under active development. Radiometric observables follow Moyer's formulations [@moyer2000], with round-trip light times computed iteratively from SPICE-based station and spacecraft states, accounting for relativistic light-time corrections, antenna and transponder delays, solar corona path delays, and time system conversions; tropospheric and ionospheric effects are applied as measurement corrections. Real tracking data are preprocessed by the Deep Whale Network (DWN), a companion ORCCA Python library that parses TRK-2-34 Tracking and Navigation Files via PyTrk234 [@pytrk234] into standardized JSON, preserving original observables and appending metadata such as SPICE station identifiers and outlier flags.
 
-**Filtering framework.** Four estimators are currently implemented: a linearized Kalman filter, a least-squares batch estimator, and sequential and batch square-root information filters [@bierman1977], with smoothing capabilities available for both sequential formulations. Estimable parameters include spacecraft states as well as a broad range of dynamical and measurement model parameters. SCB also supports consider parameters. Several approaches are available for modeling process uncertainty. Sequential filters support both State Noise Compensation (SNC) and Dynamical Model Compensation (DMC), while batch estimators support stochastic parameters through piecewise empirical accelerations. Measurement editing can be performed between filter iterations using interactive lasso selection, statistical editing based on residual consistency tests, or user-defined data ranges. All estimation solutions can be mapped to arbitrary epochs and reference frames and exported for downstream analysis. SCB supports multi-leg and multi-arc estimation problems.
+**Filtering framework.** Four estimators are implemented: a linearized Kalman filter, a least-squares batch estimator, and sequential and batch square-root information filters [@bierman1977], with smoothing for both sequential formulations. Estimable quantities include spacecraft states, many dynamical and measurement model parameters, and consider parameters. For process uncertainty, sequential filters offer State Noise Compensation (SNC) and Dynamical Model Compensation (DMC), while batch estimators handle stochastic parameters via piecewise empirical accelerations. Measurement editing between filter iterations uses interactive lasso selection, statistical editing via residual consistency tests, or user-defined data ranges. All solutions map to arbitrary epochs and frames and export for downstream analysis; multi-leg and multi-arc estimation is supported.
 
-**Testing.** Scarabaues utilizes Pytest to run its testing suite, comprised of three main components:
-- unit testing: small, per class/function tests designed to isolate low level issues.
-- integration testing: intermediate tests that ensure proper passing of data and interactions between classes.
-- functional testing: full scale tests that ensure functionality end-to-end across the entire tool.
-These tests are run on every merge, along with a performance check to ensure computational efficiency hasn't been lost as well. When new classes or functions are added, unit tests are written for them, as well as intergration and functional tests when/if necessary.
+**Testing.** Scarabaeus uses Pytest for its test suite: unit tests (small per-class/function tests isolating low-level issues), integration tests (verifying data passing and class interactions), and functional tests (full-scale, end-to-end checks of the entire tool). These run on every merge alongside a performance check guarding computational efficiency. New classes or functions receive unit tests, plus integration and functional tests when necessary.
 
-**Documentation.** Scarabaeus' documentation is maintained on two fronts: the source code documentation via docstrings, and the online documentation via Sphinx , Jupyter Notebooks, and .rst files. Source code documentation is defined within the Scarabaeus style guide, maintaining a standardized format across the codebase that also is guaranteed to function correctly with the online documentation that is automatically generated for all classes using Sphinx. In addition to the generated documentation, tutorials and additional articles and guides are maintained on the online documentation using a combination of Jupyter Notebooks for tutorials and .rst files for any other necessary guides.
+**Documentation.** Documentation spans docstrings and an online site built with Sphinx, Jupyter Notebooks, and .rst files. Docstrings follow the Scarabaeus style guide, giving a standardized codebase-wide format that integrates with the Sphinx documentation auto-generated for all classes. The site also hosts tutorials as Jupyter Notebooks and further guides and articles as .rst files.
 
 # Research Impact Statement
 
-SCB is developed in direct support of the Emirates Mission to the Asteroid Belt
-(EMA) [@parker2024ema], led by the UAE Space Agency, and is designed to process the
-mission's radiometric and optical-navigation measurements across all flight phases. Its
-dynamical models, together with their associated partial derivatives, have been validated
-against the state-of-the-art high-fidelity propagator Copernicus [@williams2025copernicus]
-across more than a dozen test cases spanning a range of dynamical combinations. A
-representative comparison is shown in \autoref{fig:copernicus} for Case 8, a two-body
-problem with the Sun as the central body augmented by an impulsive maneuver.
+SCB directly supports EMA [@parker2024ema], led by the UAE Space Agency, and is designed
+to process the mission's radiometric and optical-navigation measurements across all
+flight phases. Its dynamical models and partial derivatives were validated against
+the state-of-the-art high-fidelity propagator Copernicus [@williams2025copernicus] across
+over a dozen test cases with varied dynamical combinations;
+\autoref{fig:copernicus} shows a representative comparison for Case 8, a Sun-centered
+two-body problem with an impulsive maneuver.
 
-The measurement and filtering implementations have been exercised against both real and
+Measurement and filtering implementations were exercised on real and
 simulated data in three validation cases [@mcmahon2026issfd]: (i) two-way sequential
 ranging and Doppler from OSIRIS-REx DSN passes (DSS-35, Canberra, July 2018), processed
 against the publicly archived reference trajectory; (ii) Emirates Mars Mission (EMM)
-tracking arcs collected through multiple DSN stations; and (iii) a fully simulated asteroid
-flyby that jointly estimates the spacecraft state and two trajectory-correction maneuvers
-from combined radiometric and optical data. In each case the post-fit residuals are
+tracking arcs from multiple DSN stations; and (iii) a fully simulated asteroid
+flyby jointly estimating the spacecraft state and two trajectory-correction maneuvers
+from combined radiometric and optical data. In each case, post-fit residuals are
 centered and statistically consistent with the assigned measurement noise
-(\autoref{fig:residuals}), indicating that systematic effects are absorbed into the
+(\autoref{fig:residuals}), indicating systematic effects are absorbed into the
 estimated parameters.
 
-![Comparison of SCB against Copernicus for Case 8: a two-body problem with the Sun as the
-central body and an impulsive maneuver.\label{fig:copernicus}](figures/Picture1.png)
+![Comparison of SCB against Copernicus for Case 8: a Sun-centered two-body problem with an impulsive maneuver.\label{fig:copernicus}](figures/Picture1.png)
 
-![Example post-fit two-way sequential range and Doppler residuals from an OSIRIS-REx DSN
-tracking pass (DSS-35, Canberra), estimated with the least-squares batch filter. Residuals
-are centered and statistically consistent with the assigned measurement noise.\label{fig:residuals}](figures/Picture2.png)
+![Post-fit two-way sequential range and Doppler residuals from an OSIRIS-REx DSN
+pass (DSS-35, Canberra), estimated with the least-squares batch filter; residuals are
+centered and consistent with the assigned noise.\label{fig:residuals}](figures/Picture2.png)
 
-SCB has been presented in several conference proceedings [@mcmahon2026issfd]. While the
-software is already well suited to interplanetary navigation, future development will focus
-on improved models for small-body proximity operations. This work will introduce
-new terrain-relative navigation observables, estimation of asteroid-specific parameters,
-enhanced multi-arc filtering, and, potentially, support for binary asteroid systems. Real
-Delta-DOR measurements using quasar references are also under development, alongside
-finite-burn targeting capabilities [@kuleib2026maneuver].
+SCB has been presented in several conference proceedings [@mcmahon2026issfd]. The
+software already suits interplanetary navigation well; future development targets
+improved small-body proximity-operations models — new terrain-relative navigation
+observables, asteroid-specific parameter estimation, enhanced multi-arc filtering, and,
+potentially, binary-asteroid support — plus real Delta-DOR measurements using quasar
+references and finite-burn targeting capabilities, both already under development
+[@kuleib2026maneuver].
 
 # AI Usage Disclosure
 
-The core software implementation, algorithms, and architectural design of Scarabaeus
-were developed by the authors. Generative AI has been used to assist with code refactoring
-and generation of unit and integration tests. This paper was drafted by the authors and
-subsequently revised with AI assistance for restructuring according to JOSS format requirements
-and language editing. All technical content, examples, and claims reflect the authors'
-work and judgment.
+Scarabaeus' core implementation, algorithms, and architectural design were developed by
+the authors. Generative AI assisted with code refactoring and generating unit and
+integration tests. The paper was drafted by the authors and revised with AI assistance
+for JOSS-format restructuring and language editing. All technical content, examples, and
+claims reflect the authors' work and judgment.
 
 # Acknowledgements
 
-Funding for the co-development of the Emirates Mission to Explore the Asteroid Belt is provided 
-by the United Arab Emirates Space Agency to its knowledge partner, the University of Colorado 
+Funding for the co-development of the Emirates Mission to Explore the Asteroid Belt is provided
+by the United Arab Emirates Space Agency to its knowledge partner, the University of Colorado
 Boulder’s Laboratory for Atmospheric and Space Physics. The authors thank past members of the ORCCA
 laboratory who contributed to earlier versions of the codebase: Ms. Annalise Cabra, Dr. Anivid
 Faura-Pedros, Mr. Kian Shakerin, Dr. Chloe Long, Dr. Dahlia Baker, Dr. Matthew Givens, Dr. Spencer Boone,
