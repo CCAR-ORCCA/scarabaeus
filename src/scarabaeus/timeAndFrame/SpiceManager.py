@@ -1895,7 +1895,7 @@ class SpiceManager:
             seconds = trk_sec % 60
             # Format time string: 'YYYY-DOY::HH:MM:SS'
             tt_str = (
-                f"{trk_year}-{trk_doy:03d}::{hours:02d}:{minutes:02d}:{seconds:06.9}"
+                f"{trk_year}-{trk_doy:03d}::{hours:02d}:{minutes:02d}:{seconds:012.9f}"
             )
             # Convert to ephemeris time
             tt_ET = spice.str2et(tt_str)

@@ -1481,10 +1481,14 @@ class SolutionOD:
 
         # Chi-squared test
         if self.postfits is not None and verbose:
-            n_measurements = sum(len(r[0]) for r in self.postfits)
+            # postfits: {dataset_name: [[residual, sigma], ...]}
+            chi_squared, n_measurements = 0.0, 0
+            for dataset in self.postfits.values():
+                for resid, sigma in dataset:
+                    z = np.atleast_1d(resid) / np.atleast_1d(sigma)
+                    chi_squared += float(np.sum(z**2))
+                    n_measurements += z.size
             degrees_of_freedom = n_measurements - self.n_states
-
-            chi_squared = sum(np.sum(r[0] ** 2) for r in self.postfits)
             normalized_chi_squared = chi_squared / degrees_of_freedom
 
             print(f"\nChi-Squared Test:")
