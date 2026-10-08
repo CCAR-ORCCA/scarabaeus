@@ -1,6 +1,6 @@
 # Scarabaeus tutorials (v2 draft)
 
-> **Draft.** New tutorial series that will replace the notebooks in `tutorials/`. See the series plan for the full structure.
+> **Draft.** New tutorial series that will replace the notebooks in `tutorials/`. See [PLAN.md](PLAN.md) for the full structure, design rules and open questions.
 
 ## Navigating OSIRIS-REx
 
