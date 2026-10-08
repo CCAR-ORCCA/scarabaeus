@@ -29,6 +29,17 @@ One scenario, start to finish: OSIRIS-REx on approach to Bennu, June 1–8, 2018
 
 Each notebook writes its products to `outputs/<notebook>/` (git-ignored).
 
+### Starting at a later chapter
+
+Chapters 3–6 read files produced by earlier chapters (chapter 2's truth trajectory, chapter 3's tracking data). To start at a later chapter, generate those inputs first:
+
+```bash
+python prepare.py 06            # runs chapters 2 and 3 headlessly (about 15 s)
+python prepare.py 06 --force    # regenerate even if the outputs already exist
+```
+
+The prerequisite notebooks are executed in memory and are not modified. If the inputs are missing, the chapter's setup cell stops with a message pointing here.
+
 ## Review notes
 
 While drafting, flag anything that needs revision with a colored note. The emoji and keyword matter: they keep the note readable where colors are stripped (GitHub) and let `review_notes.py` find it.
