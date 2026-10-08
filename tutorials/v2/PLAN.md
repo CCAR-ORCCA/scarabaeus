@@ -69,6 +69,5 @@ IV.  How-tos          maneuvers, B-plane, media corrections, n-plate and attitud
 
 ## Open questions
 
-- Is a single ~5 h real tracking pass enough for chapter 9, or can more days of TRK-2-34 data around DOY 159 be added?
 - Should we ship pre-generated chapter outputs so a reader can start at, e.g., chapter 6 without running 1–5?
-- Does the Quickstart work as the entry point, or should it live in the docs site rather than the notebook series?
+- Should the Quickstart live in the docs site rather than the notebook series?
