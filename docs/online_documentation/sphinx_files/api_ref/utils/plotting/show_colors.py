@@ -1,5 +1,5 @@
-.. SPDX-FileCopyrightText: 2026 Orbital Research Cluster for Celestial Applications (ORCCA) Lab, University of Colorado at Boulder
-.. SPDX-License-Identifier: ISC
+# SPDX-FileCopyrightText: 2026 Orbital Research Cluster for Celestial Applications (ORCCA) Lab, University of Colorado at Boulder
+# SPDX-License-Identifier: ISC
 """
     Script to display all colors in scb.Plotting.color_palettes property.
 """

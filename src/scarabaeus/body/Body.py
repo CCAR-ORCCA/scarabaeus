@@ -66,8 +66,14 @@ class Body:
         self._name = name
         self.spice_id = spice_id
         self._mass_profile = mass
-        self._mass_units = mass.units if mass is not None else None
+        self._mass_units = mass.units if isinstance(mass, ArrayWUnits) else None
         self._mass_poly_deg = mass_poly_deg
+
+        # Mass the body was built with, restored by reset_mass_history() so a
+        # re-propagated mission starts from it rather than from the mass a
+        # previous propagation left at its final epoch.
+        self._initial_mass_profile = mass
+        self._initial_mass_units = self._mass_units
 
         self._mass_profiles = []
         self._mass_profiles_tspan = []
@@ -91,11 +97,11 @@ class Body:
 
         Four cases are handled:
 
-        1. No ID given and name not in pool → ``ValueError`` (ID must be supplied).
-        2. No ID given but name found in pool → ID looked up automatically.
-        3. ID given, name not in pool → ID used directly and body registered via
+        1. No ID given and name not in pool: ``ValueError`` (ID must be supplied).
+        2. No ID given but name found in pool: ID looked up automatically.
+        3. ID given, name not in pool: ID used directly and body registered via
            ``SpiceManager.def_new_body``.
-        4. ID given and matches pool entry → pool value used.
+        4. ID given and matches pool entry: pool value used.
 
         Parameters
         ----------
@@ -191,7 +197,7 @@ class Body:
 
         else:
             raise TypeError(
-                f"Unsupported internal mass type: {type(self._mass_profile.values)}"
+                f"Unsupported internal mass type: {type(self._mass_profile)}"
             )
 
     @property
@@ -269,6 +275,28 @@ class Body:
         self._mass_profile = poly
         self._mass_units = units
         self._mass_profiles.append(poly)
+
+    def reset_mass_history(self) -> None:
+        """
+        Restore the mass the body was built with and forget fitted profiles.
+
+        Every propagated leg appends the profile it fitted, and the next leg
+        starts from the last one. Propagating the same mission again (a filter
+        re-linearizing its reference, say) would otherwise start the first leg
+        from the mass the previous run ended with, and :meth:`get_mass` would
+        return profiles from earlier runs that cover the same epochs.
+
+        The profile lists are cleared in place: force-model copies of this body
+        share them by reference.
+
+        Returns
+        -------
+        None
+        """
+        self._mass_profile = self._initial_mass_profile
+        self._mass_units = self._initial_mass_units
+        self._mass_profiles.clear()
+        self._mass_profiles_tspan.clear()
 
     def get_mass(self, t: EpochArray) -> ArrayWUnits:
         """

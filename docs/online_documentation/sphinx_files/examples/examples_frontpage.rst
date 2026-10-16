@@ -1,5 +1,6 @@
 .. SPDX-FileCopyrightText: 2026 Orbital Research Cluster for Celestial Applications (ORCCA) Lab, University of Colorado at Boulder
 .. SPDX-License-Identifier: ISC
+
 .. _examples:
 .. _learn:
 
@@ -9,9 +10,9 @@
 
 .. role:: gold
 
-==========================
+============================
 :gold:`Scarabaeus Tutorials`
-==========================
+============================
 
 Hands-on Jupyter notebooks that walk through Scarabaeus from first principles to
 full orbit-determination campaigns.  Notebooks are organized in three tiers — **Basics**,

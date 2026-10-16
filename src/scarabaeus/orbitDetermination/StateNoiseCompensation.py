@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Orbital Research Cluster for Celestial Applications (ORCCA) Lab, University of Colorado at Boulder
 # SPDX-License-Identifier: ISC
 import numpy as np
-from typing import Optional
 from scarabaeus import CovarianceMatrix, ProcessNoise
 
 # --------------------#
@@ -26,29 +25,46 @@ class StateNoiseCompensation(ProcessNoise):
 
         \\mathbf{a}(t) = \\mathbf{w}_k, \\quad t \\in [t_k,\\, t_{k+1})
 
-    where :math:`\\mathbf{w}_k \\sim \\mathcal{N}(\\mathbf{0},\\, \\mathbf{Q})` and
-    :math:`\\mathbf{Q}` (3×3) is the continuous-time power spectral density (PSD)
-    of the acceleration uncertainty.
+    where :math:`\\mathbf{w}_k \\sim \\mathcal{N}(\\mathbf{0},\\, \\mathbf{Q}_c)` and
+    :math:`\\mathbf{Q}_c` (3, 3) is the covariance of the acceleration
+    uncertainty, in km²/s⁴.
 
     **Discretization**
 
-    Integrating the continuous dynamics over :math:`\\Delta t = t_{k+1} - t_k`
-    (Tapley et al., 2004) gives the exact discrete-time process noise covariance:
+    Holding the acceleration constant over :math:`\\Delta t = t_{k+1} - t_k`
+    and approximating the motion as rectilinear over the step, it maps into
+    the position and velocity through
 
     .. math::
 
-        \\mathbf{Q}_k = \\begin{bmatrix}
-            \\frac{\\Delta t^3}{3}\\,\\mathbf{Q}_c &
-            \\frac{\\Delta t^2}{2}\\,\\mathbf{Q}_c & \\mathbf{0} \\\\[2pt]
-            \\frac{\\Delta t^2}{2}\\,\\mathbf{Q}_c &
-            \\Delta t\\,\\mathbf{Q}_c & \\mathbf{0} \\\\[2pt]
+        \\mathbf{\\Gamma}_k = \\Delta t \\begin{bmatrix}
+            \\frac{\\Delta t}{2}\\,\\mathbf{I}_3 \\\\[2pt]
+            \\mathbf{I}_3
+        \\end{bmatrix}
+
+    so the discrete-time process noise covariance is
+
+    .. math::
+
+        \\mathbf{Q}_k = \\mathbf{\\Gamma}_k\\,\\mathbf{Q}_c\\,\\mathbf{\\Gamma}_k^T
+        = \\Delta t^2 \\begin{bmatrix}
+            \\frac{\\Delta t^2}{4}\\,\\mathbf{Q}_c &
+            \\frac{\\Delta t}{2}\\,\\mathbf{Q}_c & \\mathbf{0} \\\\[2pt]
+            \\frac{\\Delta t}{2}\\,\\mathbf{Q}_c &
+            \\mathbf{Q}_c & \\mathbf{0} \\\\[2pt]
             \\mathbf{0} & \\mathbf{0} & \\mathbf{0}
         \\end{bmatrix}
 
     where the row/column partition is
-    :math:`(\\mathbf{r},\\, \\mathbf{v},\\, \\mathbf{p})` and
-    :math:`\\mathbf{Q}_c` (3×3) is the continuous-time PSD of the unmodeled
-    acceleration. Static parameters :math:`\\mathbf{p}` receive no process noise.
+    :math:`(\\mathbf{r},\\, \\mathbf{v},\\, \\mathbf{p})`. Static parameters
+    :math:`\\mathbf{p}` receive no process noise. Integrating white noise over the step instead gives
+    :math:`\\Delta t\\,[\\tfrac{\\Delta t^2}{3}, \\tfrac{\\Delta t}{2};
+    \\tfrac{\\Delta t}{2}, 1] \\otimes \\mathbf{Q}_c`; the form above is
+    larger for steps longer than a second, which suits an acceleration that is
+    not estimated, and has rank three, which the SRIF needs to factor it
+    through :math:`\\mathbf{\\Gamma}_k`. It grows quickly with
+    :math:`\\Delta t`, so across long data gaps :math:`\\Delta t` should be
+    capped with ``max_interval``.
 
     **Covariance propagation**
 
@@ -73,21 +89,33 @@ class StateNoiseCompensation(ProcessNoise):
         State vector definition. Defaults to None.
     sequence_definition : optional
         Sequence definition for multi-leg trajectories. Defaults to None.
-
-    Notes
-    -----
-    Dynamic components must be position or velocity, and must precede static
-    components in the state vector.
+    max_interval : ArrayWUnits or float, optional
+        Longest interval the noise is accumulated over, in seconds when a
+        float; a longer one, such as a data gap, receives the noise of one
+        this long (see :meth:`~scarabaeus.ProcessNoise._noise_intervals`).
+        Defaults to ``None``, no limit.
+    body : Body or int, optional
+        Body whose position and velocity the noise drives, or its SPICE ID.
+        Defaults to ``None``, the owner of the first position in the state.
 
     See Also
     --------
-    scarabaeus.DynamicModelCompensation : Exponentially-correlated DMC variant.
+    scarabaeus.DynamicalModelCompensation : Exponentially-correlated DMC variant.
     scarabaeus.ProcessNoise : Abstract base class.
     scarabaeus.ProcessNoiseSettings : Configuration object consumed by the filter.
 
+    Notes
+    -----
+    The noise drives the position and velocity of ``body`` wherever they sit
+    in the state; every other state, of that body or another, receives none.
+
+    Dynamic components must be position or velocity, and must precede static
+    components in the state vector.
+
     References
     ----------
-    Tapley, B. D., Schutz, B. E., & Born, G. H. (2004). Statistical Orbit Determination. Elsevier Academic Press. ISBN 978-0-12-683630-1.
+    .. [1] Tapley, B. D., Schutz, B. E., & Born, G. H. (2004). *Statistical Orbit
+       Determination*. Elsevier Academic Press. ISBN 978-0-12-683630-1.
     """
 
     # --------------------#
@@ -98,52 +126,23 @@ class StateNoiseCompensation(ProcessNoise):
         continuous_time_covariance: CovarianceMatrix,
         state_definition=None,
         sequence_definition=None,
+        max_interval=None,
+        body=None,
     ):
         super().__init__(
-            continuous_time_covariance, state_definition, sequence_definition
+            continuous_time_covariance,
+            state_definition,
+            sequence_definition,
+            max_interval,
+            body,
         )
 
     # ----------------#
     # region Methods #
     # ----------------#
-    def _check_state_definition(self, state_definition) -> None:
-        """
-        Validate state definition for SNC compatibility.
-
-        Ensures dynamic components precede static components and are position/velocity.
-
-        Parameters
-        ----------
-        state_definition : list
-            State definition to validate.
-
-        Raises
-        ------
-        ValueError
-            If state definition violates SNC rules.
-
-        Returns
-        -------
-        None
-        """
-        flag_static = False
-        for i, tup in enumerate(state_definition):
-            state_type, _, _, component_type, _, _ = tup
-            if component_type == "static":
-                flag_static = True
-            elif component_type == "dynamic":
-                if flag_static:
-                    raise ValueError(
-                        "With SNC enabled, dynamic components cannot follow static "
-                        "components in the state definition."
-                    )
-                if state_type not in ("position", "velocity"):
-                    raise ValueError(
-                        "With SNC enabled, dynamic components must be either "
-                        "position or velocity."
-                    )
-
-    def _compute_discrete_time_covariances(self, measurement_times: list) -> None:
+    def _compute_discrete_time_covariances(
+        self, epochs: list, reference_state=None
+    ) -> None:
         """
         Compute discrete-time process noise covariances using SNC model.
 
@@ -151,86 +150,61 @@ class StateNoiseCompensation(ProcessNoise):
         piecewise constant acceleration assumption. Computes both discrete
         covariances and gamma matrices for Square Root Information Filter (SRIF).
 
-        The discrete covariance is computed as: Q_k = Γ_k * Q * Γ_k^T
-        where Γ_k = [[dt^3/2 * I_3], [dt^2 * I_3], [0]]
+        The discrete covariance is computed as
+        :math:`\\mathbf{Q}_k = \\Gamma_k \\mathbf{Q} \\Gamma_k^{\\mathsf{T}}`, with
+        :math:`\\Gamma_k = [\\Delta t^2/2\\,\\mathbf{I}_3;\\ \\Delta t\\,\\mathbf{I}_3]`
+        and :math:`\\Delta t` the interval length cut to ``max_interval``.
+        Both are stored for the position/velocity block only; :meth:`gamma_at`
+        and :meth:`covariance_at` size them for the state they are added to.
 
         Parameters
         ----------
-        measurement_times : list
-            List of time epochs at which the process noise is evaluated.
+        epochs : list
+            Filtering timeline (measurement and sequence event epochs) the
+            filters index the process noise by.
+        reference_state : callable, optional
+            Reference ``(positions, velocities)`` at an array of epochs, which
+            an RTN covariance is rotated along (see
+            :meth:`~scarabaeus.ProcessNoise._continuous_time_covariances`).
+            Defaults to ``None``.
 
         Returns
         -------
         None
         """
-        # Initialize
-        Q_tilde = []
+        # Continuous-time covariance over each interval, inertial
+        Q_tilde = self._continuous_time_covariances(epochs, reference_state)
+        # Interval lengths, cut to max_interval
+        intervals = self._noise_intervals(epochs)
         discrete_time_process_covariances = []
         gamma_matrices = []
-        n = self._get_state_size()
 
-        sequence_epochs = None
-        if self.sequence_definition is not None:
-            sequence_epochs = [
-                epochs.times for epochs in self.sequence_definition.epochs_vec
-            ]
-
-        # Loop over measurement epochs
-        for k in range(len(measurement_times)):
-            # Get continuous-time covariance
-            Q_continuous = self.continuous_time_covariance.matrix_without_units()
-            Q_tilde.append(Q_continuous)
-
-            # Transform from RTN if necessary
-            Q_tilde[k] = self.transform_from_rtn(Q_tilde[k])
-
-            # Compute discrete-time covariance and gamma matrix
+        # Loop over timeline epochs
+        for k in range(len(epochs)):
             if k == 0:
-                # First epoch: initialize with zeros
-                discrete_time_process_covariances.append(np.zeros((n, n)))
-
-                # Determine appropriate gamma size
-                if self.state_definition is not None:
-                    gamma_size = n
-                elif (
-                    self.sequence_definition is not None and sequence_epochs is not None
-                ):
-                    idx_leg = self._find_leg_index(
-                        measurement_times[k], sequence_epochs
-                    )
-                    gamma_size = (
-                        self.sequence_definition.states_n[idx_leg]
-                        or self.sequence_definition.states_n[idx_leg + 1]
-                    )
-                else:
-                    gamma_size = 6
-
-                gamma_matrices.append(np.zeros((gamma_size, 3)))
+                # First epoch: no interval to accumulate noise over
+                gamma_posvel = np.zeros((6, 3))
             else:
-                dt = measurement_times[k] - measurement_times[k - 1]
+                gamma_posvel = self._construct_gamma_matrix(intervals[k])
+            gamma_matrices.append(gamma_posvel)
 
-                # Construct gamma matrix (6x3 for pos/vel only)
-                gamma_posvel = self._construct_gamma_matrix(dt)
-
-                # Pad gamma matrix if needed
-                gamma_padded = self._pad_gamma_matrix(
-                    gamma_posvel, n, measurement_times[k], sequence_epochs
-                )
-                gamma_matrices.append(gamma_padded)
-
-                # Compute discrete covariance: Q_k = Γ * Q_tilde * Γ^T
-                Qk_discrete = gamma_padded @ Q_tilde[k] @ gamma_padded.T
-
-                discrete_time_process_covariances.append(Qk_discrete)
+            # Compute discrete covariance: Q_k = Γ * Q_tilde * Γ^T
+            discrete_time_process_covariances.append(
+                gamma_posvel @ Q_tilde[k] @ gamma_posvel.T
+            )
 
         # Store computed values
         self.Q_tilde = Q_tilde
         self.discrete_time_process_covariances = discrete_time_process_covariances
         self.gamma_matrices = gamma_matrices
+        self.epochs = np.asarray(epochs, dtype=float)
 
     def _construct_gamma_matrix(self, dt: float) -> np.ndarray:
         """
         Construct gamma matrix for position and velocity components.
+
+        The position and velocity change over ``dt`` per unit of constant
+        acceleration.
 
         Parameters
         ----------
@@ -244,111 +218,7 @@ class StateNoiseCompensation(ProcessNoise):
         """
         return np.vstack(
             (
-                (dt**3 / 2) * np.eye(3),  # Position rows
-                (dt**2) * np.eye(3),  # Velocity rows
+                (dt**2 / 2) * np.eye(3),  # Position rows
+                dt * np.eye(3),  # Velocity rows
             )
         )
-
-    def _pad_gamma_matrix(
-        self,
-        gamma_posvel: np.ndarray,
-        n: int,
-        current_time: float,
-        sequence_epochs: Optional[list] = None,
-    ) -> np.ndarray:
-        """
-        Extend the 6x3 SNC gamma matrix to match the active state size at ``current_time``.
-
-        The 6-row ``gamma_posvel`` block covers only position and velocity.  For
-        states larger than 6, zero rows are appended so that the matrix conforms
-        to the full state dimension used by the filter at the given epoch.
-
-        For sequence trajectories, a boundary rule is applied: the epoch
-        immediately following a leg-transition node (i.e. any time in the
-        half-open interval ``(t_start[j], t_second[j]]``) uses the *previous*
-        leg's state size rather than the new leg's size.  This prevents a
-        premature size switch before the filter has processed the node event.
-
-        Parameters
-        ----------
-        gamma_posvel : np.ndarray
-            SNC gamma matrix of shape ``(6, 3)``.
-        n : int
-            Full state size when ``state_definition`` is set (non-sequence mode).
-        current_time : float
-            Current measurement epoch (TDB seconds).
-        sequence_epochs : list, optional
-            List of epoch arrays, one per leg, from the sequence definition.
-
-        Returns
-        -------
-        np.ndarray
-            Zero-padded gamma matrix of shape ``(n_active, 3)``, where
-            ``n_active`` is the state size appropriate for ``current_time``.
-        """
-
-        # -------------------------
-        # Fixed-state case
-        # -------------------------
-        if self.state_definition is not None:
-            padding = ((0, n - 6), (0, 0))
-            return np.pad(gamma_posvel, padding, mode="constant", constant_values=0)
-
-        if self.sequence_definition is None or sequence_epochs is None:
-            return gamma_posvel
-
-        # -------------------------
-        # Helpers: robust epoch extraction
-        # -------------------------
-        def _to_float_array(ep):
-            v = getattr(ep, "values", None)
-            if v is not None:
-                return np.asarray(v, dtype=float).ravel()
-            t = getattr(ep, "times", None)
-            if t is not None:
-                vv = getattr(t, "values", None)
-                if vv is not None:
-                    return np.asarray(vv, dtype=float).ravel()
-            return np.asarray(ep, dtype=float).ravel()
-
-        ct = float(current_time)
-
-        # Leg start / second timestamps from the *propagation grid* (sequence epochs)
-        leg_start = []
-        leg_second = []
-        for ep in sequence_epochs:
-            arr = _to_float_array(ep)
-            if arr.size == 0:
-                leg_start.append(None)
-                leg_second.append(None)
-            else:
-                leg_start.append(float(arr[0]))
-                leg_second.append(float(arr[1]) if arr.size > 1 else None)
-
-        # Nominal leg index
-        idx_leg = self._find_leg_index(ct, sequence_epochs)
-
-        # -------------------------
-        # Boundary rule (NO exact match needed):
-        # if ct is the first encountered epoch after node j,
-        # i.e. ct in (leg_start[j], leg_second[j]] -> use j-1 size.
-        # -------------------------
-        atol = 1e-7  # just float-noise guard, not an "epsilon logic" for behavior
-        for j in range(1, len(leg_start)):
-            t0 = leg_start[j]
-            t1 = leg_second[j]
-            if t0 is None or t1 is None:
-                continue
-
-            # first encountered epoch after node is anything after t0 up to and including t1
-            if (ct > t0 + atol) and (ct <= t1 + atol):
-                idx_leg = j - 1
-                break
-
-        # State size for the chosen leg
-        n_leg = self.sequence_definition.states_n[idx_leg]
-        if not n_leg:
-            n_leg = self.sequence_definition.states_n[idx_leg + 1]
-
-        padding = ((0, int(n_leg) - 6), (0, 0))
-        return np.pad(gamma_posvel, padding, mode="constant", constant_values=0)

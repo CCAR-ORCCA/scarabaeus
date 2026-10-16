@@ -1,5 +1,6 @@
 .. SPDX-FileCopyrightText: 2026 Orbital Research Cluster for Celestial Applications (ORCCA) Lab, University of Colorado at Boulder
 .. SPDX-License-Identifier: ISC
+
 .. create a gold color role
 .. raw:: html
 
@@ -60,7 +61,7 @@ The full dependency list is managed in ``pyproject.toml`` and is installed autom
 
 .. code-block:: bash
 
-   git clone <repository-url>
+   git clone <https://github.com/CCAR-ORCCA/scarabaeus>
    cd scarabaeus
 
 **2. Create a virtual environment**
@@ -75,42 +76,28 @@ The full dependency list is managed in ``pyproject.toml`` and is installed autom
 
 **3. Install Scarabaeus**
 
-.. code-block:: bash
+.. .. code-block:: bash
 
-   pip install .
+..    pip install .
 
-Once the package is published on PyPI, users will also be able to install with:
+Currently, Scarabaeus can only be installed in developer mode, see :ref:`the Dev Environment Guide <devenviron>` for more on how to do this.
 
-.. code-block:: bash
+.. Once the package is published on PyPI, users will also be able to install with:
 
-   pip install scarabaeus
+.. .. code-block:: bash
 
-.. note::
+..    pip install scarabaeus
 
-   **SPICE kernels** — Scarabaeus uses SPICE kernels for ephemeris, reference frames, and
-   spacecraft clock data. These are not distributed with the package. Load them in your
-   script with:
+.. .. note::
 
-   .. code-block:: python
+..    **SPICE kernels** — Scarabaeus uses SPICE kernels for ephemeris, reference frames, and
+..    spacecraft clock data. These are not distributed with the package. Load them in your
+..    script with:
 
-      import scarabaeus as scb
-      scb.SpiceManager.load_kernel_from_mkfile("path/to/metakernel.tm")
+..    .. code-block:: python
 
-   See `NAIF's kernel guide <https://naif.jpl.nasa.gov/naif/toolkit.html>`_ for details on
-   obtaining and configuring kernels.
+..       import scarabaeus as scb
+..       scb.SpiceManager.load_kernel_from_mkfile("path/to/metakernel.tm")
 
--------------------------------------
-:gold:`Developer Installation`
--------------------------------------
-
-Developer installation additionally requires Rust/Cargo to compile the high-performance
-integrator back-end.
-
-.. code-block:: bash
-
-   # After the user installation steps above:
-   pip install -e . --group dev   # editable install with dev extras
-   maturin develop                # compile and bind the Rust back-end
-   pre-commit install             # install commit hooks
-
-See :ref:`the developer guide <devenviron>` for the full developer setup guide.
+..    See `NAIF's kernel guide <https://naif.jpl.nasa.gov/naif/toolkit.html>`_ for details on
+..    obtaining and configuring kernels.

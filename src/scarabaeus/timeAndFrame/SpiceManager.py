@@ -14,8 +14,10 @@ from scarabaeus.utils.SCBPolynomial import SCBPolynomial
 import warnings
 import os, pathlib
 import json
+import pickle
 import spiceypy as spice
 import scarabaeus.utils.NumpyWrapper as np
+import numpy as _np
 from numpy.typing import NDArray
 import math
 from functools import lru_cache
@@ -70,6 +72,29 @@ class SpiceManager:
        DOI 10.1016/j.pss.2017.02.013
     """
 
+    # ------------------#
+    # region   Errors  #
+    # ------------------#
+    class TooFewStatesError(ValueError):
+        """Raised when a segment has fewer states than its interpolation degree needs."""
+
+    class EvenDegreeError(ValueError):
+        """Raised when an even interpolation degree is given for a type-13 segment,
+        whose Hermite polynomials are built from a position and a velocity per node
+        and so always have odd degree."""
+
+    class SidecarNotFoundError(ValueError):
+        """Raised when no sidecar for the requested body, origin, and frame is
+        found in any of the locations searched."""
+
+    class STMLayoutError(ValueError):
+        """Raised when the STMs given for a sequence's STM sidecar line up
+        neither with its legs, one block per leg on that leg's epoch grid, nor
+        with the global epoch grid, one matrix per epoch."""
+
+    # endregion Errors #
+    # ------------------#
+
     _spc_pos_units = km
     _spc_time_units = sec
     _spc_angle_units = rad
@@ -78,6 +103,11 @@ class SpiceManager:
     kernel_list = []
     kernel_folder = None  # None → computed from os.getcwd() at call time
     poly_interp_deg = 3
+
+    # Room for the coverage window read back from an SPK before appending to it.
+    # A window holds two doubles per interval, and a trajectory written leg by
+    # leg leaves one interval per leg, so this allows 5000 of them.
+    _spk_coverage_cell_size = 10000
     poly_interp_par_deg = 1
 
     # ----------------------------#
@@ -305,6 +335,45 @@ class SpiceManager:
         )
 
         return pos
+
+    @classmethod
+    def get_pos_values(
+        cls, trgt_bdy, epoch_time, reference_frame, obsvr_bdy, ab_correct="None"
+    ):
+        """
+        Raw-array variant of :meth:`get_pos` for hot inner loops.
+
+        Returns the position as a plain numpy array in kilometers, skipping the
+        ``ArrayWUnits`` wrap/unwrap that :meth:`get_pos` performs. Numerically
+        identical to ``get_pos(...).values``; use this where the caller only needs
+        the values (e.g. force-model acceleration during propagation).
+
+        Parameters
+        ----------
+        trgt_bdy, obsvr_bdy : str or Body
+            Target and observer bodies.
+        epoch_time : float
+            TDB epoch (seconds past J2000).
+        reference_frame : str or Frame
+            Output reference frame.
+        ab_correct : str, optional
+            Aberration correction. Defaults to ``"None"``.
+
+        Returns
+        -------
+        numpy.ndarray
+            ``(3,)`` position vector in km.
+        """
+        if isinstance(reference_frame, Frame):
+            reference_frame = reference_frame.name
+        if isinstance(obsvr_bdy, Body):
+            obsvr_bdy = obsvr_bdy.name
+        if isinstance(trgt_bdy, Body):
+            trgt_bdy = trgt_bdy.name
+        state = spice.spkezr(
+            trgt_bdy, epoch_time, reference_frame, ab_correct, obsvr_bdy
+        )
+        return np.array(state[0])[0:3]
 
     @classmethod
     def _get_pos_callback(cls, trgt_bdy, reference_frame, obsvr_bdy, ab_correct):
@@ -542,16 +611,7 @@ class SpiceManager:
         )
         state = np.array(state[0])
 
-        # Get units
-        units = [
-            cls._spc_pos_units,
-            cls._spc_pos_units,
-            cls._spc_pos_units,
-            cls._spc_vel_units,
-            cls._spc_vel_units,
-            cls._spc_vel_units,
-        ]  # Needs to output in km and km/sec
-        return ArrayWUnits(state, units)
+        return ArrayWUnits.from_trusted(state, cls._state_units())
 
     @classmethod
     def get_state_precise(
@@ -561,10 +621,15 @@ class SpiceManager:
         reference_frame: str | Frame,
         obsvr_bdy: str | Body,
         aberration_correction: str = "None",
-        epoch_time_low: float | EpochArray = None,
+        epoch_time_low: float | None = None,
     ):
         """
-        Retrieve the state (position and velocity) of a target body relative to an origin body at a specified epoch time.
+        Retrieve the state of a target body at a two-part epoch ``epoch_time_high + epoch_time_low``.
+
+        SPICE is evaluated once at the nearest representable epoch, and the position is then moved
+        along the velocity by the part of the epoch that a single float cannot hold. The neglected
+        second-order term is ``|a| d^2 / 2``, with ``|d|`` at most half an ULP of the epoch (~60 ns
+        near J2000 + 26 yr), i.e. below 1e-14 km for any solar-system acceleration.
 
         Parameters
         ----------
@@ -572,7 +637,7 @@ class SpiceManager:
             The target body for which the state is to be retrieved. Can be a string name or a Body object.
 
         epoch_time_high : float or EpochArray
-            The epoch time at which the state is to be retrieved. Can be an EpochArray object or a float representing the time. This is the high component
+            High part of the epoch, in TDB seconds past J2000. Can be an EpochArray object or a float.
 
         reference_frame : str or Frame
             The reference frame in which the state is to be retrieved. Can be a Frame object or a string name.
@@ -583,8 +648,9 @@ class SpiceManager:
         aberration_correction : str, optional
             The aberration correction to be applied. Defaults to ``None``.
 
-        epoch_time_low : float or EpochArray
-            The epoch time at which the state is to be retrieved. Can be an EpochArray object or a float representing the time. This is the low component
+        epoch_time_low : float, optional
+            Low part of the epoch [s], typically from :meth:`EpochArray._add_duration`. ``None``
+            is treated as ``0.0``, which reproduces :meth:`get_state`.
 
         Returns
         -------
@@ -595,6 +661,8 @@ class SpiceManager:
         # input validation and conditioning #
         # -----------------------------------#
         epoch_time_high = cls._validate_epoch_input(epoch_time_high)
+        if epoch_time_low is None:
+            epoch_time_low = 0.0
 
         # Ensure target, reference_frame, origin are a string
         if isinstance(reference_frame, Frame):
@@ -608,42 +676,41 @@ class SpiceManager:
         # get state #
         # -----------#
 
-        # Get states from SPICE at epoch_time_high separated by "dt" seconds
-        state_start = np.array(
+        # Nearest representable epoch (t) and the remainder SPICE cannot see (d)
+        t, d = EpochArray._two_sum(epoch_time_high, epoch_time_low)
+
+        state = np.array(
             spice.spkezr(
                 trgt_bdy,
-                epoch_time_high,
-                reference_frame,
-                aberration_correction,
-                obsvr_bdy,
-            )[0]
-        )
-        state_end = np.array(
-            spice.spkezr(
-                trgt_bdy,
-                epoch_time_high + 1,
+                t,
                 reference_frame,
                 aberration_correction,
                 obsvr_bdy,
             )[0]
         )
 
-        # Stack the two state vectors into a 2D array of shape (2, 6)
-        states = np.vstack((state_start, state_end))  # shape: (2, 6)
+        # First-order shift of the position by the remainder
+        state = np.concatenate((state[:3] + state[3:] * d, state[3:]))
 
-        # Perform linear interpolation at dtepoch_time_low_small for each component
-        state = (1 - epoch_time_low) * states[0] + epoch_time_low * states[1]
+        return ArrayWUnits.from_trusted(state, cls._state_units())
 
-        # Get units
-        units = [
-            cls._spc_pos_units,
-            cls._spc_pos_units,
-            cls._spc_pos_units,
-            cls._spc_vel_units,
-            cls._spc_vel_units,
-            cls._spc_vel_units,
-        ]  # Needs to output in km and km/sec
-        return ArrayWUnits(state, units)
+    @classmethod
+    def _state_units(cls) -> _np.ndarray:
+        """Return the per-element units of a SPICE state, km and km/s.
+
+        :meth:`get_state` and :meth:`get_state_precise` hand this to
+        :meth:`ArrayWUnits.from_trusted`: the light-time solutions call them
+        hundreds of thousands of times per dataset, and validating a fixed
+        list of six units through the constructor cost more than SPICE did. A
+        new array each call, since ``ArrayWUnits.__setitem__`` can write into
+        it.
+
+        Returns
+        -------
+        numpy.ndarray
+            Object array ``[km, km, km, km/s, km/s, km/s]``.
+        """
+        return _np.array([cls._spc_pos_units] * 3 + [cls._spc_vel_units] * 3)
 
     @classmethod
     def get_state_antenna(
@@ -764,14 +831,15 @@ class SpiceManager:
         Notes
         -----
         - The station's topocentric frame (e.g., ``DSS-14_TOPO``) must be defined in the
-        loaded SPICE kernels.
+          loaded SPICE kernels.
         - The axis convention for topocentric frames is assumed to be:
-        X = East, Y = North, Z = Up.
+          X = East, Y = North, Z = Up.
         - To obtain azimuth as well, use ``atan2(East, North)`` in the same frame.
         - Requires SPICE kernels for:
-            * DSN station locations and frames.
-            * Target body ephemerides.
-            * Leapseconds (LSK).
+
+          * DSN station locations and frames.
+          * Target body ephemerides.
+          * Leapseconds (LSK).
         """
         topo_frame = f"{station}_TOPO"
 
@@ -901,6 +969,352 @@ class SpiceManager:
 
         return ArrayWUnits(lighttime, cls._spc_time_units)
 
+    # Parsed-sidecar cache shared by every get_parameters call:
+    #     absolute path -> (mtime, size, parsed contents)
+    _sidecar_cache: dict = {}
+    # Epoch grids derived from STM sidecars, keyed by the parsed object's id and
+    # holding a reference to it so the entry cannot outlive its source.
+    _sidecar_epoch_cache: dict = {}
+
+    @classmethod
+    def _load_sidecar_cached(cls, path: str):
+        """
+        Load a parameters sidecar, reusing the parse when the file is unchanged.
+
+        Parameters
+        ----------
+        path : str
+            Absolute path to a ``.json`` or ``.pkl`` sidecar.
+
+        Returns
+        -------
+        object
+            The parsed sidecar contents, or ``None`` when it cannot be read.
+
+        Notes
+        -----
+        The cache key is the file's ``(mtime, size)``, so rewriting a sidecar
+        invalidates it without any explicit bookkeeping. Use
+        :meth:`clear_sidecar_cache` to drop everything, for instance after
+        deleting files behind the library's back.
+        """
+        from scarabaeus.utils.Serialization import load as _load_sidecar
+
+        try:
+            stat = os.stat(path)
+            key = (stat.st_mtime_ns, stat.st_size)
+        except OSError:
+            return None
+
+        cached = cls._sidecar_cache.get(path)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+
+        try:
+            contents = _load_sidecar(path)
+        except Exception:
+            contents = None
+
+        cls._sidecar_cache[path] = (key, contents)
+
+        return contents
+
+    @classmethod
+    def _sidecar_derived(cls, payload, key, build):
+        """
+        Memoize something derived from a parsed sidecar.
+
+        Sidecar contents arrive from JSON as Python lists, and the getters are
+        called once per epoch — so anything derived from the whole file
+        (converting an epoch grid to an array, fitting a parameter's time
+        series) costs O(N) on every lookup and turns retrieval into O(N*M).
+        For a finely sampled arc that is the difference between seconds and a
+        run that looks hung.
+
+        Derived values are cached against the parsed payload itself, so they
+        inherit the file cache's ``(mtime, size)`` invalidation: rewriting a
+        sidecar produces a new payload and the old entry is simply never
+        consulted again.
+
+        Parameters
+        ----------
+        payload : dict
+            Parsed sidecar contents, used as the cache's owner.
+        key : hashable
+            Identifies the derived value within that sidecar.
+        build : callable
+            Produces the value on a miss.
+
+        Returns
+        -------
+        object
+            The cached or freshly built value.
+        """
+        entry = cls._sidecar_epoch_cache.get(id(payload))
+        if entry is None or entry[0] is not payload:
+            entry = (payload, {})
+            cls._sidecar_epoch_cache[id(payload)] = entry
+
+        values = entry[1]
+        if key not in values:
+            values[key] = build()
+        return values[key]
+
+    @classmethod
+    def _sidecar_epochs_cached(cls, stm_data, leg_key=None):
+        """
+        Epoch grid of an STM sidecar as a float array, parsed once.
+
+        Parameters
+        ----------
+        stm_data : dict
+            Parsed STM sidecar.
+        leg_key : hashable, optional
+            Leg identifier, for sequence sidecars that store one STM grid per
+            leg.
+
+        Returns
+        -------
+        numpy.ndarray
+            Ascending epoch grid, TDB seconds.
+        """
+
+        def build():
+            if leg_key is None:
+                raw = stm_data["epochsTDB"]
+            else:
+                raw = stm_data["legs"][leg_key]["STM_epochsTDB"]
+            return np.array(raw, dtype=float)
+
+        return cls._sidecar_derived(stm_data, ("stm_epochs", leg_key), build)
+
+    @classmethod
+    def clear_sidecar_cache(cls) -> None:
+        """Drop every cached parameters sidecar."""
+        cls._sidecar_cache.clear()
+        cls._sidecar_epoch_cache.clear()
+
+    # Names this library gives the sidecars it writes next to an SPK. They are
+    # a preference, not a requirement: a file named anything else is read when
+    # it is pointed at, or when it is the only candidate in a folder.
+    _SIDECAR_SUFFIXES = {
+        "parameters": ("_parameters.json", "_parameters.pkl"),
+        "stms": ("_stms.json", "_stms.pkl"),
+        "settings": ("_settings.json", "_settings.pkl"),
+        "mass_profile": ("_mass_profile.json", "_mass_profile.pkl"),
+    }
+
+    @classmethod
+    def sidecar_files(cls, location=None, kind: str = "parameters") -> list[str]:
+        """
+        List the sidecar files a lookup would read, in the order it reads them.
+
+        Sidecars are found by *where they are*, not by a folder layout this
+        library imposes, so ``location`` can be whatever handle the caller
+        happens to hold:
+
+        * an **SPK** (``.bsp``) — the sidecars written beside it are read
+          first (``<base>_parameters.json`` and friends), then anything else
+          in the same folder, which covers a run whose sidecars are shared
+          under a different basename;
+        * a **file** — read as-is, whatever it is called;
+        * a **folder** — the files in it whose names carry this library's
+          suffix for *kind* come first, then any other ``.json`` / ``.pkl``,
+          so a folder following someone else's naming still resolves;
+        * an **iterable** of any of the above — searched in the given order,
+          for payloads split across locations;
+        * ``None`` — :attr:`kernel_folder` when set, then
+          ``<cwd>/data/kernels/scenario``.
+
+        Locations that do not exist are skipped rather than raised on: the
+        callers report every location they consulted when a lookup finds
+        nothing, which is more useful than failing on the first missing one.
+
+        Parameters
+        ----------
+        location : str or os.PathLike or iterable, optional
+            Where to look, as described above. Defaults to ``None``.
+        kind : str, optional
+            Which payload is wanted — ``'parameters'``, ``'stms'``,
+            ``'settings'``, or ``'mass_profile'``. Only sets which suffixes are
+            preferred. Defaults to ``'parameters'``.
+
+        Returns
+        -------
+        list of str
+            Absolute paths of existing candidate files, most specific first,
+            without duplicates.
+
+        Examples
+        --------
+        .. code-block:: python
+
+            SpiceManager.sidecar_files("/runs/case7/traj.bsp")
+            SpiceManager.sidecar_files(["/runs/case7", "/shared/sidecars"])
+        """
+        suffixes = cls._SIDECAR_SUFFIXES.get(kind, cls._SIDECAR_SUFFIXES["parameters"])
+
+        # Normalize whatever was given into an ordered list of locations
+        if location is None:
+            locations = [] if cls.kernel_folder is None else [cls.kernel_folder]
+            locations.append(os.path.join(os.getcwd(), "data", "kernels", "scenario"))
+        elif isinstance(location, (str, os.PathLike)):
+            locations = [location]
+        else:
+            locations = list(location)
+
+        def _folder_files(folder: str) -> list[str]:
+            """Suffix matches first, then any other sidecar-shaped file."""
+            try:
+                names = sorted(os.listdir(folder))
+            except OSError:
+                return []
+            preferred = [n for n in names if n.endswith(suffixes)]
+            others = [
+                n for n in names if n.endswith((".json", ".pkl")) and n not in preferred
+            ]
+            return [os.path.join(folder, n) for n in preferred + others]
+
+        files = []
+        for loc in locations:
+            loc = os.path.abspath(os.fspath(loc))
+
+            if os.path.isdir(loc):
+                files += _folder_files(loc)
+            elif os.path.isfile(loc):
+                if loc.endswith(".bsp"):
+                    # An SPK stands for its own sidecars, then for its folder
+                    base = loc[: -len(".bsp")]
+                    files += [
+                        base + suffix
+                        for suffix in suffixes
+                        if os.path.isfile(base + suffix)
+                    ]
+                    files += _folder_files(os.path.dirname(loc))
+                else:
+                    files.append(loc)
+
+        # De-duplicate, keeping the order the locations were given in
+        seen = set()
+        return [f for f in files if not (f in seen or seen.add(f))]
+
+    @classmethod
+    def _sidecar_locations_searched(cls, location=None) -> str:
+        """Human-readable list of the locations a lookup consulted."""
+        if location is None:
+            locations = [] if cls.kernel_folder is None else [cls.kernel_folder]
+            locations.append(os.path.join(os.getcwd(), "data", "kernels", "scenario"))
+        elif isinstance(location, (str, os.PathLike)):
+            locations = [location]
+        else:
+            locations = list(location)
+
+        return ", ".join(str(loc) for loc in locations) or "nowhere"
+
+    # Keys that identify what a sidecar holds, so a candidate resolved by
+    # location alone can still be told apart: an STM sidecar carries the same
+    # body/origin/frame as the parameters sidecar beside it, and would otherwise
+    # satisfy an identity match for either.
+    _SIDECAR_MARKERS = {
+        "parameters": ("parameters", "legs"),
+        "stms": ("STMs",),
+        "settings": ("integrator", "force_models"),
+        "mass_profile": ("mass_profile", "coefficients"),
+    }
+
+    # Markers that some kinds also embed beside their own payload, for context
+    # only: a sequence STM sidecar carries the sequence's "legs" next to its
+    # "STMs". They identify a kind only when no other kind's payload is present.
+    _SIDECAR_CONTEXT_MARKERS = ("legs",)
+
+    @classmethod
+    def _sidecar_is_kind(cls, data, kind: str) -> bool:
+        """
+        Whether a parsed sidecar holds the payload *kind* asks for.
+
+        A file carrying another kind's payload belongs to that kind, unless the
+        shared marker is one of ``_SIDECAR_CONTEXT_MARKERS``.
+
+        Parameters
+        ----------
+        data : object
+            Parsed sidecar contents.
+        kind : str
+            A key of ``_SIDECAR_MARKERS``: ``'parameters'``, ``'stms'``,
+            ``'settings'`` or ``'mass_profile'``.
+
+        Returns
+        -------
+        bool
+            Whether *data* is a sidecar of that kind.
+        """
+        if not isinstance(data, dict):
+            return False
+
+        markers = cls._SIDECAR_MARKERS.get(kind, ())
+        if not any(marker in data for marker in markers):
+            return False
+
+        # A file that carries another kind's payload belongs to that kind,
+        # unless the shared marker is context it embeds beside our own.
+        other_payloads = [
+            marker
+            for other, other_markers in cls._SIDECAR_MARKERS.items()
+            if other != kind
+            for marker in other_markers
+            if marker not in cls._SIDECAR_CONTEXT_MARKERS
+        ]
+        return not any(marker in data for marker in other_payloads)
+
+    @staticmethod
+    def _sidecar_has_identity(data) -> bool:
+        """Whether a sidecar records which body, origin, and frame it describes."""
+        if not isinstance(data, dict):
+            return False
+        return isinstance(data.get("legs"), dict) or "body_ID" in data
+
+    @staticmethod
+    def _sidecar_matches(data, body_id: int, origin_id: int, frame_name: str) -> bool:
+        """
+        Whether a sidecar was written for this body, origin, and frame.
+
+        Handles both shapes the writers produce: identifiers at the top level,
+        or one entry per leg under ``'legs'`` for a mission sequence, where a
+        match on any leg makes the file the right one.
+
+        Parameters
+        ----------
+        data : object
+            Parsed sidecar contents.
+        body_id : int
+            SPICE ID of the target body.
+        origin_id : int
+            SPICE ID of the origin body.
+        frame_name : str
+            Name of the reference frame.
+
+        Returns
+        -------
+        bool
+            ``True`` when the sidecar describes the requested combination.
+        """
+        if not isinstance(data, dict):
+            return False
+
+        def _match(entry) -> bool:
+            return (
+                isinstance(entry, dict)
+                and entry.get("body_ID") == body_id
+                and entry.get("origin_ID") == origin_id
+                and entry.get("reference_frame") == frame_name
+            )
+
+        legs = data.get("legs")
+        if isinstance(legs, dict):
+            return any(_match(leg) for leg in legs.values())
+
+        return _match(data)
+
     @classmethod
     def get_parameters(
         cls,
@@ -909,13 +1323,17 @@ class SpiceManager:
         reference_frame: str | Frame,
         obsvr_bdy: str | Body,
         folder_path_override: str = None,
+        per_parameter: bool = False,
+        sidecar_path=None,
     ):
         """
         Retrieve and interpolate estimated parameters from a companion JSON file.
 
-        Searches the scenario kernel folder for a ``*_parameters.json`` file
-        whose ``body_ID``, ``origin_ID``, and ``reference_frame`` fields match
-        the supplied arguments.  If the file contains a multi-leg sequence, the
+        Reads the candidates :meth:`sidecar_files` resolves from
+        *sidecar_path* — an SPK, a file, a folder, or several of them — and
+        takes the first whose ``body_ID``, ``origin_ID``, and
+        ``reference_frame`` match the supplied arguments, at the top level or
+        in any leg.  If the file contains a multi-leg sequence, the
         leg whose ``epochsTDB`` interval contains *epoch_time* is selected.
         Within each leg (or in the flat, non-sequence case) the stored parameter
         time series is fitted with a polynomial of degree
@@ -932,40 +1350,55 @@ class SpiceManager:
         obsvr_bdy : str or Body
             Observer (origin) body recorded in the JSON file.
         folder_path_override : str, optional
-            Absolute path to the folder that contains the JSON files.  When
-            ``None`` (default), ``cls.kernel_folder`` is used if set; otherwise
-            falls back to ``<cwd>/data/kernels/scenario``.
+            Deprecated alias for *sidecar_path*, kept working for callers that
+            pass a folder.  Defaults to ``None``.
+        per_parameter : bool, optional
+            Return a ``{name: ArrayWUnits}`` mapping instead of the stacked
+            vector.  Defaults to ``False``.
+        sidecar_path : str or os.PathLike or iterable, optional
+            Where to look for the sidecar: an SPK, a file, a folder, or an
+            iterable of those — see :meth:`sidecar_files`.  When ``None``
+            (default), ``cls.kernel_folder`` is used if set; otherwise falls
+            back to ``<cwd>/data/kernels/scenario``.
 
         Returns
         -------
-        parameters : ArrayWUnits
-            Interpolated parameter vector with units reconstructed from the
-            ``unitsPower`` / ``unitsScale`` fields stored in the JSON.
+        parameters : ArrayWUnits or dict of str to ArrayWUnits
+            By default an :class:`ArrayWUnits` holding the stacked parameter
+            vector, always — the return type does not vary with the contents of
+            the file.
+
+            Its units are the shared units when every parameter of the body
+            agrees, which is the usual case. A body's parameters need not agree,
+            though: solving for a delta-v (km/s) alongside a maneuver-epoch
+            correction (sec) is ordinary. No single unit then describes the
+            stack, so it is reported dimensionless rather than mislabelled with
+            whichever unit came first, and ``per_parameter`` is the way to
+            recover what each column actually is.
+
+            With ``per_parameter=True``, a ``{name: ArrayWUnits}`` mapping
+            instead, each entry carrying its own units.
 
         Raises
         ------
+        SpiceManager.SidecarNotFoundError
+            If no matching sidecar is found; the message lists every location
+            searched.
         ValueError
-            If no matching JSON file is found, or if *epoch_time* does not fall
-            within any leg's time span.
+            If the sidecar is malformed (e.g. a leg's ``parameters`` entry), or
+            if *epoch_time* does not fall within any leg's time span.
+
+        Warns
+        -----
         RuntimeWarning
-            If more than one matching JSON file is found; the most recently
+            If more than one matching sidecar is found; the most recently
             modified file is used.
         """
 
-        # Define the folder path containing the JSON files
-        if not folder_path_override:
-            # not given folder path -> assume matches data folder
-            folder_path = (
-                cls.kernel_folder
-                if cls.kernel_folder is not None
-                else os.getcwd() + "/data/kernels/scenario"
-            )
-        else:
-            folder_path = folder_path_override
-            
+        location = sidecar_path if sidecar_path is not None else folder_path_override
+
         json_parameters = None
-        match_count = 0
-        matched_filenames = []
+        matched_paths = []
 
         # Ensure target, reference_frame, origin are a string
         if isinstance(reference_frame, Frame):
@@ -979,74 +1412,46 @@ class SpiceManager:
         obsvr_id = spice.bodn2c(obsvr_bdy)
 
         # ------------------------------------------------------------------
-        # Iterate over the files in the folder
-        # MINIMAL CHANGE: fix recognition logic (no double count, ANY leg match)
+        # Iterate over the candidate sidecars, most specific location first
         # ------------------------------------------------------------------
-        for filename in os.listdir(folder_path):
-            if not filename.endswith(".json"):
+        for path in cls.sidecar_files(location, kind="parameters"):
+            # JSON or pickle, auto-detected by extension. Parsed through a
+            # process-wide cache: Trajectory.get_state() calls this once per
+            # epoch, so without it a scenario folder holding N sidecars is
+            # re-read N times per epoch — the dominant cost of plotting a
+            # solution. Entries are keyed on the file's modification time, so
+            # a rewritten sidecar is re-read automatically.
+            json_data = cls._load_sidecar_cached(path)
+
+            if not cls._sidecar_is_kind(json_data, "parameters"):
                 continue
 
-            with open(os.path.join(folder_path, filename), "r") as file:
-                json_data = json.load(file)
-
-            matched_this_file = False
-
-            # Sequence JSON: match if ANY leg matches (IDs live inside each leg)
-            if (
-                isinstance(json_data, dict)
-                and "legs" in json_data
-                and isinstance(json_data["legs"], dict)
-            ):
-                for leg in json_data["legs"].values():
-                    if not isinstance(leg, dict):
-                        continue
-                    if (
-                        leg.get("body_ID") == trgt_id
-                        and leg.get("origin_ID") == obsvr_id
-                        and leg.get("reference_frame") == reference_frame
-                    ):
-                        matched_this_file = True
-                        break
-
-            # Non-sequence JSON fallback: match at top-level
-            elif isinstance(json_data, dict):
-                if (
-                    json_data.get("body_ID") == trgt_id
-                    and json_data.get("origin_ID") == obsvr_id
-                    and json_data.get("reference_frame") == reference_frame
-                ):
-                    matched_this_file = True
-
-            if matched_this_file:
-                match_count += 1
-                matched_filenames.append(filename)
+            if cls._sidecar_matches(json_data, trgt_id, obsvr_id, reference_frame):
+                matched_paths.append(path)
                 json_parameters = json_data
 
         # Print error if needed
-        if match_count > 1:
+        if len(matched_paths) > 1:
 
             # Pick most recently modified matching file
-            latest_idx = np.argmax(
-                [
-                    os.path.getmtime(os.path.join(folder_path, f))
-                    for f in matched_filenames
-                ]
-            )
-
-            latest_filename = matched_filenames[latest_idx]
+            latest_idx = np.argmax([os.path.getmtime(p) for p in matched_paths])
+            latest_path = matched_paths[latest_idx]
 
             warnings.warn(
                 "Multiple matching JSON files found. "
-                f"Using most recently modified file: {latest_filename}",
+                f"Using most recently modified file: {os.path.basename(latest_path)}",
                 RuntimeWarning,
             )
 
-            with open(os.path.join(folder_path, latest_filename), "r") as file:
-                json_parameters = json.load(file)
+            json_parameters = cls._load_sidecar_cached(latest_path)
 
-        elif match_count == 0:
-            raise ValueError(
-                "The JSON file containing the estimated parameters could not be located."
+        elif not matched_paths:
+            raise cls.SidecarNotFoundError(
+                f"No parameters sidecar for body {trgt_id} about origin "
+                f"{obsvr_id} in frame '{reference_frame}' was found. Searched: "
+                f"{cls._sidecar_locations_searched(location)}. Pass "
+                "`sidecar_path` pointing at the SPK, the sidecar file, or the "
+                "folder holding it."
             )
 
         # Determine if the JSON contains sequences
@@ -1056,7 +1461,13 @@ class SpiceManager:
 
             # Find the appropriate leg for the given epoch_time
             for idx, leg in enumerate(json_parameters["legs"].values()):
-                epochsTDB = np.array(leg["epochsTDB"], dtype=float)
+                if not isinstance(leg, dict):
+                    continue
+                epochsTDB = cls._sidecar_derived(
+                    json_parameters,
+                    ("leg_epochs", idx),
+                    lambda leg=leg: np.array(leg["epochsTDB"], dtype=float),
+                )
                 if epochsTDB.size == 0:
                     continue
 
@@ -1080,8 +1491,10 @@ class SpiceManager:
                         )
 
                     vals_out = []
-                    unitsP_out = []
-                    unitsS_out = []
+                    # (name, dim, Units) per parameter. A Units object holds a
+                    # single 1x4 dimension spec, so several parameters cannot
+                    # share one by concatenating their powers.
+                    blocks = []
 
                     for i in range(0, len(leg_par), 2):
                         if i + 1 >= len(leg_par):
@@ -1095,8 +1508,15 @@ class SpiceManager:
                                 f"Malformed parameters entry in leg {idx} at pair {i//2}."
                             )
 
-                        up = np.array(d.get("unitsPower", []), dtype=int).ravel()
-                        us = np.array(d.get("unitsScale", []), dtype=float).ravel()
+                        powers = d.get("unitsPower")
+                        par_units = (
+                            Units(
+                                Dimensions(np.array(powers, dtype=int).ravel()),
+                                np.array(d.get("unitsScale", []), dtype=float).ravel(),
+                            )
+                            if powers
+                            else None
+                        )
 
                         v_raw = d.get("values", None)
                         if v_raw is None:
@@ -1104,15 +1524,25 @@ class SpiceManager:
                                 f"Missing 'values' in parameters dict for leg {idx}."
                             )
 
-                        # Case A: constant (1xP or P-vector)
-                        # Example: "values": [0,0,0]
-                        if isinstance(v_raw, (list, tuple)) and (
-                            len(v_raw) == 0 or not isinstance(v_raw[0], (list, tuple))
-                        ):
-                            v = np.array(v_raw, dtype=float).ravel()
+                        # A leg parameter is either constant over the leg (one
+                        # value per component) or a time series (one row per
+                        # epoch). Decide on the array's rank, not on the Python
+                        # type: a size-1 parameter such as a solved-for SRP
+                        # scale factor is serialised by ``ndarray.tolist()`` as
+                        # a bare float, which no isinstance check for
+                        # list/tuple recognises. Such an entry used to fall
+                        # through to the time-series branch and raise
+                        # ``IndexError`` on a 0-d array, which
+                        # ``SolutionOD._compute_state_est`` swallowed — leaving
+                        # an all-zero state estimate that looked like an answer.
+                        v_arr = np.asarray(v_raw, dtype=float)
+
+                        # Case A: constant (scalar, or a P-vector)
+                        # Example: "values": [0,0,0]  or  "values": 1.0
+                        if v_arr.ndim <= 1:
+                            v = np.atleast_1d(v_arr).ravel()
                             vals_out.append(v)
-                            unitsP_out.append(up)
-                            unitsS_out.append(us)
+                            blocks.append((leg_par[i], v.size, par_units))
                             continue
 
                         # Case B: time series
@@ -1122,36 +1552,36 @@ class SpiceManager:
                             # If values look 2D but no epochs provided, fall back to leg epochsTDB (same length check below)
                             p_epochs = epochsTDB
 
-                        p_epochs = np.array(p_epochs, dtype=float)
-                        V = np.array(v_raw, dtype=float)
-
-                        # Allow V as (N,P) or (N,) for scalar param
-                        if V.ndim == 1:
-                            V = V.reshape(-1, 1)
-
-                        if p_epochs.shape[0] != V.shape[0]:
-                            raise ValueError(
-                                f"Parameter time series length mismatch in leg {idx}: "
-                                f"len(epochs)={p_epochs.shape[0]} vs values rows={V.shape[0]}"
-                            )
-
-                        # Interpolate each component (polyfit degree cls.poly_interp_par_deg)
                         deg = int(cls.poly_interp_par_deg)
-                        coeff = np.polyfit(p_epochs, V, deg)  # coeff shape: (deg+1, P)
+
+                        # The fit depends only on the file's contents, so it is
+                        # done once per parameter rather than once per epoch.
+                        # A least-squares solve over the whole grid on every
+                        # lookup is what makes a finely sampled arc appear to
+                        # hang, and it only bites once a parameter is solved for.
+                        def _fit(p_epochs=p_epochs, v_raw=v_raw, idx=idx, deg=deg):
+                            p_e = np.array(p_epochs, dtype=float)
+                            V = np.array(v_raw, dtype=float)
+
+                            # Allow V as (N,P) or (N,) for scalar param
+                            if V.ndim == 1:
+                                V = V.reshape(-1, 1)
+
+                            if p_e.shape[0] != V.shape[0]:
+                                raise ValueError(
+                                    f"Parameter time series length mismatch in leg {idx}: "
+                                    f"len(epochs)={p_e.shape[0]} vs values rows={V.shape[0]}"
+                                )
+
+                            # coeff shape: (deg+1, P)
+                            return np.polyfit(p_e, V, deg)
+
+                        coeff = cls._sidecar_derived(
+                            json_parameters, ("param_fit", idx, i, deg), _fit
+                        )
                         v = np.polyval(coeff, epoch_time).ravel()  # -> (P,)
                         vals_out.append(v)
-
-                        # Units: replicate per-component if only one units spec provided
-                        if up.size not in (0, v.size):
-                            if up.size == 4:  # common "Dimensions" length
-                                up = np.tile(up, v.size)
-                            else:
-                                up = np.resize(up, v.size)
-                        if us.size not in (0, v.size):
-                            us = np.resize(us, v.size)
-
-                        unitsP_out.append(up)
-                        unitsS_out.append(us)
+                        blocks.append((leg_par[i], v.size, par_units))
 
                     # Concatenate all parameters in order
                     parameter = (
@@ -1159,21 +1589,9 @@ class SpiceManager:
                         if len(vals_out)
                         else np.array([], dtype=float)
                     )
-
-                    leg_unitsPower = (
-                        np.concatenate(unitsP_out)
-                        if len(unitsP_out)
-                        else np.array([], dtype=int)
-                    )
-                    leg_unitsScale = (
-                        np.concatenate(unitsS_out)
-                        if len(unitsS_out)
-                        else np.array([], dtype=float)
-                    )
-
-                    units = Units(
-                        Dimensions(leg_unitsPower.tolist()), leg_unitsScale.tolist()
-                    )
+                    if per_parameter:
+                        return cls._split_parameters(parameter, blocks)
+                    units = cls._stacked_parameter_units(blocks)
                     break
 
             if parameter is None:
@@ -1183,21 +1601,117 @@ class SpiceManager:
 
         # Nominal case (no sequence)
         else:
-            parameters = np.array(json_parameters.get("parameters"))
-            epochsTDB = np.array(json_parameters.get("epochsTDB"))
-            unitsPower = np.array(json_parameters.get("unitsPower"))
-            unitsScale = np.array(json_parameters.get("unitsScale"))
+            # The fit depends only on the file, so it is done once per sidecar
+            # rather than once per epoch. Refitting here — a least-squares
+            # solve over the whole grid, plus two list-to-array conversions —
+            # is what makes a finely sampled arc appear to hang, since the
+            # caller asks once per measurement.
+            def _fit_flat():
+                parameters = np.array(json_parameters.get("parameters"))
+                epochsTDB = np.array(json_parameters.get("epochsTDB"))
+                return np.polyfit(epochsTDB, parameters, cls.poly_interp_par_deg)
 
-            # Perform interpolation with the data
-            json_poly_coefficients = np.polyfit(
-                epochsTDB, parameters, cls.poly_interp_par_deg
+            json_poly_coefficients = cls._sidecar_derived(
+                json_parameters, ("flat_fit", int(cls.poly_interp_par_deg)), _fit_flat
             )
             parameter = np.polyval(json_poly_coefficients, epoch_time)
 
-            # Get units
-            units = Units(Dimensions(unitsPower), unitsScale)
+            # Units. `parametersUnits` is per-parameter and authoritative; the
+            # scalar unitsPower/unitsScale are the legacy single-unit form and
+            # only exist when every parameter agrees. A body whose parameters
+            # carry different units (delta-v in km/s next to an epoch
+            # correction in sec) therefore has no single label, and each
+            # parameter is returned separately.
+            per_param = json_parameters.get("parametersUnits")
+            if per_param:
+                blocks = cls._parameter_unit_blocks(per_param)
+                units = cls._stacked_parameter_units(blocks)
+
+                if per_parameter:
+                    return cls._split_parameters(parameter, blocks)
+            else:
+                units = Units(
+                    Dimensions(np.array(json_parameters.get("unitsPower"))),
+                    np.array(json_parameters.get("unitsScale")),
+                )
+                if per_parameter:
+                    return {"parameters": ArrayWUnits(parameter, units)}
 
         return ArrayWUnits(parameter, units)
+
+    @staticmethod
+    def _parameter_unit_blocks(per_param) -> list:
+        """Decode a sidecar ``parametersUnits`` list into ``(name, dim, Units)``."""
+        blocks = []
+        for d in per_param:
+            powers = d.get("unitsPower")
+            units = (
+                Units(
+                    Dimensions(np.array(powers, dtype=int)),
+                    np.array(d.get("unitsScale", []), dtype=float),
+                )
+                if powers
+                else None
+            )
+            blocks.append((d["name"], int(d.get("dim", 1)), units))
+        return blocks
+
+    @staticmethod
+    def _same_units(a, b) -> bool:
+        """
+        Units equality that also accepts ``None`` (a unitless parameter).
+
+        Parameters
+        ----------
+        a, b : Units or None
+            Units to compare.
+
+        Returns
+        -------
+        bool
+            Whether both are ``None``, or both are equal Units.
+        """
+        # Units.__eq__ raises TypeError against anything that is not a Units
+        if a is None or b is None:
+            return a is b
+        return a == b
+
+    @classmethod
+    def _stacked_parameter_units(cls, blocks):
+        """Units of a stacked parameter vector built from ``(name, dim, Units)``.
+
+        The shared units when every parameter agrees. When they differ no
+        single unit describes the stack, so it is returned dimensionless
+        rather than mislabelled; ``per_parameter`` gives the per-column units.
+
+        Parameters
+        ----------
+        blocks : list of tuple
+            ``(name, dim, Units or None)`` per parameter, as from
+            :meth:`_parameter_unit_blocks`.
+
+        Returns
+        -------
+        Units or None
+            The shared units (``None`` when every parameter is unitless, or
+            there are none), or dimensionless when they differ.
+        """
+        all_units = [u for _, _, u in blocks]
+        first = all_units[0] if all_units else None
+        if all(cls._same_units(u, first) for u in all_units):
+            return first
+        return Units(Dimensions([0, 0, 0, 0]), [1.0, 1.0, 1.0, 1.0])
+
+    @staticmethod
+    def _split_parameters(parameter, blocks) -> dict:
+        """Split a stacked parameter vector into ``{name: ArrayWUnits}``."""
+        values = np.atleast_1d(parameter)
+        out, col = {}, 0
+        for name, dim, units in blocks:
+            chunk = values[col : col + dim]
+            out[name] = ArrayWUnits(chunk[0] if dim == 1 else chunk, units)
+            col += dim
+        return out
 
     @classmethod
     def get_STMs(
@@ -1207,16 +1721,23 @@ class SpiceManager:
         reference_frame: str | Frame,
         obsvr_bdy: str | Body,
         folder_path_override: str = None,
+        sidecar_path=None,
     ) -> np.ndarray:
         """
         Retrieve or interpolate the State Transition Matrix (STM) at a given epoch.
 
-        Searches the scenario kernel folder for a ``*_stms.json`` file whose
-        ``body_ID``, ``origin_ID``, and ``reference_frame`` fields match the
-        supplied arguments.  If *epoch_time* coincides (within floating-point
-        tolerance) with a stored epoch the corresponding STM is returned
-        directly.  Otherwise element-wise linear interpolation is performed
-        between the two bracketing epochs.
+        Reads the candidates :meth:`sidecar_files` resolves from
+        *sidecar_path* — an SPK, a file, a folder, or several of them — and
+        takes the first whose ``body_ID``, ``origin_ID``, and
+        ``reference_frame`` match the supplied arguments.  If *epoch_time*
+        equals a stored epoch the corresponding STM is returned directly.
+        Otherwise element-wise linear interpolation is performed between the
+        two bracketing epochs.
+
+        A sequence sidecar stores one STM block per leg, each on that leg's
+        own grid.  The STM is then taken from the first leg whose span holds
+        *epoch_time*, so an epoch on the boundary between two legs reads the
+        end of the earlier one.
 
         Parameters
         ----------
@@ -1229,17 +1750,27 @@ class SpiceManager:
             Reference frame recorded in the STM JSON file.
         obsvr_bdy : str or Body
             Observer (origin) body recorded in the STM JSON file.
+        folder_path_override : str, optional
+            Deprecated alias for *sidecar_path*, kept working for callers that
+            pass a folder.  Defaults to ``None``.
+        sidecar_path : str or os.PathLike or iterable, optional
+            Where to look for the sidecar: an SPK, a file, a folder, or an
+            iterable of those — see :meth:`sidecar_files`.  Defaults to
+            ``None``.
 
         Returns
         -------
         STM : numpy.ndarray
-            Shape ``(6, 6)`` State Transition Matrix evaluated at *epoch_time*.
+            Shape ``(n, n)`` State Transition Matrix evaluated at *epoch_time*,
+            ``n`` being the size of the state it was propagated with.
 
         Raises
         ------
+        SidecarNotFoundError
+            If no matching STM sidecar is found in any location searched.
         ValueError
-            If no matching STM JSON file is found, or if *epoch_time* lies
-            outside the stored time span.
+            If *epoch_time* lies outside the stored time span, or outside every
+            leg's span for a sequence sidecar.
         """
         # 1) Normalize inputs
         if isinstance(reference_frame, Frame):
@@ -1249,59 +1780,66 @@ class SpiceManager:
         if isinstance(trgt_bdy, Body):
             trgt_bdy = trgt_bdy.name
 
-        # 2) Find the right JSON file
+        trgt_id = spice.bodn2c(trgt_bdy)
+        obsvr_id = spice.bodn2c(obsvr_bdy)
+
+        # 2) Find the right sidecar among the candidate locations
+        location = sidecar_path if sidecar_path is not None else folder_path_override
+
         stm_data = None
-        _kf = (
-            folder_path_override
-            if folder_path_override is not None
-            else cls.kernel_folder
-            if cls.kernel_folder is not None
-            else os.getcwd() + "/data/kernels/scenario"
-        )
-        for fn in os.listdir(_kf):
-            if fn.endswith("_stms.json"):
-                with open(os.path.join(_kf, fn), "r") as f:
-                    jd = json.load(f)
-                if (
-                    jd["body_ID"] == spice.bodn2c(trgt_bdy)
-                    and jd["origin_ID"] == spice.bodn2c(obsvr_bdy)
-                    and jd["reference_frame"] == reference_frame
-                ):
-                    stm_data = jd
-                    break
+        for path in cls.sidecar_files(location, kind="stms"):
+            jd = cls._load_sidecar_cached(path)
+            if not cls._sidecar_is_kind(jd, "stms"):
+                continue
+            if cls._sidecar_matches(jd, trgt_id, obsvr_id, reference_frame):
+                stm_data = jd
+                break
+
         if stm_data is None:
-            raise ValueError("No matching STM JSON found.")
+            raise cls.SidecarNotFoundError(
+                f"No STM sidecar for body {trgt_id} about origin {obsvr_id} in "
+                f"frame '{reference_frame}' was found. Searched: "
+                f"{cls._sidecar_locations_searched(location)}. Pass "
+                "`sidecar_path` pointing at the SPK, the sidecar file, or the "
+                "folder holding it."
+            )
 
         # 3) Extract the appropriate epochs array
         #    (either across a single span or within the correct leg)
-        if "parameters_def" in stm_data and "legs" in stm_data["parameters_def"]:
-            # sequence‐case: find the leg containing your time
-            for leg in stm_data["parameters_def"]["legs"].values():
-                leg_epochs = np.array(leg["epochsTDB"], dtype=float)
+        legs = stm_data.get("legs")
+        if legs and all("STM_epochsTDB" in leg for leg in legs.values()):
+            # sequence case: one STM block per leg, keyed by leg
+            for leg_key in legs:
+                leg_epochs = cls._sidecar_epochs_cached(stm_data, leg_key)
                 if leg_epochs[0] <= epoch_time <= leg_epochs[-1]:
                     epochs = leg_epochs
+                    stms = stm_data["STMs"][leg_key]
                     break
             else:
-                raise ValueError("Epoch not in any leg.")
+                raise ValueError(f"Epoch {epoch_time} is not in any leg.")
         else:
             # non‐sequence
-            epochs = np.array(stm_data["epochsTDB"], dtype=float)
+            epochs = cls._sidecar_epochs_cached(stm_data)
+            stms = stm_data["STMs"]
             if not (epochs[0] <= epoch_time <= epochs[-1]):
                 raise ValueError("Epoch out of stored range.")
 
-        # 4) If exact match, return it
-        #    Convert to Python float before str‐lookup
-        match_idx = np.where(np.isclose(epochs, epoch_time))[0]
-        if match_idx.size == 1:
-            t0 = float(epochs[match_idx[0]])
-            return np.array(stm_data["STMs"][str(t0)])
+        # 4) Locate the epoch by binary search. A linear scan here would be
+        #    O(N) per lookup, and the caller asks once per measurement.
+        #    epochs[idx] is the first stored epoch at or after epoch_time, and
+        #    the range check above keeps idx inside the grid.
+        idx = int(np.searchsorted(epochs, epoch_time))
 
-        # 5) Otherwise find neighbors and do linear element‐wise interpolation
-        #    (epochs is sorted ascending)
-        idx = np.searchsorted(epochs, epoch_time)
+        # 5) Exact match: return the stored matrix directly. A relative
+        #    tolerance would not do here: at ET ~7.6e8 s, np.isclose's
+        #    default spans ~7600 s and swallows every interpolation.
+        if epochs[idx] == epoch_time:
+            return np.array(stms[str(float(epochs[idx]))])
+
+        # 6) Otherwise interpolate element-wise between the bracketing epochs
         t1, t2 = float(epochs[idx - 1]), float(epochs[idx])
-        STM1 = np.array(stm_data["STMs"][str(t1)])
-        STM2 = np.array(stm_data["STMs"][str(t2)])
+        STM1 = np.array(stms[str(t1)])
+        STM2 = np.array(stms[str(t2)])
         alpha = (epoch_time - t1) / (t2 - t1)
         return (1 - alpha) * STM1 + alpha * STM2
 
@@ -1312,9 +1850,16 @@ class SpiceManager:
         reference_frame: str | Frame,
         obsvr_bdy: str | Body,
         folder_path_override: str = None,
+        sidecar_path=None,
     ):
         """
         Retrieves the propagator settings for a given target, reference frame, and origin from JSON files.
+
+        Reads the candidates :meth:`sidecar_files` resolves from
+        *sidecar_path* — an SPK, a file, a folder, or several of them — and
+        takes the first whose ``body_ID``, ``origin_ID``, and
+        ``reference_frame`` match the supplied arguments.
+
         Parameters
         ----------
         trgt_bdy : str or Body
@@ -1323,6 +1868,13 @@ class SpiceManager:
             The reference frame or its name.
         obsvr_bdy : str or Body
             The origin body or its name.
+        folder_path_override : str, optional
+            Deprecated alias for *sidecar_path*, kept working for callers that
+            pass a folder.  Defaults to ``None``.
+        sidecar_path : str or os.PathLike or iterable, optional
+            Where to look for the sidecar: an SPK, a file, a folder, or an
+            iterable of those — see :meth:`sidecar_files`.  Defaults to
+            ``None``.
 
         Returns
         -------
@@ -1331,19 +1883,9 @@ class SpiceManager:
 
         Raises
         ------
-        ValueError
-            If the settings JSON file could not be located.
+        SidecarNotFoundError
+            If no matching settings sidecar is found in any location searched.
         """
-
-        folder_path = (
-            folder_path_override
-            if folder_path_override is not None
-            else cls.kernel_folder
-            if cls.kernel_folder is not None
-            else os.getcwd() + "/data/kernels/scenario"
-        )
-        settings_data = None
-
         # Ensure target, reference_frame, origin are a string
         if isinstance(reference_frame, Frame):
             reference_frame = reference_frame.name
@@ -1352,20 +1894,38 @@ class SpiceManager:
         if isinstance(trgt_bdy, Body):
             trgt_bdy = trgt_bdy.name
 
-        for filename in os.listdir(folder_path):
-            if filename.endswith("_settings.json"):
-                with open(os.path.join(folder_path, filename), "r") as file:
-                    json_data = json.load(file)
-                if (
-                    json_data["body_ID"] == spice.bodn2c(trgt_bdy)
-                    and json_data["origin_ID"] == spice.bodn2c(obsvr_bdy)
-                    and json_data["reference_frame"] == reference_frame
-                ):
-                    settings_data = json_data
-                    break
+        trgt_id = spice.bodn2c(trgt_bdy)
+        obsvr_id = spice.bodn2c(obsvr_bdy)
+
+        location = sidecar_path if sidecar_path is not None else folder_path_override
+
+        settings_data = None
+        for path in cls.sidecar_files(location, kind="settings"):
+            json_data = cls._load_sidecar_cached(path)
+
+            if not cls._sidecar_is_kind(json_data, "settings"):
+                continue
+
+            # A propagator-settings payload records no body, origin, or frame
+            # of its own: it is identified by the SPK it was written beside,
+            # which is what the location resolves. Identifiers are still
+            # honoured when a writer did record them.
+            if cls._sidecar_has_identity(json_data) and not cls._sidecar_matches(
+                json_data, trgt_id, obsvr_id, reference_frame
+            ):
+                continue
+
+            settings_data = json_data
+            break
 
         if not settings_data:
-            raise ValueError("Settings JSON file could not be located.")
+            raise cls.SidecarNotFoundError(
+                f"No propagator-settings sidecar for body {trgt_id} about "
+                f"origin {obsvr_id} in frame '{reference_frame}' was found. "
+                f"Searched: {cls._sidecar_locations_searched(location)}. Pass "
+                "`sidecar_path` pointing at the SPK, the sidecar file, or the "
+                "folder holding it."
+            )
 
         return settings_data
 
@@ -1376,9 +1936,11 @@ class SpiceManager:
         epoch_time: float | EpochArray,
         reference_frame: str | Frame,
         tol: int,
+        frame_id: int = None,
     ):
         """
         Get the attitude of a target body at a specified epoch time.
+
         Parameters
         ----------
         trgt_bdy : str or Body
@@ -1388,21 +1950,38 @@ class SpiceManager:
         reference_frame : str or Frame
             The reference frame in which the attitude is to be determined. Can be a string or an instance of Frame.
         tol : int
-            The tolerance value for the attitude determination.
+            Time tolerance for the C-kernel lookup, in spacecraft clock ticks.
+        frame_id : int, optional
+            The frame of the target body. If not given, frame ID is assumed to be the body's ID multiplied by 1000. Defaults
+            to ``None``.
 
         Returns
         -------
-        tuple
-            A tuple containing:
-            - ArrayWUnits: The state vector of the target body.
-            - ArrayWUnits: The angular velocity of the target body.
-            - ArrayWUnits: The angular acceleration of the target body.
+        cmat : np.ndarray
+            (3, 3) rotation matrix from ``reference_frame`` to the body frame,
+            as returned by ``spice.ckgpav``.
+        av : np.ndarray
+            (3,) angular velocity of the body frame relative to
+            ``reference_frame``, in rad/s, expressed in ``reference_frame``.
+        clkout : float
+            Spacecraft clock time, in ticks, of the returned pointing.
         """
 
         # -----------------------------------#
         # input validation and conditioning #
         # -----------------------------------#
         epoch_time = cls._validate_epoch_input(epoch_time)
+        # sce2c needs a Python float: an int epoch, a numpy scalar and the
+        # (1,) array an EpochArray yields all come here.
+        epoch_time = float(_np.asarray(epoch_time, dtype=float).ravel()[0])
+
+        # Ensure target, reference_frame are the types SPICE expects
+        # (trgt_bdy must be coerced to its int NAIF id before sce2c, which
+        # requires a raw int spacecraft ID).
+        if isinstance(reference_frame, Frame):
+            reference_frame = reference_frame.name
+        if isinstance(trgt_bdy, Body):
+            trgt_bdy = trgt_bdy.spice_id
 
         # --------------#
         # get attitude #
@@ -1410,14 +1989,11 @@ class SpiceManager:
         # Get s/c clock and attitude from SPICE
         t_clicks = spice.sce2c(trgt_bdy, epoch_time)  # Convert in clock ticks
 
-        # Ensure target, reference_frame, origin are a string
-        if isinstance(reference_frame, Frame):
-            reference_frame = reference_frame.name
-        if isinstance(trgt_bdy, Body):
-            trgt_bdy = trgt_bdy.name
+        if not frame_id:
+            # didn't get a frame ID -> assumed its ID * 1000
+            frame_id = trgt_bdy * 1000
 
-        trgt_bdy_frm_id = trgt_bdy * 1000
-        state = spice.ckgpav(trgt_bdy_frm_id, t_clicks, tol, reference_frame)
+        state = spice.ckgpav(frame_id, t_clicks, tol, reference_frame)
         return (state[0], state[1], state[2])
 
     @staticmethod
@@ -1515,7 +2091,8 @@ class SpiceManager:
         # -------------#
         # Use the default frame centered on the observer unless otherwise specified
         if inframe == "obs":
-            _, inframe = spice.cnmfrm(obsvr_bdy.name)
+            obsvr_name = obsvr_bdy.name if isinstance(obsvr_bdy, Body) else obsvr_bdy
+            _, inframe = spice.cnmfrm(obsvr_name)
 
         # Spice window
         cnfine = spice.stypes.SPICEDOUBLE_CELL(2)
@@ -1842,7 +2419,8 @@ class SpiceManager:
         years = []
         doys = []
         secs = []
-        for et in et_list:
+        # A single epoch is a bare float, which is not iterable on its own.
+        for et in np.atleast_1d(et_list):
             # Convert ET to calendar string in DOY format: 'YYYY-DOY::HR:MN:SC'
             utc_str = spice.et2utc(et, "ISOD", 9)  # Precision is
             date_part, time_part = utc_str.split("T")
@@ -1893,16 +2471,18 @@ class SpiceManager:
             hours = int(trk_sec // 3600)
             minutes = int((trk_sec % 3600) // 60)
             seconds = trk_sec % 60
-            # Format time string: 'YYYY-DOY::HH:MM:SS'
+            # Format time string: 'YYYY-DOY::HH:MM:SS.sssssssss' (fixed point: a
+            # general format turns a rounding-sized second into '1.19e-07',
+            # which SPICE cannot parse)
             tt_str = (
-                f"{trk_year}-{trk_doy:03d}::{hours:02d}:{minutes:02d}:{seconds:06.9}"
+                f"{trk_year}-{trk_doy:03d}::{hours:02d}:{minutes:02d}:{seconds:012.9f}"
             )
             # Convert to ephemeris time
             tt_ET = spice.str2et(tt_str)
             et.append(tt_ET)
         return et
 
-    # NOTE: see issue https://orccagitlab.colorado.edu/javi9068/scarabaeus/-/issues/315#note_2131 for context
+    # NOTE: convert_time is disabled and kept for reference (internal issue #315)
     # @staticmethod
     # def convert_time(self,
     #                 from_time : str | int | float,
@@ -2066,7 +2646,7 @@ class SpiceManager:
         return spice.namfrm(frame_name)
 
     @staticmethod
-    @lru_cache(maxsize=None)
+    @lru_cache(maxsize=1024)
     def frame_id_to_frame_name(frame_id: int) -> str:
         """Return the SPICE frame name for a given integer frame ID.
 
@@ -2089,36 +2669,38 @@ class SpiceManager:
         """
         return spice.frmnam(frame_id)
 
+    @lru_cache
     @staticmethod
-    def list_all_frames(max_id: int = 100000) -> list:
+    def list_all_frames(max_id: int = None) -> list:
         """List all SPICE reference frames currently detectable in the pool.
 
-        Scans integer frame IDs in :math:`[-\\texttt{max\\_id},\\,+\\texttt{max\\_id})` and
-        collects every ID for which SPICE returns a non-empty name.
+        This includes all built in SPICE frames.
 
         Parameters
         ----------
         max_id : int, optional
-            Half-range of the frame-ID scan window.  Defaults to ``100000``.
+            Keep only frames whose NAIF ID is at most this value. Enumerating
+            every loaded frame is slow once a large kernel set is on the pool,
+            so a caller that only needs the low-numbered inertial frames can
+            cap the search. Defaults to no limit.
 
         Returns
         -------
         frames_list : list of str
             Names of all reference frames found.
-
-        Notes
-        -----
-        Frame IDs are distinct from body NAIF IDs used in SPK/PCK kernels.
         """
-        frames_list = []
-        for frame_id in range(-max_id, max_id):
-            try:
-                frame_name = SpiceManager.frame_id_to_frame_name(frame_id)
-                if frame_name:
-                    frames_list.append(frame_name)
-            except Exception:
-                pass  # Ignore errors for undefined frame IDs
-        return frames_list
+        all_frames = []
+        for frame in (spice.bltfrm, spice.kplfrm):
+            # check built in (bltfrm) and loaded (kplfrm)
+            for frame_class in range(1, 6):  # SPICE frame classes are 1-5
+                # check for each frame class
+                for frame_id in frame(frame_class):
+                    if max_id is not None and frame_id > max_id:
+                        continue
+                    # get name of the frame and save
+                    all_frames.append(SpiceManager.frame_id_to_frame_name(frame_id))
+
+        return all_frames
 
     @staticmethod
     def list_all_ck_ids(ck_file: str) -> list[int]:
@@ -2137,10 +2719,35 @@ class SpiceManager:
         return spice.ckobj(ck_file)
 
     @staticmethod
-    def test(file):
-        spice.ckgp(
-            1835067803272,
-        )
+    def list_all_bodies() -> list[int]:
+        """List every body found across all loaded SPK kernels.
+
+        Iterates over each SPK kernel currently loaded in the SPICE kernel
+        pool, and for every kernel prints its filename followed by the NAIF
+        integer ID and resolved name of each body it contains. Bodies whose
+        ID cannot be resolved to a name are printed as ``(no name)``.
+
+        Returns
+        -------
+        all_ids : list of int
+            Sorted, de-duplicated NAIF integer IDs of every body found
+            across the loaded SPK kernels.
+        """
+        all_ids = set()
+        n_files = spice.ktotal("SPK")
+        for i in range(n_files):
+            filename, filtyp, srcfil, handle = spice.kdata(i, "SPK")
+            print(f"\n--- {filename} ---")
+            ids = spice.spkobj(filename)
+            for body_id in ids:
+                all_ids.add(int(body_id))
+                try:
+                    name = spice.bodc2n(body_id)
+                    print(f"  {body_id:>10}: {name}")
+                except:
+                    print(f"  {body_id:>10}: (no name)")
+
+        return sorted(all_ids)
 
     @classmethod
     def get_xfrm(
@@ -2266,34 +2873,18 @@ class SpiceManager:
         """
 
         # Check if the frame is already in the SPICE pool
-        try:
-            existing_frame_name = spice.frmnam(frame_id)
-            if existing_frame_name:
-                raise RuntimeError(
-                    f"Frame ID {frame_id} is already registered as '{existing_frame_name}' in the SPICE pool. "
-                    f"Please choose a different frame ID or unregister the existing frame."
-                )
-        except spice.stypes.SpiceyError:
-            # This occurs if the frame ID is not found, which is fine
-            pass
+        # (spice.frmnam never actually raises -- it returns "" for an
+        # unregistered frame_id -- so no try/except is needed here)
+        existing_frame_name = spice.frmnam(frame_id)
+        if existing_frame_name:
+            raise RuntimeError(
+                f"Frame ID {frame_id} is already registered as '{existing_frame_name}' in the SPICE pool. "
+                f"Please choose a different frame ID or unregister the existing frame."
+            )
 
         # Check if the file already exists
         if os.path.isfile(file_name):
-            print(f"Warning: File '{file_name}' already exists.")
-            # Prompt the user for confirmation
-            while True:
-                # user_input = (
-                #    input("Do you want to overwrite it? (Y/N): ").strip().upper()
-                # )
-                user_input = "Y"  # Force user_input to overwrite
-                if user_input == "Y":
-                    break
-                elif user_input == "N":
-                    raise RuntimeError(
-                        f"Execution aborted due to existing file: {file_name}"
-                    )
-                else:
-                    print("Invalid input. Please enter 'Y' or 'N'.")
+            print(f"Warning: File '{file_name}' already exists. It will be overwritten.")
 
         # Write the content to the file
         with open(file_name, "w") as file:
@@ -2357,34 +2948,18 @@ class SpiceManager:
         """
 
         # Check if the frame is already in the SPICE pool
-        try:
-            existing_frame_name = spice.frmnam(frame_id)
-            if existing_frame_name:
-                raise RuntimeError(
-                    f"Frame ID {frame_id} is already registered as '{existing_frame_name}' in the SPICE pool. "
-                    f"Please choose a different frame ID or unregister the existing frame."
-                )
-        except spice.stypes.SpiceyError:
-            # This occurs if the frame ID is not found, which is fine
-            pass
+        # (spice.frmnam never actually raises -- it returns "" for an
+        # unregistered frame_id -- so no try/except is needed here)
+        existing_frame_name = spice.frmnam(frame_id)
+        if existing_frame_name:
+            raise RuntimeError(
+                f"Frame ID {frame_id} is already registered as '{existing_frame_name}' in the SPICE pool. "
+                f"Please choose a different frame ID or unregister the existing frame."
+            )
 
         # Check if the file already exists
         if os.path.isfile(file_name):
-            print(f"Warning: File '{file_name}' already exists.")
-            # Prompt the user for confirmation
-            while True:
-                # user_input = (
-                #    input("Do you want to overwrite it? (Y/N): ").strip().upper()
-                # )
-                user_input = "Y"  # Force user_input to overwrite
-                if user_input == "Y":
-                    break
-                elif user_input == "N":
-                    raise RuntimeError(
-                        f"Execution aborted due to existing file: {file_name}"
-                    )
-                else:
-                    print("Invalid input. Please enter 'Y' or 'N'.")
+            print(f"Warning: File '{file_name}' already exists. It will be overwritten.")
 
         # Write to the file
         with open(file_name, "w") as file:
@@ -2458,34 +3033,18 @@ class SpiceManager:
         """
 
         # Check if the frame is already in the SPICE pool
-        try:
-            existing_frame_name = spice.frmnam(frame_id)
-            if existing_frame_name:
-                raise RuntimeError(
-                    f"Frame ID {frame_id} is already registered as '{existing_frame_name}' in the SPICE pool. "
-                    f"Please choose a different frame ID or unregister the existing frame."
-                )
-        except spice.stypes.SpiceyError:
-            # This occurs if the frame ID is not found, which is fine
-            pass
+        # (spice.frmnam never actually raises -- it returns "" for an
+        # unregistered frame_id -- so no try/except is needed here)
+        existing_frame_name = spice.frmnam(frame_id)
+        if existing_frame_name:
+            raise RuntimeError(
+                f"Frame ID {frame_id} is already registered as '{existing_frame_name}' in the SPICE pool. "
+                f"Please choose a different frame ID or unregister the existing frame."
+            )
 
         # Check if the file already exists
         if os.path.isfile(file_name):
-            print(f"Warning: File '{file_name}' already exists.")
-            # Prompt the user for confirmation
-            while True:
-                # user_input = (
-                #    input("Do you want to overwrite it? (Y/N): ").strip().upper()
-                # )
-                user_input = "Y"  # Force user_input to overwrite
-                if user_input == "Y":
-                    break
-                elif user_input == "N":
-                    raise RuntimeError(
-                        f"Execution aborted due to existing file: {file_name}"
-                    )
-                else:
-                    print("Invalid input. Please enter 'Y' or 'N'.")
+            print(f"Warning: File '{file_name}' already exists. It will be overwritten.")
 
         # Write to the file
         with open(file_name, "w") as file:
@@ -2512,8 +3071,9 @@ class SpiceManager:
         ValueError
             If *id_number* has no associated frame in the kernel pool.
         """
-        frame_code, frame_name = spice.cidfrm(id_number)
-        if frame_name == None:
+        try:
+            frame_code, frame_name = spice.cidfrm(id_number)
+        except spice.stypes.SpiceyError:
             raise ValueError(f"Frame '{str(id_number)}' is not recognized.")
         return (frame_code, frame_name)
 
@@ -2597,12 +3157,12 @@ class SpiceManager:
         -------
         interval : list of str
             ``[start_jd, end_jd]`` where each element is a Julian Date string
-            produced by ``spice.timout``.
+            produced by ``spice.et2utc``.
         """
         cover = spice.spkcov(spkFile, objID)
         end_times = spice.wnfetd(cover, 0)
-        start = spice.timout(end_times[0], "JD")
-        end = spice.timout(end_times[1], "JD")
+        start = spice.et2utc([end_times[0]], "J", 6, 30)[0]
+        end = spice.et2utc([end_times[1]], "J", 6, 30)[0]
         return [start, end]
 
     # endregion Body Methods #
@@ -2677,19 +3237,87 @@ class SpiceManager:
         bool
             Returns True if the kernel is in the pool and False if not.
         """
-        try:
-            # Get the total number of loaded kernels
-            num_kernels = spice.ktotal("ALL")
+        # Get the total number of loaded kernels
+        num_kernels = spice.ktotal("ALL")
 
-            # Loop through all the loaded kernels and check if the kernel_filename is in the pool
-            for i in range(num_kernels):
-                file, _, _, _, _ = spice.kdata(i, "ALL")
-                if kernel_filename in file:
-                    return True
-        except Exception as e:
-            print(f"Error checking kernel: {e}")
+        # Loop through all the loaded kernels and check if the kernel_filename is in the pool
+        # spice.kdata returns either (file, type, source, handle, found) or
+        # (file, type, source, handle) depending on spiceypy version/config.
+        for i in range(num_kernels):
+            file = spice.kdata(i, "ALL")[0]
+            if kernel_filename in file:
+                return True
 
         return False
+
+    @staticmethod
+    def spk_files_for_body(spice_id, epochs=None) -> list:
+        """
+        List the loaded SPK files that provide ephemeris for a body.
+
+        Useful for recording which trajectory a computation actually used,
+        since a body's ephemeris is resolved from global kernel-pool state
+        rather than from anything passed in at the call site.
+
+        Parameters
+        ----------
+        spice_id : int or str
+            NAIF ID of the body.
+        epochs : array_like, optional
+            ET epochs, in seconds. When given, only the files that resolve the
+            body at one of these epochs are listed: for each epoch, the
+            last-loaded file whose coverage contains it. Defaults to ``None``.
+
+        Returns
+        -------
+        list of str
+            Paths of the loaded SPKs covering this body, in load order. Without
+            ``epochs``, SPK precedence (last-loaded-wins) makes the final entry
+            the one that resolves wherever its coverage reaches, but an earlier
+            file still resolves epochs outside it.
+        """
+        try:
+            target = int(spice_id)
+        except (TypeError, ValueError):
+            return []
+
+        files, windows = [], []
+        try:
+            for i in range(spice.ktotal("SPK")):
+                path = spice.kdata(i, "SPK")[0]
+                try:
+                    if target in spice.spkobj(path):
+                        files.append(path)
+                        if epochs is not None:
+                            cover = spice.spkcov(path, target)
+                            windows.append([
+                                spice.wnfetd(cover, k)
+                                for k in range(spice.wncard(cover))
+                            ])
+                except Exception:
+                    # Unreadable or non-SPK entry; skip rather than fail the
+                    # caller, since this is diagnostic information.
+                    continue
+        except Exception as e:
+            print(f"Error listing SPK files for body {spice_id}: {e}")
+
+        if epochs is None:
+            return files
+
+        # Walk the files newest first, as SPICE does, giving each epoch to
+        # the first one that covers it
+        unresolved = _np.unique(_np.asarray(epochs, dtype=float).ravel())
+        resolving = set()
+        for idx in reversed(range(len(files))):
+            if unresolved.size == 0:
+                break
+            covered = _np.zeros(unresolved.shape, dtype=bool)
+            for start, stop in windows[idx]:
+                covered |= (unresolved >= start) & (unresolved <= stop)
+            if covered.any():
+                resolving.add(idx)
+                unresolved = unresolved[~covered]
+        return [files[idx] for idx in sorted(resolving)]
 
     @staticmethod
     def increase_kernel_priority(kernel_filename: str):
@@ -2728,7 +3356,7 @@ class SpiceManager:
         spice.boddef(name, spiceId)
 
     @classmethod
-    def write_spk_segment_type9(
+    def write_spk_segment_type13(
         cls,
         SPK_name: str,
         SPK_SEG_ID: str,
@@ -2736,18 +3364,31 @@ class SpiceManager:
         origin_ID: float,
         ref_frame: Frame,
         epochs_TDB: list,
-        degree_poly: float,
+        degree_poly: int,
         state_SPICE: list,
         parameters_JSON: list = None,
+        parameters_units: list = None,
         STMs_JSON: list = None,
+        STM_units: dict = None,
         state_definition: list = None,
         sequence_definition: list = None,
         leg_data: dict = None,
         propagator_settings: dict = None,
         mass_profile: SCBPolynomial = None,
+        stm_format: str = "json",
+        sidecar_format: str = "json",
+        sidecar_name: str = None,
     ):
         """
-        Write a segment of type 9 to an SPK file.
+        Write a segment of type 13 to an SPK file.
+
+        Type 13 stores the same ``(epoch, position, velocity)`` records as type 9,
+        in the same number of bytes, but interpolates them with Hermite polynomials
+        that use the sampled velocities as derivative constraints on the position
+        curve. The returned velocity is then the exact derivative of the returned
+        position, and at ``degree_poly=3`` the two-node window makes the interpolant
+        C1-continuous across every node, removing the jumps a shifting type-9
+        Lagrange window produced at each node crossing.
 
         Parameters
         ----------
@@ -2785,15 +3426,52 @@ class SpiceManager:
         Returns
         -------
         None
-        """
-        # Handle SPK file opening
-        SPK_handle = cls._open_spk_file(SPK_name)
 
+        Raises
+        ------
+        EvenDegreeError
+            If ``degree_poly`` is even. Type 13 builds each Hermite polynomial from
+            a position and a velocity per node, so its degree is always odd.
+        TooFewStatesError
+            If the segment holds fewer than ``(degree_poly + 1) // 2`` states, which
+            is the window SPK type 13 needs to build its interpolating polynomial.
+        """
         # Initialize
         body_ID = body.spice_id
+        num_states = len(epochs_TDB)
+
+        # Checked before the file is opened, rather than left to CSPICE, whose
+        # SPICE(INVALIDDEGREE) names neither the segment nor the way out.
+        if degree_poly % 2 == 0:
+            # The odd degrees either side, keeping only the ones SPICE would take:
+            # degree 0 has no odd neighbour below it, so don't offer -1.
+            options = sorted({max(degree_poly - 1, 1), max(degree_poly + 1, 1)})
+            advice = " or ".join(str(degree) for degree in options)
+            raise cls.EvenDegreeError(
+                f"SPK segment '{SPK_SEG_ID}' (body {body_ID}) asks for degree "
+                f"{degree_poly}, but type 13 interpolates with Hermite polynomials "
+                "built from a position and a velocity per node, so the degree is "
+                f"always odd. Use {advice}."
+            )
+
+        # A type-13 window spans (degree + 1) / 2 states, half what the same degree
+        # costs under type 9, because every node also supplies a derivative.
+        min_states = (degree_poly + 1) // 2
+
+        # Checked before the file is opened, rather than left to CSPICE, whose
+        # SPICE(TOOFEWSTATES) names neither the segment nor the way out.
+        if num_states < min_states:
+            raise cls.TooFewStatesError(
+                f"SPK segment '{SPK_SEG_ID}' (body {body_ID}) holds {num_states} "
+                f"state(s), but a degree-{degree_poly} Hermite polynomial needs at "
+                f"least {min_states}. Propagate the segment on a finer output grid "
+                "(more epochs), or lower the Trajectory's `degree_poly`."
+            )
+
+        # Handle SPK file opening
+        SPK_handle = cls._open_spk_file(SPK_name, body_ID, epochs_TDB)
 
         # Write SPK segment
-        num_states = len(epochs_TDB)
         cls._write_spk_segment(
             SPK_handle,
             body_ID,
@@ -2807,8 +3485,13 @@ class SpiceManager:
             SPK_SEG_ID,
         )
 
-        # Write parameters to JSON if provided
-        if parameters_JSON is not None:
+        # Sidecar extension follows the requested format (".json" or ".pkl").
+        side_ext = (
+            ".pkl" if str(sidecar_format).lower() in ("pickle", "pkl") else ".json"
+        )
+
+        # Write parameters sidecar only when parameters were actually estimated
+        if cls._has_parameter_payload(parameters_JSON):
             data = cls._prepare_parameters_data(
                 body_ID,
                 origin_ID,
@@ -2818,10 +3501,16 @@ class SpiceManager:
                 state_definition,
                 sequence_definition,
                 leg_data,
+                parameters_units=parameters_units,
             )
-            cls._write_parameters_to_json(SPK_name, data, "_parameters.json")
+            # Sidecars follow ``sidecar_name`` rather than the SPK, so several
+            # bodies sharing one .bsp cannot overwrite each other's parameters.
+            # Readers locate a sidecar by body id, not by filename.
+            cls._write_parameters_to_json(
+                sidecar_name or SPK_name, data, f"_parameters{side_ext}"
+            )
 
-        # Write STMs to JSON if provided
+        # Write STMs sidecar if provided
         if STMs_JSON is not None:
             stm_data = cls._prepare_stm_data(
                 STMs_JSON,
@@ -2833,21 +3522,21 @@ class SpiceManager:
                 state_definition,
                 sequence_definition,
                 leg_data,
+                STM_units=STM_units,
             )
-            cls._write_parameters_to_json(SPK_name, stm_data, "_STMs.json")
+            cls._write_stm_sidecar(SPK_name, stm_data, stm_format)
 
-        # Write propagator settings to JSON if provided
+        # Write propagator settings sidecar if provided
         if propagator_settings is not None:
             cls._write_parameters_to_json(
-                SPK_name, propagator_settings, "_settings.json"
+                SPK_name, propagator_settings, f"_settings{side_ext}"
             )
 
-        # Write mass profile to JSON if provided
+        # Write mass profile sidecar if provided
         if mass_profile is not None:
-            # Write mass profile to JSON if provided
             mass_profile_data = cls._prepare_mass_profile_data(body, mass_profile)
             cls._write_parameters_to_json(
-                SPK_name, mass_profile_data, "_mass_profile.json"
+                SPK_name, mass_profile_data, f"_mass_profile{side_ext}"
             )
 
         # Close SPK file
@@ -2856,29 +3545,88 @@ class SpiceManager:
         # Load the SPK file
         spice.furnsh(SPK_name)
 
-    @staticmethod
-    def _open_spk_file(SPK_name):
+    @classmethod
+    def _open_spk_file(cls, SPK_name, body_ID, epochs_TDB):
         """
         Open an SPK file for writing or appending.
         IMPORTANT: CSPICE cannot spkopa an SPK that is currently loaded (furnsh).
+
+        Appending is the ordinary way to grow an SPK, so an existing file is not
+        itself worth a warning. Re-covering epochs the file already holds for
+        this body is: segments do not merge, the later one simply outranks the
+        earlier, so the states already on file quietly stop being the ones SPICE
+        returns over the overlap.
+
+        Parameters
+        ----------
+        SPK_name : str
+            Path of the SPK to create or append to.
+        body_ID : int
+            SPICE ID of the body whose segment is about to be written; only this
+            body's existing coverage can be shadowed by it.
+        epochs_TDB : list
+            Epochs of the segment about to be written, ascending. Its first and
+            last entries are the coverage being claimed.
         """
         # Ensure not loaded before opening for write/append
-        try:
-            spice.unload(
-                SPK_name
-            )  # safe if not loaded? in CSPICE it can error; catch below
-        except Exception:
-            pass
+        # (spice.unload is a no-op for a file that isn't loaded, so no
+        # try/except is needed here)
+        spice.unload(SPK_name)
 
-        if os.path.isfile(SPK_name):
-            print(
-                f"Warning: SPK file '{SPK_name}' already exists. The trajectory segment will be appended to this file."
+        if not os.path.isfile(SPK_name):
+            return spice.spkopn(SPK_name, SPK_name, 0)
+
+        # Read the coverage before spkopa: the file has to be opened read-only
+        # to be queried, and it cannot be open twice at once.
+        overlaps = cls._overlapping_coverage(
+            SPK_name, body_ID, epochs_TDB[0], epochs_TDB[-1]
+        )
+        if overlaps:
+            windows = "; ".join(
+                f"{spice.etcal(lo)} to {spice.etcal(hi)} TDB" for lo, hi in overlaps
             )
-            SPK_handle = spice.spkopa(SPK_name)
-        else:
-            SPK_handle = spice.spkopn(SPK_name, SPK_name, 0)
+            print(
+                f"Warning: SPK file '{SPK_name}' already covers body {body_ID} over "
+                f"{windows}. The segment being appended takes priority there, so the "
+                "states already on file will no longer be the ones returned."
+            )
 
-        return SPK_handle
+        return spice.spkopa(SPK_name)
+
+    @classmethod
+    def _overlapping_coverage(cls, SPK_name, body_ID, t0, tf):
+        """
+        Parts of an existing SPK's coverage that a new segment would write over.
+
+        Returns the intervals of ``SPK_name``'s current coverage for ``body_ID``
+        that intersect ``[t0, tf]``, as ``(start, stop)`` pairs in TDB seconds,
+        empty when the new segment breaks no ground. Segments that merely touch
+        -- one ending exactly where the next begins -- share a single instant
+        rather than an interval and are not reported, since chaining legs end to
+        end is how a sequence is written, not a collision.
+
+        Parameters
+        ----------
+        SPK_name : str
+            Path of an existing SPK, not currently open for writing.
+        body_ID : int
+            SPICE ID to look up. A body absent from the file has empty coverage,
+            which ``spkcov`` reports without complaint.
+        t0, tf : float
+            Start and end of the segment about to be written, TDB seconds.
+        """
+        cover = spice.spkcov(
+            SPK_name, int(body_ID), spice.cell_double(cls._spk_coverage_cell_size)
+        )
+
+        overlaps = []
+        for interval in range(spice.wncard(cover)):
+            start, stop = spice.wnfetd(cover, interval)
+            lo, hi = max(start, t0), min(stop, tf)
+            if hi > lo:
+                overlaps.append((lo, hi))
+
+        return overlaps
 
     @staticmethod
     def _write_spk_segment(
@@ -2894,7 +3642,9 @@ class SpiceManager:
         SPK_SEG_ID,
     ):
         """
-        Write a trajectory segment to an SPK file.
+        Write a trajectory segment to an SPK file as a type-13 (unequally spaced
+        Hermite) segment. The argument list matches ``spkw09``; only the way the
+        records are interpolated on read-back differs.
 
         Parameters
         ----------
@@ -2921,7 +3671,7 @@ class SpiceManager:
         -------
         None
         """
-        spice.spkw09(
+        spice.spkw13(
             SPK_handle,
             body_ID,
             origin_ID,
@@ -2943,14 +3693,19 @@ class SpiceManager:
         origin_ID: float,
         ref_frame: Frame,
         epochs_TDB: list,
-        degree_poly: float,
+        degree_poly: int,
         parameters_JSON: list = None,
+        parameters_units: list = None,
         STMs_JSON: list = None,
+        STM_units: dict = None,
         state_definition: list = None,
         sequence_definition: list = None,
         leg_data: dict = None,
         propagator_settings: dict = None,
         mass_profile: SCBPolynomial = None,
+        stm_format: str = "json",
+        sidecar_format: str = "json",
+        sidecar_name: str = None,
     ):
         """
         Write ONLY the JSON sidecars associated with an SPK (parameters/STMs/settings/mass profile).
@@ -2967,8 +3722,13 @@ class SpiceManager:
         """
         body_ID = body.spice_id
 
-        # Parameters JSON
-        if parameters_JSON is not None:
+        # Sidecar extension follows the requested format (".json" or ".pkl").
+        side_ext = (
+            ".pkl" if str(sidecar_format).lower() in ("pickle", "pkl") else ".json"
+        )
+
+        # Parameters sidecar, only when parameters were actually estimated
+        if cls._has_parameter_payload(parameters_JSON):
             data = cls._prepare_parameters_data(
                 body_ID,
                 origin_ID,
@@ -2978,8 +3738,14 @@ class SpiceManager:
                 state_definition,
                 sequence_definition,
                 leg_data,
+                parameters_units=parameters_units,
             )
-            cls._write_parameters_to_json(SPK_name, data, "_parameters.json")
+            # Sidecars follow ``sidecar_name`` rather than the SPK, so several
+            # bodies sharing one .bsp cannot overwrite each other's parameters.
+            # Readers locate a sidecar by body id, not by filename.
+            cls._write_parameters_to_json(
+                sidecar_name or SPK_name, data, f"_parameters{side_ext}"
+            )
 
         # STMs JSON
         if STMs_JSON is not None:
@@ -2993,21 +3759,121 @@ class SpiceManager:
                 state_definition,
                 sequence_definition,
                 leg_data,
+                STM_units=STM_units,
             )
-            cls._write_parameters_to_json(SPK_name, stm_data, "_STMs.json")
+            cls._write_stm_sidecar(SPK_name, stm_data, stm_format)
 
-        # Settings JSON
+        # Settings sidecar
         if propagator_settings is not None:
             cls._write_parameters_to_json(
-                SPK_name, propagator_settings, "_settings.json"
+                SPK_name, propagator_settings, f"_settings{side_ext}"
             )
 
-        # Mass profile JSON
+        # Mass profile sidecar
         if mass_profile is not None:
             mass_profile_data = cls._prepare_mass_profile_data(body, mass_profile)
             cls._write_parameters_to_json(
-                SPK_name, mass_profile_data, "_mass_profile.json"
+                SPK_name, mass_profile_data, f"_mass_profile{side_ext}"
             )
+
+    @classmethod
+    def _has_parameter_payload(cls, parameters_JSON) -> bool:
+        """
+        Report whether a parameters payload carries any estimated parameter.
+
+        A state vector holding only position and velocity produces an empty
+        payload: ``None`` from the flat state-array path, or one ``None`` per
+        leg from a sequence. The per-leg list is truthy even when every entry
+        is empty, so an ``is not None`` check alone still writes a sidecar
+        whose ``parameters`` fields are all null — a file that later matches
+        in :meth:`get_parameters` and shadows the run that actually estimated
+        something. Callers use this to skip the write instead.
+
+        Parameters
+        ----------
+        parameters_JSON : ArrayWUnits, ArrayWFrame, list, tuple or None
+            Payload as assembled by ``Trajectory``: a single array for the
+            flat case, or one entry per leg for a sequence.
+
+        Returns
+        -------
+        bool
+            ``True`` when at least one parameter value is present.
+        """
+        if parameters_JSON is None:
+            return False
+
+        # Sequence payloads nest one entry per leg, and a leg entry may itself
+        # be wrapped in a list.
+        if isinstance(parameters_JSON, (list, tuple)):
+            return any(cls._has_parameter_payload(entry) for entry in parameters_JSON)
+
+        # Unwrap ArrayWFrame -> ArrayWUnits -> ndarray; anything else is used
+        # as-is so plain sequences of numbers still measure correctly.
+        values = getattr(parameters_JSON, "quantity", parameters_JSON)
+        values = getattr(values, "values", values)
+
+        return np.size(values) > 0
+
+    @staticmethod
+    def _parameter_entries(state_definition, body_ID=None) -> list:
+        """
+        The state components that are genuinely estimated parameters of a body.
+
+        Everything that is not a position or a velocity, optionally restricted
+        to one owner. The rule this replaces — "skip the first two entries" —
+        assumed the state opened with the primary body's position and velocity
+        and held no others, so a second *propagated* body had its pos/vel
+        listed as parameters of the first.
+
+        A sidecar describes one body, so ``body_ID`` narrows the list to the
+        parameters that body's sidecar holds: its own and, for the first
+        propagated body in the state, every parameter whose owner is not
+        propagated (a ground station's range bias, say). Such an owner has no
+        trajectory, hence no sidecar, of its own, and the first propagated body
+        is the trajectory a filter reads, so every parameter in the state lands
+        in exactly one sidecar. Without ``body_ID`` every parameter is returned.
+
+        Parameters
+        ----------
+        state_definition : list
+            State components as ``(name, dim, estimation, dynamics, owner,
+            value)`` tuples.
+        body_ID : int, optional
+            SPICE id of the body the sidecar is for.
+
+        Returns
+        -------
+        list
+            The subset that body's sidecar holds, in state order.
+        """
+        entries = []
+        propagated = []
+        for entry in state_definition or []:
+            # An entry with no readable name does not name a parameter. The
+            # rule this replaced never looked at the leading components at all,
+            # so it tolerated placeholders there; keep that tolerance.
+            try:
+                name = str(entry[0]).lower()
+            except (TypeError, IndexError):
+                continue
+            if name not in ("position", "velocity"):
+                entries.append(entry)
+                continue
+            sid = getattr(entry[4], "spice_id", None)
+            if sid not in propagated:
+                propagated.append(sid)
+
+        if body_ID is None:
+            return entries
+
+        hosts_unpropagated = bool(propagated) and propagated[0] == body_ID
+        return [
+            entry
+            for entry in entries
+            if (sid := getattr(entry[4], "spice_id", None)) == body_ID
+            or (hosts_unpropagated and sid not in propagated)
+        ]
 
     @classmethod
     def _prepare_parameters_data(
@@ -3020,6 +3886,7 @@ class SpiceManager:
         state_definition,
         sequence_definition,
         leg_data,
+        parameters_units=None,
     ):
         """
         Prepare parameters data for JSON export.
@@ -3064,26 +3931,76 @@ class SpiceManager:
 
             data.update(
                 {
-                    "parameters_def": np.array(
-                        [
-                            state_definition[i + 2][0]
-                            for i in range(len(state_definition) - 2)
-                        ]
-                    ).tolist(),
-                    "parameters_body": np.array(
-                        [
-                            state_definition[i + 2][4]._name
-                            for i in range(len(state_definition) - 2)
-                        ]
-                    ).tolist(),
+                    "parameters_def": [
+                        entry[0]
+                        for entry in cls._parameter_entries(state_definition, body_ID)
+                    ],
+                    "parameters_body": [
+                        entry[4]._name
+                        for entry in cls._parameter_entries(state_definition, body_ID)
+                    ],
                     "epochsTDB": epochs_TDB,
                     "parameters": parameters_JSON.values.tolist(),
-                    "unitsPower": parameters_JSON.units.dimensions.powers.tolist(),
-                    "unitsScale": parameters_JSON.units.scales.tolist(),
                 }
             )
+            data.update(cls._parameter_units_payload(parameters_JSON, parameters_units))
 
         return data
+
+    @classmethod
+    def _parameter_units_payload(cls, parameters_JSON, parameters_units) -> dict:
+        """
+        Build the units fields of a parameters sidecar.
+
+        Parameters of one body need not share units — a spacecraft solving for
+        a delta-v (km/s) and a maneuver-epoch correction (sec) is ordinary — so
+        the stacked ``parameters`` block cannot always be described by a single
+        unit. ``parametersUnits`` records one entry per parameter and is the
+        authoritative field.
+
+        The legacy scalar ``unitsPower`` / ``unitsScale`` are still emitted
+        whenever every parameter agrees, so any file that could be written
+        before this change is unchanged and older readers keep working. They
+        are omitted when the units differ, rather than silently mislabelling
+        the whole block with whichever unit happened to come first.
+
+        Parameters
+        ----------
+        parameters_JSON : ArrayWUnits
+            The stacked parameter values. Carries shared units when uniform.
+        parameters_units : list of tuple or None
+            ``(name, dim, units)`` per parameter, as produced by
+            ``Trajectory._extract_body_parameters_from_state``. When ``None``
+            the caller had no per-parameter breakdown and the stacked units are
+            used.
+
+        Returns
+        -------
+        dict
+            The units fields to merge into the sidecar payload.
+        """
+
+        def _u(units):
+            if units is None:
+                return {"unitsPower": [], "unitsScale": []}
+            return {
+                "unitsPower": units.dimensions.powers.tolist(),
+                "unitsScale": units.scales.tolist(),
+            }
+
+        if parameters_units:
+            payload = {
+                "parametersUnits": [
+                    {"name": name, "dim": int(dim), **_u(units)}
+                    for name, dim, units in parameters_units
+                ]
+            }
+            all_units = [u for _, _, u in parameters_units]
+            if all(SpiceManager._same_units(u, all_units[0]) for u in all_units):
+                payload.update(_u(all_units[0]))
+            return payload
+
+        return _u(getattr(parameters_JSON, "units", None))
 
     @staticmethod
     def _prepare_sequence_data(sequence_definition, leg_data, parameters_JSON):
@@ -3092,6 +4009,30 @@ class SpiceManager:
 
         Supports robust leg metadata format:
         leg_data = {"by_seq_idx": { seq_idx : {body_ID, origin_ID, reference_frame}, ... }}
+
+        Parameters
+        ----------
+        sequence_definition : MissionSequence
+            The sequence definition; its legs and finite burns are exported.
+        leg_data : dict
+            The body, origin, and reference frame of each leg, either keyed by
+            sequence index under ``"by_seq_idx"`` or as lists indexed by leg
+            under ``"body_ID"``, ``"origin_ID"`` and ``"reference_frame"``.
+        parameters_JSON : list or None
+            One entry per leg: ``None`` or empty for no parameters, the leg's
+            ``(name, ArrayWFrame)`` components (written as the
+            ``[name0, value0, name1, value1, ...]`` list
+            :meth:`get_parameters` reads), or a single ArrayWFrame or value.
+
+        Returns
+        -------
+        dict
+            Per-leg metadata and parameters, keyed ``"leg_<i>"``.
+
+        Raises
+        ------
+        KeyError
+            If ``leg_data["by_seq_idx"]`` has no entry for a leg.
         """
         # Split epochs per event
         split_epochs = [
@@ -3105,6 +4046,14 @@ class SpiceManager:
 
         legs = {}
         num_events = 0
+
+        def _is_named_pairs(leg_par):
+            return isinstance(leg_par, (list, tuple)) and all(
+                isinstance(p, (list, tuple))
+                and len(p) == 2
+                and isinstance(p[0], str)
+                for p in leg_par
+            )
 
         # Helper to get leg meta robustly
         def _get_leg_meta(seq_idx, leg_i):
@@ -3135,8 +4084,17 @@ class SpiceManager:
                 num_events += 1
                 continue
 
-            if typ != "Leg":
-                # If you have other event types, skip them consistently
+            if typ not in ("Leg", "Finite Burn"):
+                # Anything else is an event, not a propagated span, and has no
+                # state history to register. A finite burn *is* a propagated
+                # span: the rest of the library treats it as an active segment
+                # (MissionSequence, ScenarioSetup, and Trajectory's own leg
+                # collection all test ``in ("Leg", "Finite Burn")``), and the
+                # index arithmetic below already assumes it occupies a leg slot
+                # -- ``num_events`` only counts impulsive burns and nodes.
+                # Excluding it here dropped every burn span from the sidecar's
+                # leg registry, so a solution could not resolve state history
+                # across the burns.
                 continue
 
             leg_i = idx - num_events
@@ -3144,17 +4102,27 @@ class SpiceManager:
             body_ID, origin_ID, reference_frame = _get_leg_meta(idx, leg_i)
 
             # Parameters payload for this leg
-            if parameters_JSON is None:
+            leg_entry = None if parameters_JSON is None else parameters_JSON[leg_i]
+            if leg_entry is None or (
+                isinstance(leg_entry, (list, tuple)) and len(leg_entry) == 0
+            ):
                 params_payload = None
                 units_power = []
                 units_scale = []
                 params_frame = []
+            elif _is_named_pairs(leg_entry):
+                # The leg's (name, ArrayWFrame) components. All of them are
+                # written, as the [name0, value0, name1, value1, ...] list
+                # get_parameters reads, so every parameter (a maneuver epoch
+                # next to its delta-v, a station's range bias) reaches the
+                # sidecar; each value carries its own units and frame, so the
+                # leg-level unit fields stay empty.
+                params_payload = [item for pair in leg_entry for item in pair]
+                units_power = []
+                units_scale = []
+                params_frame = []
             else:
-                pj = (
-                    parameters_JSON[leg_i][0]
-                    if isinstance(parameters_JSON[leg_i], (list, tuple))
-                    else parameters_JSON[leg_i]
-                )
+                pj = leg_entry[0] if isinstance(leg_entry, (list, tuple)) else leg_entry
                 if isinstance(pj, ArrayWFrame):
                     params_payload = np.atleast_1d(pj.quantity.values).tolist()
                     units_power = pj.quantity.units.dimensions.powers.tolist()
@@ -3171,18 +4139,18 @@ class SpiceManager:
                 "origin_ID": origin_ID,
                 "reference_frame": reference_frame,
                 "name": name,
-                "parameters_def": np.array(
-                    [
-                        model.state_definition[i + 2][0]
-                        for i in range(len(model.state_definition) - 2)
-                    ]
-                ).tolist(),
-                "parameters_body": np.array(
-                    [
-                        model.state_definition[i + 2][4]._name
-                        for i in range(len(model.state_definition) - 2)
-                    ]
-                ).tolist(),
+                "parameters_def": [
+                    entry[0]
+                    for entry in SpiceManager._parameter_entries(
+                        model.state_definition
+                    )
+                ],
+                "parameters_body": [
+                    entry[4]._name
+                    for entry in SpiceManager._parameter_entries(
+                        model.state_definition
+                    )
+                ],
                 "epochsTDB": split_epochs[idx],
                 "parameters": params_payload,
                 "unitsPower": units_power,
@@ -3206,79 +4174,175 @@ class SpiceManager:
         state_definition,
         sequence_definition,
         leg_data,
+        STM_units=None,
     ):
         """
         Prepare STM data for JSON export.
 
-        For sequence_definition != None, we still export STMs on a global time grid
-        (same schema as non-sequence), because STMs are typically computed on the
-        propagated timeline, not per event index.
+        Without a sequence the STMs are keyed by epoch on the global grid
+        *epochs_TDB*, one matrix per epoch.
+
+        A sequence propagates each leg (or finite burn) with its own STM,
+        restarted at the leg's first epoch and sized to that leg's state, so
+        consecutive legs both hold an STM at their shared boundary epoch.  When
+        *STMs* is one block per leg, each block's rows lying on that leg's
+        grid in *sequence_definition*, the blocks are written per leg:
+        ``"STMs"`` maps each leg key to its own epoch-keyed matrices, and
+        that leg's entry in ``"legs"`` records the grid as ``STM_epochsTDB``.
+        A sequence whose *STMs* is one matrix per global epoch keeps the
+        global layout.
+
+        The payload records the STM ``reference_frame`` and ``units`` explicitly so
+        the matrices are self-describing on disk.
+
+        Parameters
+        ----------
+        STMs : list
+            STMs, one matrix per epoch of *epochs_TDB*, or, for a sequence,
+            one ``(N_k, n*n)`` or ``(N_k, n, n)`` block per leg on that leg's
+            grid.
+        epochs_TDB : list
+            The global epoch grid, in TDB seconds past J2000.
+        body_ID : int
+            The ID of the body.
+        origin_ID : int
+            The ID of the origin.
+        ref_frame : Frame
+            The reference frame.
+        parameters_JSON : list or None
+            The parameters per leg, for the sequence leg metadata (see
+            :meth:`_prepare_sequence_data`).
+        state_definition : list or None
+            The state definition.
+        sequence_definition : MissionSequence or None
+            The sequence definition, or ``None`` for a single arc.
+        leg_data : dict or None
+            The body, origin, and reference frame data for each leg.
+        STM_units : dict or None
+            Serialized units (``Units.to_dict()``) for the STM entries, or ``None``
+            when the STMs carry no unit information.
 
         Returns
         -------
         dict
             JSON-serializable STM payload.
-        """
-        import numpy as np
 
+        Raises
+        ------
+        STMLayoutError
+            If a sequence's *STMs* match neither its legs' grids nor
+            *epochs_TDB*.
+        """
         # Normalize epochs list
         epochs_list = list(epochs_TDB)
 
-        # Normalize STMs to plain lists
-        # Accept: list of ndarray, ndarray (N, n, n), or list-like
+        # Normalize STMs to one 2-D array per epoch.
+        # Accept: list of ndarray, ndarray (N, n, n), or list-like.
         stms_list = []
         if STMs is None:
             stms_list = []
         else:
-            if isinstance(STMs, np.ndarray):
+            if isinstance(STMs, _np.ndarray):
                 # could be (N,n,n) or (n,n) if single
                 if STMs.ndim == 3:
-                    stms_list = [STMs[k, :, :].tolist() for k in range(STMs.shape[0])]
+                    stms_list = list(STMs)  # N views, no copy
                 elif STMs.ndim == 2:
-                    stms_list = [STMs.tolist()]
+                    stms_list = [STMs]
                 else:
-                    stms_list = [np.atleast_2d(STMs).tolist()]
+                    stms_list = [_np.atleast_2d(STMs)]
             else:
-                # list / iterable
-                for M in STMs:
-                    if isinstance(M, np.ndarray):
-                        stms_list.append(M.tolist())
-                    else:
-                        # maybe already list
-                        stms_list.append(M)
+                # list / iterable, already per-epoch
+                stms_list = list(STMs)
 
         stm_data = {
             "body_ID": int(body_ID),
             "origin_ID": int(origin_ID),
             "reference_frame": ref_frame.name,
+            "units": STM_units,
             "epochsTDB": epochs_list,
             "STMs": {str(t): M for t, M in zip(epochs_list, stms_list)},
         }
 
-        # Add parameter definitions for context (same as non-sequence case)
+        # Add parameter definitions for context. The STM spans the whole
+        # state, so every parameter column is labelled — not only those of the
+        # body this sidecar is written for. The old "skip the first two
+        # entries" rule listed a second propagated body's position and
+        # velocity as parameters.
         if sequence_definition is None:
+            entries = cls._parameter_entries(state_definition)
             stm_data.update(
                 {
-                    "parameters_def": np.array(
-                        [
-                            state_definition[i + 2][0]
-                            for i in range(len(state_definition) - 2)
-                        ]
-                    ).tolist(),
-                    "parameters_body": np.array(
-                        [
-                            state_definition[i + 2][4]._name
-                            for i in range(len(state_definition) - 2)
-                        ]
-                    ).tolist(),
+                    "parameters_def": [entry[0] for entry in entries],
+                    "parameters_body": [entry[4]._name for entry in entries],
                 }
             )
         else:
             # For sequences, keep leg metadata (useful for readers) but do not
             # pretend it's "parameters_def" only.
-            stm_data["legs"] = cls._prepare_sequence_data(
+            legs = cls._prepare_sequence_data(
                 sequence_definition, leg_data, parameters_JSON
             )
+            stm_data["legs"] = legs
+
+            # Each leg's full grid, both ends included: the leg's STM block
+            # lies on it, unlike the leg's "epochsTDB", which drops the
+            # boundary epoch the next leg starts on.
+            leg_grids = [
+                _np.atleast_1d(epoch.times.values).astype(float)
+                for epoch, typ in zip(
+                    sequence_definition.epochs_vec, sequence_definition.types
+                )
+                if typ in ("Leg", "Finite Burn")
+            ]
+
+            def _is_leg_block(block, grid):
+                """Whether ``block`` holds one STM per epoch of ``grid``.
+
+                Parameters
+                ----------
+                block : array_like
+                    One leg's STMs, either ``(N, n, n)`` or flattened rows
+                    ``(N, n*n)``.
+                grid : np.ndarray
+                    That leg's STM epochs, shape (N,).
+
+                Returns
+                -------
+                bool
+                    True if ``block`` has one square STM per epoch in
+                    ``grid``; a lone ``(n, n)`` matrix is rejected.
+                """
+                block = _np.asarray(block)
+                if block.ndim == 3:
+                    return block.shape[0] == len(grid)
+                # (N, n*n) rows; a lone (n, n) matrix has n columns, not n*n
+                if block.ndim == 2:
+                    n = math.isqrt(block.shape[1])
+                    return block.shape[0] == len(grid) and n * n == block.shape[1]
+                return False
+
+            if (
+                stms_list
+                and len(stms_list) == len(legs) == len(leg_grids)
+                and all(map(_is_leg_block, stms_list, leg_grids))
+            ):
+                stm_data["STMs"] = {}
+                for leg_key, block, grid in zip(legs, stms_list, leg_grids):
+                    block = _np.asarray(block, dtype=float)
+                    n = math.isqrt(block[0].size)
+                    stm_data["STMs"][leg_key] = {
+                        str(t): M
+                        for t, M in zip(grid.tolist(), block.reshape(-1, n, n))
+                    }
+                    legs[leg_key]["STM_epochsTDB"] = grid.tolist()
+            elif stms_list and len(stms_list) != len(epochs_list):
+                raise cls.STMLayoutError(
+                    f"Got {len(stms_list)} STM entries for a sequence of "
+                    f"{len(legs)} leg(s) (grid lengths "
+                    f"{[len(g) for g in leg_grids]}) over {len(epochs_list)} "
+                    "global epochs. Pass one (N_k, n*n) or (N_k, n, n) block "
+                    "per leg on that leg's grid, or one matrix per global epoch."
+                )
 
         return stm_data
 
@@ -3304,15 +4368,55 @@ class SpiceManager:
             "body_ID": body.spice_id,
             "name": body.name,
             "mass_poly": {
-                "coeffs": mass_profile.coef.tolist(),
+                "coeffs": mass_profile.coefficients.tolist(),
                 "domain": list(mass_profile.domain),
                 "mass_units_power": body._mass_units.dimensions.powers,
                 "mass_units_scale": body._mass_units.scales,
             },
         }
 
+    @classmethod
+    def _write_stm_sidecar(cls, SPK_name, stm_data, stm_format="json"):
+        """
+        Write the STM sidecar in the requested format.
+
+        ``stm_format="json"`` (default) produces a human-readable ``_stms.json``;
+        ``"pickle"`` produces a compact binary ``_stms.pkl`` of the same payload
+        dict, which is lighter on disk for large STM time histories. The reader
+        :meth:`get_STMs` accepts either.
+
+        Parameters
+        ----------
+        SPK_name : str
+            Path to the ``.bsp`` file; the sidecar is written alongside it with
+            the same base name.
+        stm_data : dict
+            STM payload from :meth:`_prepare_stm_data`.
+        stm_format : {"json", "pickle"}, optional
+            On-disk format. Defaults to ``"json"``.
+
+        Raises
+        ------
+        ValueError
+            If ``stm_format`` is not ``"json"`` or ``"pickle"``.
+        """
+        fmt = (stm_format or "json").lower()
+        if fmt in ("pickle", "pkl"):
+            folder = os.path.dirname(SPK_name)
+            base = os.path.basename(SPK_name)
+            out_name = os.path.join(folder, base.replace(".bsp", "") + "_stms.pkl")
+            with open(out_name, "wb") as f:
+                pickle.dump(stm_data, f, protocol=pickle.HIGHEST_PROTOCOL)
+        elif fmt == "json":
+            # Written compact
+            cls._write_parameters_to_json(SPK_name, stm_data, "_stms.json", indent=None)
+        else:
+            raise ValueError(
+                f"Unknown stm_format '{stm_format}'. Use 'json' or 'pickle'."
+            )
+
     @staticmethod
-    def _write_parameters_to_json(SPK_name, data, suffix):
+    def _write_parameters_to_json(SPK_name, data, suffix, indent=4):
         def _default(o):
             """
             Fallback serializer for non-JSON-able objects.
@@ -3401,8 +4505,15 @@ class SpiceManager:
         base = os.path.basename(SPK_name)
         out_name = os.path.join(folder, base.replace(".bsp", "") + suffix)
 
-        with open(out_name, "w") as json_file:
-            json.dump(data, json_file, indent=4, default=_default)
+        if suffix.endswith(".pkl"):
+            # Store the *same* plain-dict content as the JSON path (normalised via
+            # ``_default``) as a binary pickle, so the readers parse it identically.
+            plain = json.loads(json.dumps(data, default=_default))
+            with open(out_name, "wb") as pkl_file:
+                pickle.dump(plain, pkl_file, protocol=pickle.HIGHEST_PROTOCOL)
+        else:
+            with open(out_name, "w") as json_file:
+                json.dump(data, json_file, indent=indent, default=_default)
 
     @staticmethod
     def name_to_ID(name):
@@ -3483,11 +4594,9 @@ class SpiceManager:
         if not ck_path.endswith(".bc") and not ck_path.endswith(".ck"):
             ck_path += ".bc"
 
-        # Unload if loaded (safe-guard)
-        try:
-            spice.unload(ck_path)
-        except Exception:
-            pass
+        # Unload if loaded (safe-guard); spice.unload is a no-op for a file
+        # that isn't loaded, so no try/except is needed here
+        spice.unload(ck_path)
 
         # Ensure directory exists
         folder = os.path.dirname(os.path.abspath(ck_path))
@@ -3527,58 +4636,60 @@ class SpiceManager:
             raise ValueError(f"avvs must be shape (nrec,3) or (3,nrec). Got {a.shape}.")
         return a
 
-    @staticmethod
-    def _finite_difference_body_rates(
-        et_list: np.ndarray, c_ref_to_inst_list: np.ndarray
-    ) -> np.ndarray:
-        """
-        Estimate body angular velocity (in REF frame) from a sequence of DCMs C_ref_to_inst.
-
-        Returns
-        -------
-        avvs : (N,3) angular velocity vectors expressed in REF frame
-
-        Notes
-        -----
-        - CKW03 expects AVVs expressed in the base frame REF. :contentReference[oaicite:1]{index=1}
-        - This is a pragmatic FD estimate; if your mode can provide analytical rates,
-          pass them in instead.
-        """
-        et = np.asarray(et_list, dtype=float)
-        C = np.asarray(c_ref_to_inst_list, dtype=float)  # (N,3,3)
-        N = C.shape[0]
-        if N < 2:
-            return np.zeros((N, 3))
-
-        # Convert to C_inst_to_ref for convenience: C_ir = C_ri^T
-        C_ir = np.transpose(C, (0, 2, 1))
-
-        w_ref = np.zeros((N, 3))
-        for k in range(1, N - 1):
-            dt = et[k + 1] - et[k - 1]
-            if dt <= 0:
-                continue
-
-            # Central difference on C_ir
-            dC = (C_ir[k + 1] - C_ir[k - 1]) / dt
-
-            # Kinematics: dC_ir = -[w]_x * C_ir  =>  [w]_x = -(dC_ir) * C_ir^T
-            # with C_ir^T = C_ri
-            W = -(dC @ C_ir[k].T)
-
-            # Extract vector from skew-symmetric matrix:
-            # [  0  -wz  wy]
-            # [ wz   0  -wx]
-            # [-wy  wx   0 ]
-            wx = 0.5 * (W[2, 1] - W[1, 2])
-            wy = 0.5 * (W[0, 2] - W[2, 0])
-            wz = 0.5 * (W[1, 0] - W[0, 1])
-            w_ref[k, :] = np.array([wx, wy, wz])
-
-        # Endpoints: one-sided
-        w_ref[0, :] = w_ref[1, :]
-        w_ref[-1, :] = w_ref[-2, :]
-        return w_ref
+    # Unused: only ever referenced from a commented-out branch in
+    # write_ck_type3 (Option B below). Kept for reference.
+    # @staticmethod
+    # def _finite_difference_body_rates(
+    #     et_list: np.ndarray, c_ref_to_inst_list: np.ndarray
+    # ) -> np.ndarray:
+    #     """
+    #     Estimate body angular velocity (in REF frame) from a sequence of DCMs C_ref_to_inst.
+    #
+    #     Returns
+    #     -------
+    #     avvs : (N,3) angular velocity vectors expressed in REF frame
+    #
+    #     Notes
+    #     -----
+    #     - CKW03 expects AVVs expressed in the base frame REF. :contentReference[oaicite:1]{index=1}
+    #     - This is a pragmatic FD estimate; if your mode can provide analytical rates,
+    #       pass them in instead.
+    #     """
+    #     et = np.asarray(et_list, dtype=float)
+    #     C = np.asarray(c_ref_to_inst_list, dtype=float)  # (N,3,3)
+    #     N = C.shape[0]
+    #     if N < 2:
+    #         return np.zeros((N, 3))
+    #
+    #     # Convert to C_inst_to_ref for convenience: C_ir = C_ri^T
+    #     C_ir = np.transpose(C, (0, 2, 1))
+    #
+    #     w_ref = np.zeros((N, 3))
+    #     for k in range(1, N - 1):
+    #         dt = et[k + 1] - et[k - 1]
+    #         if dt <= 0:
+    #             continue
+    #
+    #         # Central difference on C_ir
+    #         dC = (C_ir[k + 1] - C_ir[k - 1]) / dt
+    #
+    #         # Kinematics: dC_ir = -[w]_x * C_ir  =>  [w]_x = -(dC_ir) * C_ir^T
+    #         # with C_ir^T = C_ri
+    #         W = -(dC @ C_ir[k].T)
+    #
+    #         # Extract vector from skew-symmetric matrix:
+    #         # [  0  -wz  wy]
+    #         # [ wz   0  -wx]
+    #         # [-wy  wx   0 ]
+    #         wx = 0.5 * (W[2, 1] - W[1, 2])
+    #         wy = 0.5 * (W[0, 2] - W[2, 0])
+    #         wz = 0.5 * (W[1, 0] - W[0, 1])
+    #         w_ref[k, :] = np.array([wx, wy, wz])
+    #
+    #     # Endpoints: one-sided
+    #     w_ref[0, :] = w_ref[1, :]
+    #     w_ref[-1, :] = w_ref[-2, :]
+    #     return w_ref
 
     @classmethod
     def write_ck_type3(

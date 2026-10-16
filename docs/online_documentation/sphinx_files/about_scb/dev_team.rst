@@ -1,5 +1,6 @@
 .. SPDX-FileCopyrightText: 2026 Orbital Research Cluster for Celestial Applications (ORCCA) Lab, University of Colorado at Boulder
 .. SPDX-License-Identifier: ISC
+
 .. meta::
     :description lang=en:
         Scarabaeus development team.
@@ -15,9 +16,9 @@
 
 .. role:: gold
 
-=========================
+===================================
 :gold:`Scarabaeus Development Team`
-=========================
+===================================
 The SCB development team is made up of undergraduate, PhD, and postdoctoral students, as well as professors and engineers from many different
 institutions and nationalities. The project is led by the `ORCCA laboratory <https://www.colorado.edu/faculty/mcmahon/orcca>`_ at the
 University of Colorado Boulder.
@@ -28,15 +29,16 @@ Current Members
 - Prof. Jay W. McMahon (ORCCA, CU Boulder)
 - Mr. Giovanni Fereoli (ORCCA, CU Boulder)
 - Mr. Zachary Ellis (ORCCA, CU Boulder)
+- Ms. Andrea López López (ORCCA, CU Boulder)
 - Mr. Mohamed Almashjari (UAESA)
 - Mr. Mohamed Kuleib (TII)
 - Ms. Wendy Frank (LASP)
 - Dr. Jeremy Knittel (LASP)
-- Mr. Trevor Wolff (ORCCA, CU Boulder)
 - Ms. Bushra Aldhanhani (TII)
 
 Past Members
 ============
+- Mr. Trevor Wolff (ORCCA, CU Boulder)
 - Ms. Annalise Cabra (B.A. Physics, CU Boulder)
 - Dr. Anivid Faura-Pedros (ORCCA, CU Boulder)
 - Mr. Kian Shakerin (ORCCA, CU Boulder)

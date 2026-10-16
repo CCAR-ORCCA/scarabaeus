@@ -1,5 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Orbital Research Cluster for Celestial Applications (ORCCA) Lab, University of Colorado at Boulder
 # SPDX-License-Identifier: ISC
+import math
 import numpy as np
 from typing import Optional
 from scarabaeus import CovarianceMatrix, ProcessNoise
@@ -8,7 +9,7 @@ from scarabaeus import CovarianceMatrix, ProcessNoise
 # --------------------#
 #  Class Definition  #
 # --------------------#
-class DynamicModelCompensation(ProcessNoise):
+class DynamicalModelCompensation(ProcessNoise):
     """ Dynamic Model Compensation (DMC) process noise model.
 
     An alternative to SNC that models process noise through direct augmentation
@@ -29,17 +30,20 @@ class DynamicModelCompensation(ProcessNoise):
 
     .. math::
 
-        \\dot{\\mathbf{w}} = -\\mathbf{B}\\,\\mathbf{w} + \\mathbf{v}(t)
+        \\dot{\\mathbf{w}} = -\\mathbf{B}\\,\\mathbf{w} + \\mathbf{u}(t)
 
     where :math:`\\mathbf{B} = \\mathrm{diag}(\\beta_x, \\beta_y, \\beta_z)` contains
-    the inverse correlation times (decay rates), and :math:`\\mathbf{v}(t)` is zero-mean
-    white noise with continuous-time PSD :math:`\\mathbf{Q}` (3×3).
+    the inverse correlation times (decay rates), and :math:`\\mathbf{u}(t)` is a
+    zero-mean input held constant over each step, with covariance
+    :math:`\\mathbf{Q}` (3, 3), in km²/s⁶.
 
-    **Exact discretization (gamma matrix)**
+    **Discretization (gamma matrix)**
 
-    The mapping from the white-noise input :math:`\\mathbf{v}(t)` to the state
-    perturbation over a step :math:`\\Delta t` is given by the exact analytic
-    gamma matrix :math:`\\mathbf{\\Gamma}_k` (9×3):
+    The response of the state to a constant input :math:`\\mathbf{u}` over a
+    step :math:`\\Delta t` is
+    :math:`\\mathbf{\\Gamma}_k = \\int_{t_k}^{t_{k+1}}
+    \\mathbf{\\Phi}(t_{k+1}, \\tau)\\,\\mathbf{B}_u\\,d\\tau` (9, 3),
+    with :math:`\\mathbf{B}_u = [\\mathbf{0}\\;\\mathbf{0}\\;\\mathbf{I}_3]^T`:
 
     .. math::
 
@@ -62,6 +66,22 @@ class DynamicModelCompensation(ProcessNoise):
     .. math::
 
         \\mathbf{Q}_k = \\mathbf{\\Gamma}_k\\,\\mathbf{Q}\\,\\mathbf{\\Gamma}_k^T
+
+    This treats :math:`\\mathbf{u}` as piecewise constant, as SNC does with the
+    acceleration. Integrating white noise over the step instead gives a full
+    rank :math:`\\mathbf{Q}_k` that grows more slowly with :math:`\\Delta t`;
+    the form above has rank three, which the SRIF needs to factor it through
+    :math:`\\mathbf{\\Gamma}_k`.
+
+    **Decay rates**
+
+    The filters discretize the noise with the decay rates the dynamics
+    propagate the state with: the ``beta_fogm`` state of ``body`` when there
+    is one, else the ``fogm_beta`` of the
+    :class:`~scarabaeus.ForceModelTranslation` of that body. They are
+    evaluated on each interval and again on every iteration, so an
+    estimated decay rate is followed. ``beta`` is used only when no
+    reference decay rates are given.
 
     **Covariance propagation**
 
@@ -90,20 +110,34 @@ class DynamicModelCompensation(ProcessNoise):
     Parameters
     ----------
     continuous_time_covariance : CovarianceMatrix
-        The continuous-time process noise covariance matrix.
+        Covariance :math:`\\mathbf{Q}` of the input driving the stochastic
+        acceleration, held constant over each interval, in km²/s⁶.
     state_definition : optional
         State vector definition. Defaults to None.
     sequence_definition : optional
         Sequence definition for multi-leg trajectories. Defaults to None.
-    beta : np.ndarray
-        Time-constant vector (inverse correlation times) for the Gauss-Markov process.
-        Can be a scalar (isotropic) or a 3-element vector for x, y, z components.
+    beta : np.ndarray, optional
+        Decay rates (inverse correlation times, 1/s) of the Gauss-Markov
+        process, a scalar (isotropic) or a 3-element vector for x, y, z
+        components. Used only when
+        :meth:`_compute_discrete_time_covariances` is given no reference
+        decay rates, which the filters always give. Defaults to ``None``.
+    max_interval : ArrayWUnits or float, optional
+        Longest interval the noise is accumulated over, in seconds when a
+        float; a longer one, such as a data gap, receives the noise of one
+        this long (see :meth:`~scarabaeus.ProcessNoise._noise_intervals`).
+        Defaults to ``None``, no limit.
+    body : Body or int, optional
+        Body whose position, velocity and ``a_fogm`` the noise drives, or its
+        SPICE ID. Defaults to ``None``, the owner of the first position in
+        the state.
 
-    Notes
-    -----
-    As :math:`\\beta \\to \\infty` (very short correlation time) DMC approaches SNC;
-    as :math:`\\beta \\to 0` (long correlation time) the stochastic acceleration
-    becomes nearly constant and is effectively estimated as a deterministic parameter.
+    Raises
+    ------
+    DynamicalModelCompensation.BetaSizeError
+        If ``beta`` is neither a scalar nor a 3-element vector.
+    DynamicalModelCompensation.NonPositiveBetaError
+        If a component of ``beta`` is not strictly positive.
 
     See Also
     --------
@@ -111,10 +145,37 @@ class DynamicModelCompensation(ProcessNoise):
     scarabaeus.ProcessNoise : Abstract base class.
     scarabaeus.ProcessNoiseSettings : Configuration object consumed by the filter.
 
+    Notes
+    -----
+    As :math:`\\beta \\to \\infty` (very short correlation time) DMC approaches SNC;
+    as :math:`\\beta \\to 0` (long correlation time) the stochastic acceleration
+    becomes nearly constant and is effectively estimated as a deterministic parameter.
+
     References
     ----------
-    Tapley, B. D., Schutz, B. E., & Born, G. H. (2004). Statistical Orbit Determination. Elsevier Academic Press. ISBN 978-0-12-683630-1.
+    .. [1] Tapley, B. D., Schutz, B. E., & Born, G. H. (2004). *Statistical Orbit
+       Determination*. Elsevier Academic Press. ISBN 978-0-12-683630-1.
     """
+
+    # ------------------#
+    # region   Errors  #
+    # ------------------#
+    class MissingBetaError(ValueError):
+        """Raised when the noise is discretized with neither reference decay
+        rates nor a ``beta`` given to the constructor."""
+
+    class BetaSizeError(ValueError):
+        """Raised when ``beta`` is neither a scalar nor a 3-element vector."""
+
+    class NonPositiveBetaError(ValueError):
+        """Raised when a component of ``beta`` is not strictly positive."""
+
+    # endregion Errors #
+    # ------------------#
+
+    # The Gauss-Markov acceleration is driven along with the position and
+    # velocity
+    _noise_states = ("position", "velocity", "a_fogm")
 
     # --------------------#
     # region Constructor #
@@ -125,183 +186,162 @@ class DynamicModelCompensation(ProcessNoise):
         state_definition=None,
         sequence_definition=None,
         beta: Optional[np.ndarray] = None,
+        max_interval=None,
+        body=None,
     ):
         super().__init__(
-            continuous_time_covariance, state_definition, sequence_definition
+            continuous_time_covariance,
+            state_definition,
+            sequence_definition,
+            max_interval,
+            body,
         )
 
-        # Validate beta matrix if provided
-        if beta is None:
-            raise ValueError(
-                "DMC requires a beta vector (inverse correlation times). "
-                "Provide a 3-element vector [beta_x, beta_y, beta_z]."
-            )
-        beta = np.asarray(beta, dtype=float).reshape(-1)
-        if beta.size == 1:
-            # isotropic case
-            beta = np.repeat(beta, 3)
-        elif beta.size != 3:
-            raise ValueError("Beta must be either a scalar or a 3-element vector.")
-        self.beta = beta
-        self.beta_matrix = np.diag(beta)
-        if np.any(self.beta <= 0):
-            raise ValueError("All beta components must be strictly positive.")
+        # Validate beta if provided; the filters take it from the dynamics
+        self.beta = None
+        if beta is not None:
+            beta = np.asarray(beta, dtype=float).reshape(-1)
+            if beta.size == 1:
+                # isotropic case
+                beta = np.repeat(beta, 3)
+            elif beta.size != 3:
+                raise self.BetaSizeError(
+                    "Beta must be either a scalar or a 3-element vector."
+                )
+            if not np.all(beta > 0):
+                raise self.NonPositiveBetaError(
+                    "All beta components must be strictly positive."
+                )
+            self.beta = beta
 
     # ----------------#
     # region Methods #
     # ----------------#
-    def _check_state_definition(self, state_definition) -> None:
-        """
-        Validate state definition for DMC compatibility.
-
-        Required structure:
-        1. The first three components of the state definition must be, in order:
-        - position
-        - velocity
-        - a_fogm
-        all belonging to the same body.
-        2. No other body may contain an 'a_fogm' component.
-
-        Parameters
-        ----------
-        state_definition : list
-            State definition to validate. Each entry is expected to be a tuple like:
-            (name, size, estimation, dynamics, owner, value)
-
-        Raises
-        ------
-        ValueError
-            If the required DMC structure is not satisfied.
-        """
-        if state_definition is None or len(state_definition) < 3:
-            raise ValueError(
-                "DMC requires at least the first three state components to be "
-                "('position', 'velocity', 'a_fogm') for the same body."
-            )
-
-        # First three components must be position, velocity, a_fogm
-        first = state_definition[0]
-        second = state_definition[1]
-        third = state_definition[2]
-
-        try:
-            name1, _, _, _, owner1, _ = first
-            name2, _, _, _, owner2, _ = second
-            name3, _, _, _, owner3, _ = third
-        except Exception as e:
-            raise ValueError(
-                f"Invalid state definition entry format in first three components: {e}"
-            )
-
-        # Check ordering
-        if name1 != "position" or name2 != "velocity" or name3 != "a_fogm":
-            raise ValueError(
-                "DMC requires the first three state components to be exactly "
-                "('position', 'velocity', 'a_fogm') in that order."
-            )
-
-        # Check same owner/body
-        if not (owner1 is owner2 and owner2 is owner3):
-            raise ValueError(
-                "DMC requires 'position', 'velocity', and 'a_fogm' to belong to the same body."
-            )
-
-        dmc_owner = owner1
-
-        # Check that no other body has a_fogm
-        for tup in state_definition[3:]:
-            try:
-                name, _, _, _, owner, _ = tup
-            except Exception as e:
-                raise ValueError(f"Invalid state definition entry format: {e}")
-
-            if name == "a_fogm" and owner is not dmc_owner:
-                raise ValueError(
-                    "DMC currently supports only one body with 'a_fogm'. "
-                    f"Found additional 'a_fogm' for body {owner}."
-                )
-
-    def _compute_discrete_time_covariances(self, measurement_times: list) -> None:
+    def _compute_discrete_time_covariances(
+        self,
+        epochs: list,
+        reference_state=None,
+        reference_beta=None,
+        reference_frame=None,
+    ) -> None:
         """
         Compute discrete-time process noise covariances using DMC model.
 
         For DMC, the process noise applies to augmented stochastic parameters
         following a first-order Gauss-Markov process with time-constant matrix B.
+        Each interval is cut to ``max_interval``, as in
+        :meth:`~scarabaeus.ProcessNoise._noise_intervals`; the
+        :math:`\\mathbf{w}` block levels off by itself, at
+        :math:`Q_{ii}/\\beta_i^2`, but the position and velocity blocks do not.
+        Covariances and gamma matrices are stored for the
+        ``[position, velocity, a_fogm]`` block of :attr:`body` only;
+        :meth:`gamma_at` and :meth:`covariance_at` place them in the state
+        they are added to.
+
+        When the Gauss-Markov acceleration is expressed in a frame other than
+        the propagation one (RTN or body-fixed), its components are
+        :math:`\\mathbf w = \\mathbf T^T \\mathbf w_{\\mathrm{in}}` and it
+        drives the translational state through :math:`\\mathbf T \\mathbf w`.
+        The input :math:`\\mathbf u` keeps its (inertial) covariance and
+        the gamma matrix is rotated instead,
+
+        .. math::
+
+            \\mathbf\\Gamma' =
+            \\begin{bmatrix}
+            \\mathbf T\\,\\mathbf\\Gamma_r\\,\\mathbf T^T \\\\
+            \\mathbf T\\,\\mathbf\\Gamma_v\\,\\mathbf T^T \\\\
+            \\mathbf\\Gamma_w\\,\\mathbf T^T
+            \\end{bmatrix},
+
+        with :math:`\\mathbf T` held at its value at the interval's
+        :meth:`~scarabaeus.ProcessNoise._noise_epochs` entry.
 
         Parameters
         ----------
-        measurement_times : list
-            List of time epochs at which the process noise is evaluated.
+        epochs : list
+            Filtering timeline (measurement and sequence event epochs) the
+            filters index the process noise by.
+        reference_state : callable, optional
+            Reference ``(positions, velocities)`` at an array of epochs, which
+            an RTN covariance is rotated along (see
+            :meth:`~scarabaeus.ProcessNoise._continuous_time_covariances`).
+            Defaults to ``None``.
+        reference_beta : callable, optional
+            Decay rates the dynamics use at an array of epochs, of shape
+            ``(len(epochs), 3)``, evaluated at
+            :meth:`~scarabaeus.ProcessNoise._noise_epochs`; not finite on a
+            leg that does not carry :attr:`body`, where the noise is zero.
+            Defaults to ``None``, which uses ``beta``.
+        reference_frame : callable, optional
+            Rotation :math:`\\mathbf T` from the frame the Gauss-Markov
+            acceleration is expressed in to the propagation frame, at an array
+            of epochs, of shape ``(len(epochs), 3, 3)``, evaluated at
+            :meth:`~scarabaeus.ProcessNoise._noise_epochs`. Defaults to
+            ``None``, the identity: an inertial Gauss-Markov acceleration.
 
         Returns
         -------
         None
+
+        Raises
+        ------
+        DynamicalModelCompensation.MissingBetaError
+            If neither ``reference_beta`` nor ``beta`` is given.
         """
-        Q_tilde = []
+        epochs = np.asarray(epochs, dtype=float)
+        if reference_beta is not None:
+            betas = reference_beta(self._noise_epochs(epochs))
+        elif self.beta is not None:
+            betas = self.beta
+        else:
+            raise self.MissingBetaError(
+                "DMC needs the decay rates of the Gauss-Markov process: give "
+                "beta, or let the filter take them from the dynamics."
+            )
+        betas = np.broadcast_to(np.asarray(betas, dtype=float), (len(epochs), 3))
+        rotations = (
+            np.asarray(reference_frame(self._noise_epochs(epochs)), dtype=float)
+            if reference_frame is not None
+            else None
+        )
+
+        # Continuous-time covariance over each interval, inertial
+        Q_tilde = self._continuous_time_covariances(epochs, reference_state)
+        # Interval lengths, cut to max_interval
+        intervals = self._noise_intervals(epochs)
         discrete_time_process_covariances = []
         gamma_matrices = []
-        n = self._get_state_size()
 
-        sequence_epochs = None
-        if self.sequence_definition is not None:
-            sequence_epochs = [
-                epochs.times for epochs in self.sequence_definition.epochs_vec
-            ]
-
-        for k in range(len(measurement_times)):
-            Q_continuous = self.continuous_time_covariance.matrix_without_units()
-            Q_tilde.append(Q_continuous)
-
-            # Transform from RTN if needed
-            Q_tilde[k] = self.transform_from_rtn(Q_tilde[k])
-
-            if k == 0:
-                discrete_time_process_covariances.append(np.zeros((n, n)))
-
-                if self.state_definition is not None:
-                    gamma_size = n
-                elif (
-                    self.sequence_definition is not None and sequence_epochs is not None
-                ):
-                    idx_leg = self._find_leg_index(
-                        measurement_times[k], sequence_epochs
-                    )
-                    gamma_size = (
-                        self.sequence_definition.states_n[idx_leg]
-                        or self.sequence_definition.states_n[idx_leg + 1]
-                    )
-                else:
-                    gamma_size = 9
-
-                gamma_matrices.append(np.zeros((gamma_size, 3)))
+        for k in range(len(epochs)):
+            # Local DMC gamma for [r, v, a_fogm]; zero at the first epoch,
+            # which has no interval to accumulate noise over, and over an
+            # interval on a leg without the body, which has no decay rates
+            if np.all(np.isfinite(betas[k])):
+                gamma_local = self._construct_gamma_matrix_dmc(intervals[k], betas[k])
+                if rotations is not None:
+                    gamma_local = self._rotate_gamma(gamma_local, rotations[k])
             else:
-                dt = measurement_times[k] - measurement_times[k - 1]
+                gamma_local = np.zeros((9, 3))
+            gamma_matrices.append(gamma_local)
 
-                # Local DMC gamma for [r, v, a_fogm]
-                gamma_local = self._construct_gamma_matrix_dmc(dt)  # 9x3
-
-                # Pad rows like SNC
-                gamma_padded = self._pad_gamma_matrix_dmc(
-                    gamma_local, n, measurement_times[k], sequence_epochs
-                )
-                gamma_matrices.append(gamma_padded)
-
-                # Full-state discrete covariance
-                Qk_discrete = gamma_padded @ Q_tilde[k] @ gamma_padded.T
-                discrete_time_process_covariances.append(Qk_discrete)
+            discrete_time_process_covariances.append(
+                gamma_local @ Q_tilde[k] @ gamma_local.T
+            )
 
         self.Q_tilde = Q_tilde
         self.discrete_time_process_covariances = discrete_time_process_covariances
         self.gamma_matrices = gamma_matrices
+        self.epochs = epochs
 
-    def _construct_gamma_matrix_dmc(self, dt: float, n: int = 9) -> np.ndarray:
+    def _construct_gamma_matrix_dmc(self, dt: float, beta: np.ndarray) -> np.ndarray:
         """
-        Construct the exact 9x3 DMC gamma matrix for a given time step.
+        Construct the 9x3 DMC gamma matrix for a given time step.
 
-        The gamma matrix relates continuous white-noise input ``v(t)`` to the
-        position, velocity, and stochastic-acceleration states via the
-        first-order Gauss-Markov dynamics ``ẇ = -B w + v``.  Each diagonal
-        block is computed analytically:
+        The gamma matrix relates the input ``u``, held constant over the
+        step, to the position, velocity, and stochastic-acceleration states
+        via the first-order Gauss-Markov dynamics :math:`\\dot{w} = -B w + u`.
+        Each diagonal block is computed analytically:
 
         .. math::
 
@@ -316,12 +356,20 @@ class DynamicModelCompensation(ProcessNoise):
         matrix.  The discrete process noise covariance is then
         :math:`Q_k = \\Gamma Q \\Gamma^T`.
 
+        The terms cancel to :math:`\\Delta t^3/6`, :math:`\\Delta t^2/2` and
+        :math:`\\Delta t` as :math:`\\beta\\Delta t \\to 0`, which loses
+        every digit for long correlation times or short steps. The blocks are
+        therefore evaluated as :math:`\\Gamma_r = \\Delta t^3\\varphi_3`,
+        :math:`\\Gamma_v = \\Delta t^2\\varphi_2` and
+        :math:`\\Gamma_w = \\Delta t\\,\\varphi_1` at
+        :math:`-\\beta\\Delta t` (see :meth:`_phi_functions`).
+
         Parameters
         ----------
         dt : float
-            Time step in seconds between consecutive measurement epochs.
-        n : int, optional
-            Unused; retained for API consistency. Defaults to 9.
+            Interval the noise acts over, in seconds.
+        beta : np.ndarray
+            Decay rate of each axis over the interval, in 1/s.
 
         Returns
         -------
@@ -329,9 +377,6 @@ class DynamicModelCompensation(ProcessNoise):
             Gamma matrix of shape ``(9, 3)``, with row blocks
             ``[Gamma_r; Gamma_v; Gamma_w]``.
         """
-        B = self.beta_matrix
-        beta = np.diag(B)
-
         # Initialize gamma matrix (9 x 3)
         Gamma_r = np.zeros((3, 3))
         Gamma_v = np.zeros((3, 3))
@@ -339,125 +384,84 @@ class DynamicModelCompensation(ProcessNoise):
 
         # For each diagonal component (x, y, z)
         for i in range(3):
-            b = beta[i]
-            exp_b_dt = np.exp(-b * dt)
-            I_minus_exp = 1 - exp_b_dt
+            phi_1, phi_2, phi_3 = self._phi_functions(-beta[i] * dt)
 
             # Position block:
-            Gamma_r[i, i] = (
-                (dt**2 / 2) * (1 / b) - dt * (1 / b**2) + (1 / b**3) * I_minus_exp
-            )
+            Gamma_r[i, i] = dt**3 * phi_3
 
             # Velocity block:
-            Gamma_v[i, i] = dt * (1 / b) - (1 / b**2) * I_minus_exp
+            Gamma_v[i, i] = dt**2 * phi_2
 
             # Stochastic parameter block:
-            Gamma_w[i, i] = (1 / b) * I_minus_exp
+            Gamma_w[i, i] = dt * phi_1
 
         # Stack the three blocks vertically
         gamma = np.vstack((Gamma_r, Gamma_v, Gamma_w))
 
         return gamma
 
-    def _pad_gamma_matrix_dmc(
-        self,
-        gamma_local: np.ndarray,
-        n: int,
-        current_time: float,
-        sequence_epochs: Optional[list] = None,
-    ) -> np.ndarray:
+    @staticmethod
+    def _rotate_gamma(gamma: np.ndarray, T: np.ndarray) -> np.ndarray:
         """
-        Extend the 9x3 DMC gamma matrix to the active state size at ``current_time``.
-
-        The local 9-row block corresponds to the leading
-        ``[position, velocity, a_fogm]`` sub-state.  When additional static
-        parameters are estimated, zero rows are appended so the matrix matches
-        the full state dimension used by the filter.
-
-        The boundary rule for sequence trajectories is identical to
-        :meth:`StateNoiseCompensation._pad_gamma_matrix`: the first epoch after
-        a leg-transition node uses the previous leg's state size.
+        Gamma matrix of a Gauss-Markov acceleration expressed in a rotated
+        frame, driven by an input in the propagation frame.
 
         Parameters
         ----------
-        gamma_local : np.ndarray
-            DMC gamma matrix of shape ``(9, 3)`` from
-            :meth:`_construct_gamma_matrix_dmc`.
-        n : int
-            Full state size when ``state_definition`` is set (non-sequence mode).
-        current_time : float
-            Current measurement epoch (TDB seconds).
-        sequence_epochs : list, optional
-            List of epoch arrays per leg from the sequence definition.
+        gamma : np.ndarray
+            Gamma matrix of shape ``(9, 3)`` from
+            :meth:`_construct_gamma_matrix_dmc`, row blocks
+            ``[Gamma_r; Gamma_v; Gamma_w]``.
+        T : np.ndarray
+            Rotation from the Gauss-Markov frame to the propagation frame,
+            shape ``(3, 3)``.
 
         Returns
         -------
         np.ndarray
-            Zero-padded gamma matrix of shape ``(n_active, 3)``.
+            ``[T Gamma_r T^T; T Gamma_v T^T; Gamma_w T^T]``, shape ``(9, 3)``.
         """
+        return np.vstack(
+            (T @ gamma[:3] @ T.T, T @ gamma[3:6] @ T.T, gamma[6:] @ T.T)
+        )
 
-        # -------------------------
-        # Fixed-state case
-        # -------------------------
-        if self.state_definition is not None:
-            padding = ((0, n - 9), (0, 0))
-            return np.pad(gamma_local, padding, mode="constant", constant_values=0)
+    @staticmethod
+    def _phi_functions(z: float) -> tuple:
+        """
+        Exponential integrator functions :math:`\\varphi_1, \\varphi_2, \\varphi_3`.
 
-        if self.sequence_definition is None or sequence_epochs is None:
-            return gamma_local
+        .. math::
 
-        # -------------------------
-        # Helpers: robust epoch extraction
-        # -------------------------
-        def _to_float_array(ep):
-            v = getattr(ep, "values", None)
-            if v is not None:
-                return np.asarray(v, dtype=float).ravel()
-            t = getattr(ep, "times", None)
-            if t is not None:
-                vv = getattr(t, "values", None)
-                if vv is not None:
-                    return np.asarray(vv, dtype=float).ravel()
-            return np.asarray(ep, dtype=float).ravel()
+            \\varphi_k(z) = \\sum_{j \\ge 0} \\frac{z^j}{(j + k)!},
+            \\qquad
+            \\varphi_{k+1}(z) = \\frac{\\varphi_k(z) - 1/k!}{z}
 
-        ct = float(current_time)
+        The recurrence divides a cancellation by :math:`z`, so for
+        :math:`|z| < 1` the series of :math:`\\varphi_3` is summed instead and
+        the recurrence run upwards, which adds terms of the same size.
 
-        # Leg start / second timestamps from the propagation grid
-        leg_start = []
-        leg_second = []
-        for ep in sequence_epochs:
-            arr = _to_float_array(ep)
-            if arr.size == 0:
-                leg_start.append(None)
-                leg_second.append(None)
-            else:
-                leg_start.append(float(arr[0]))
-                leg_second.append(float(arr[1]) if arr.size > 1 else None)
+        Parameters
+        ----------
+        z : float
+            Argument, :math:`-\\beta\\Delta t` for the DMC gamma matrix.
 
-        # Nominal leg index
-        idx_leg = self._find_leg_index(ct, sequence_epochs)
-
-        # -------------------------
-        # Boundary rule identical to SNC
-        # -------------------------
-        atol = 1e-7
-        for j in range(1, len(leg_start)):
-            t0 = leg_start[j]
-            t1 = leg_second[j]
-            if t0 is None or t1 is None:
-                continue
-
-            if (ct > t0 + atol) and (ct <= t1 + atol):
-                idx_leg = j - 1
-                break
-
-        # Active state size
-        n_leg = self.sequence_definition.states_n[idx_leg]
-        if not n_leg:
-            n_leg = self.sequence_definition.states_n[idx_leg + 1]
-
-        padding = ((0, int(n_leg) - 9), (0, 0))
-        return np.pad(gamma_local, padding, mode="constant", constant_values=0)
+        Returns
+        -------
+        tuple of float
+            :math:`(\\varphi_1(z), \\varphi_2(z), \\varphi_3(z))`.
+        """
+        if abs(z) < 1.0:
+            # Truncated after (20)!, below machine precision of 1/6
+            phi_3 = 0.0
+            for j in range(17, -1, -1):
+                phi_3 = phi_3 * z + 1.0 / math.factorial(j + 3)
+            phi_2 = 0.5 + z * phi_3
+            phi_1 = 1.0 + z * phi_2
+        else:
+            phi_1 = np.expm1(z) / z
+            phi_2 = (phi_1 - 1.0) / z
+            phi_3 = (phi_2 - 0.5) / z
+        return phi_1, phi_2, phi_3
 
     '''    
     def _discretize_dmc(self, Q: np.ndarray, dt: float) -> np.ndarray:

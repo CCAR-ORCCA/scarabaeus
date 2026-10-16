@@ -20,7 +20,7 @@ from scarabaeus import (
     ForceModelTranslation,
     Maneuver,
 )
-from typing import Optional, Union, Sequence, Literal, Tuple
+from typing import Optional, Union, Sequence, Literal, Tuple, Iterable
 import copy
 import scarabaeus.utils.NumpyWrapper as np
 import numpy
@@ -28,6 +28,13 @@ import os
 from scipy.integrate import solve_ivp
 
 from tqdm import tqdm
+
+from scarabaeus.utils.Serialization import (
+    owner_to_dict,
+    owner_from_dict,
+    dump as _dump_serialized,
+    load as _load_serialized,
+)
 
 # ----------------------------#
 #  Generate Units and Frames  #
@@ -93,8 +100,39 @@ class Propagator:
         Absolute/relative tolerances for the numerical integrator.
     integrator : str, optional
         Integration scheme identifier (e.g. ``"DOP853"``).
+    n_densifier : int, optional
+        Number of sub-intervals each integration step is resampled into, using
+        the integrator's dense output. Defaults to ``10``; pass ``1`` to get the
+        solver's own steps unchanged.
+
+        It applies only when ``tspan`` is a ``(t0, tf)`` tuple, because that is
+        the case in which the output sits on the integrator's adaptive steps.
+        Those steps grow long where the dynamics are quiet, and an SPK written
+        on them leaves SPICE interpolating across wide gaps. The default puts
+        nine extra epochs inside every step, so the output stays fine where the
+        steps are short and coarse where they are long, without imposing one
+        fixed interval over the whole arc. Note that it therefore returns about
+        ten times as many epochs as the bare steps, which costs memory in the
+        propagated states and STMs and size in any SPK written from them.
+
+        The extra epochs come from the solver's interpolant, not from fresh
+        integration: DOP853 carries a dedicated 7th-order dense output, so they
+        cost no additional function evaluations beyond the ones ``dense_output``
+        already requires. The solver's own step endpoints are reproduced
+        exactly, making the densified grid a superset of the undensified one.
+
+        An ``EpochArray`` tspan already names every output epoch, and
+        ``integrator="IAS15"`` builds no interpolant, so neither can be
+        densified. Leaving ``n_densifier`` at its default in those cases simply
+        does nothing; asking for a value explicitly raises
+        :class:`Propagator.DensifierGridError` or
+        :class:`Propagator.DensifierIntegratorError`, rather than silently
+        ignoring what was asked for.
     propagate_STM : bool, optional
-        If True, propagate the state transition matrix.
+        If True, propagate the state transition matrix. Not yet supported with
+        ``integrator="IAS15"``, which integrates the state alone: that
+        combination makes :meth:`propagate` raise
+        :class:`Propagator.IAS15STMError`, so pass ``propagate_STM=False``.
     STM0 : np.ndarray, optional
         Initial STM. If None, identity is used.
     look_event : str, optional
@@ -107,6 +145,13 @@ class Propagator:
         If True, displays integration progress bar in the terminal. Defaults to ``True``.
     copy_force_models : bool, optional
         If True, creates deep copies of the provided force models to avoid side effects.
+
+    See Also
+    --------
+    scarabaeus.StateArray : State vector consumed and produced by the propagator.
+    scarabaeus.ForceModelTranslation : Translational force model aggregator.
+    scarabaeus.ScenarioSetup : Multi-leg propagation driver that wraps Propagator.
+    scarabaeus.MissionSequence : Ordered container of legs passed to ScenarioSetup.
 
     Notes
     -----
@@ -121,17 +166,44 @@ class Propagator:
     - ``force_models`` may be a single instance or a list, enabling multi-object
       or multi-model configurations.
     - Each provided force model must implement:
-        - ``initialize_force_models(state_vector, base_frame, t0)``
-        - ``dynamics_mode_list`` (property)
-        - the appropriate acceleration/partial APIs used by the propagator.
 
-    See Also
-    --------
-    scarabaeus.StateArray : State vector consumed and produced by the propagator.
-    scarabaeus.ForceModelTranslation : Translational force model aggregator.
-    scarabaeus.ScenarioSetup : Multi-leg propagation driver that wraps Propagator.
-    scarabaeus.MissionSequence : Ordered container of legs passed to ScenarioSetup.
+      - ``initialize_force_models(state_vector, base_frame, t0)``
+      - ``dynamics_mode_list`` (property)
+      - the appropriate acceleration/partial APIs used by the propagator.
     """
+
+    #: Sub-intervals each integration step is resampled into when the caller
+    #: does not ask for a particular number. Chosen so that an SPK written from
+    #: a (t0, tf) propagation has enough nodes for SPICE to interpolate between
+    #: without the caller having to think about it.
+    _DENSIFIER_DEFAULT = 10
+
+    class DensifierValueError(ValueError):
+        """Raised when ``n_densifier`` is not a whole number of at least 1."""
+
+    class DensifierIntegratorError(ValueError):
+        """Raised when ``n_densifier`` > 1 is asked of an integrator that
+        builds no dense output to resample from."""
+
+    class DensifierGridError(ValueError):
+        """Raised when ``n_densifier`` > 1 is combined with a tspan that
+        already names every output epoch."""
+
+    class IAS15STMError(NotImplementedError):
+        """Raised when ``propagate_STM=True`` is combined with
+        ``integrator="IAS15"``, which integrates the state alone."""
+
+    class MissingScaleFactorModelError(ValueError):
+        """Raised when the state holds a force-model scale factor
+        (``eta_srp``, ``eta_thermal``, ``eta_antenna``) but no force model
+        applies it, so it would be estimated with a zero partial."""
+
+    #: Scale factors in the state and the force-model modes that apply them.
+    _SCALE_FACTOR_MODELS = {
+        "eta_srp": ("CannonballSRP", "nPlateSRP"),
+        "eta_thermal": ("ThermalRadiation",),
+        "eta_antenna": ("AntennaRadiationPressure",),
+    }
 
     def __init__(
         self,
@@ -143,6 +215,7 @@ class Propagator:
         atol: float = 2.220446049250313e-14,
         rtol: float = 2.220446049250313e-14,
         integrator: Literal["DOP853", "IAS15"] = "DOP853",
+        n_densifier: int | None = None,
         propagate_STM: bool = True,
         STM0=None,
         look_event: Optional[str] = None,
@@ -172,7 +245,7 @@ class Propagator:
         self._backward = backward
 
         # Base frame
-        self.base_frame = base_frame if base_frame is not None else J2000
+        self._base_frame = base_frame if base_frame is not None else J2000
 
         # Normalize tspan to TDB for consistency with ephemerides / forces
         # self._tspan = (
@@ -186,13 +259,22 @@ class Propagator:
                 # given time vector to solve along
                 if self._tspan.system != "TDB":
                     # convert to TDB if not already
-                    self._tspan.to(sys="TDB")
+                    self._tspan = self.tspan.to(sys="TDB")
+
+                # get t0 and tf for force models (raw ET, rep-independent)
+                fm_t0 = float(self._tspan.et[0])
+                fm_tf = float(self._tspan.et[-1])
             case tuple():
-                # given (t0, tf) tuple
-                for t in self._tspan:
-                    # convert both t0 and tf to TDB is not already
-                    if t.system != "TDB":
-                        t.to(sys="TDB")
+                # given (t0, tf) tuple -> convert both to TDB if not already
+                # (.to() returns a new object, so rebuild the tuple)
+                self._tspan = tuple(
+                    t.to(sys="TDB") if t.system != "TDB" else t
+                    for t in self._tspan
+                )
+
+                # get t0 and tf for force models (raw ET, rep-independent)
+                fm_t0 = float(self._tspan[0].et)
+                fm_tf = float(self._tspan[1].et)
             case _:
                 # not the correct type -> raise error
                 raise ValueError(
@@ -204,7 +286,23 @@ class Propagator:
         self._atol = atol
         self._rtol = rtol
         self._integrator = integrator
+        # Whether the caller named a value, as opposed to taking the default.
+        # An impossible combination is an error when it was asked for and a
+        # no-op when it was merely inherited from the default.
+        self._n_densifier_explicit = n_densifier is not None
+        self._n_densifier = self._validate_densifier(
+            self._DENSIFIER_DEFAULT if n_densifier is None else n_densifier
+        )
         self._propagate_STM = propagate_STM
+
+        # Only filled in by propagate() when propagate_STM is on; the STM
+        # property is documented as returning None otherwise, so it has to
+        # exist either way.
+        self._STM = None
+
+        # (name, spice_id) of state components carried through this arc without
+        # acting on it; see reinitialize(dormant_parameters=...).
+        self._dormant_parameters = frozenset()
 
         # Force models: normalize to list and initialize all
         if force_models is None:
@@ -232,10 +330,10 @@ class Propagator:
 
         # Bind each ForceModel to the working state and frame
         for fm in self._force_models:
-            fm.initialize_force_models(
-                state_vector=self._full_state_vector,
-                base_frame=self.base_frame,
-            )
+            fm.initialize_force_models(state_vector = self._full_state_vector,
+                                       base_frame   = self.base_frame,
+                                       t0           = fm_t0,
+                                       tf           = fm_tf)
 
         # Combined dynamics mode list (union over all models)
         self._dynamics_mode_list = sorted(
@@ -293,6 +391,35 @@ class Propagator:
         # precompute ODE cache (must be last — needs all state/index structures ready)
         self._precompute_ode_cache()
 
+    def _reset_integration_state(self) -> None:
+        """
+        Restore the ODE row layout ``[reduced state | STM]`` for a fresh run.
+
+        :meth:`propagate` leaves ``_ys`` holding the *full* state alongside the
+        STM, which is what callers want to read afterwards, while :meth:`ode`
+        slices the *reduced* state — only the dynamic entries are integrated.
+        The two layouts coincide whenever every state entry is dynamic, so
+        propagating twice works for a plain position/velocity state and fails
+        the moment a static solve-for parameter is added, with the STM slice
+        coming out one row too long.
+
+        Rebuilding the initial row here makes :meth:`propagate` repeatable.
+        Continuing from a new initial condition is
+        :meth:`reinitialize`'s job, not a second call to propagate.
+        """
+        match self.tspan:
+            case EpochArray():
+                init_size = self.tspan.size
+            case _:
+                init_size = 1
+
+        self._ys = np.zeros(
+            (init_size, self._reduced_state_vector.size + self._STM0.size)
+        )
+        self._ys[0] = np.concatenate(
+            (self._reduced_state_vector.values0.values, self._STM0)
+        )
+
     def _create_reduced_state_vector(self):
         # Separate dynamic and static parameters
         self._dynamic_indices = []
@@ -320,46 +447,53 @@ class Propagator:
 
     def _validate_configuration(self):
         """
-        Validate the propagator configuration for consistency.
-
-        Checks
-        ------
-        - If 'eta_srp' appears in the state, at least one force model must
-          enable an SRP contribution ('CannonballSRP' or 'nPlateSRP').
-        - If any force model enables 'ThreeBodyGravity', its point-mass list
-          must be non-empty and must not include the propagation origin body.
-        - The initial epoch of `tspan` must match the epoch of the state vector.
-        - If mass is modeled as dynamic, `primary_body` must be a Spacecraft.
+        Check the propagator configuration for consistency.
 
         Raises
         ------
+        MissingScaleFactorModelError
+            If a non-dormant scale factor is in the state but no force model
+            applies it: ``eta_srp`` needs ``"CannonballSRP"`` or ``"nPlateSRP"``,
+            ``eta_thermal`` needs ``"ThermalRadiation"`` and ``eta_antenna`` needs
+            ``"AntennaRadiationPressure"``.
         ValueError
-            On inconsistent SRP, third-body, or time-span configuration.
+            If a force model enables ``"ThreeBodyGravity"`` with an empty
+            ``third_bodies`` list, or with the propagation origin among its third
+            bodies.
         TypeError
-            If dynamic-mass modeling is requested for a non-spacecraft object.
+            If mass is modeled as dynamic but ``primary_body`` is not a
+            :class:`~scarabaeus.Spacecraft`.
+
+        Notes
+        -----
+        The third-body check compares names case-insensitively. The initial epoch
+        of ``tspan`` is read but not compared with the state epoch.
         """
 
-        # SRP: eta_srp present -> require SRP model
+        # Scale factor present -> require the model that applies it
         try:
             components = self._full_state_vector.state_definition
         except AttributeError:
             components = getattr(self._full_state_vector, "state", [])
 
-        has_eta_srp = any(entry[0] == "eta_srp" for entry in components)
-
-        has_srp_model = any(
-            any(
-                mode in getattr(fm, "dynamics_mode_list", [])
-                for mode in ("CannonballSRP", "nPlateSRP")
-            )
+        active_modes = {
+            mode
             for fm in self._force_models
-        )
-
-        if has_eta_srp and not has_srp_model:
-            raise ValueError(
-                "Invalid configuration: 'eta_srp' is present in the state vector, "
-                "but no SRP model is enabled (expected 'CannonballSRP' or 'nPlateSRP')."
+            for mode in getattr(fm, "dynamics_mode_list", [])
+        }
+        for param, modes in self._SCALE_FACTOR_MODELS.items():
+            in_state = any(
+                entry[0] == param
+                and (entry[0], getattr(entry[-1], "spice_id", None))
+                not in self._dormant_parameters
+                for entry in components
             )
+            if in_state and not active_modes.intersection(modes):
+                raise self.MissingScaleFactorModelError(
+                    f"Invalid configuration: '{param}' is present in the state "
+                    f"vector, but no model applying it is enabled (expected "
+                    f"{' or '.join(repr(m) for m in modes)})."
+                )
 
         # Time span: tspan[0] must match state epoch
         # Use EpochArray semantics if available
@@ -488,6 +622,70 @@ class Propagator:
 
         return units, frames
 
+    def _probe_partial_units(self, fm, partial_name, position, full_state, epoch, body):
+        """
+        Query a partial for the sake of its units, retrying at an epoch whose
+        mass is known.
+
+        Units are epoch-invariant, but *evaluating* a partial is not: models
+        that scale with spacecraft mass (SRP, thrust) read ``Body.mass``, which
+        is only defined over the spans already propagated. Legs of a
+        :class:`~scarabaeus.MissionSequence` are built up front, so a later
+        leg's start epoch usually predates any profile covering it. Retrying
+        inside a span that does exist keeps the units exact rather than falling
+        back to unitless, and a partial that cannot be evaluated at all simply
+        has no units to record.
+
+        Parameters
+        ----------
+        fm : ForceModel or None
+            Force model owning the partial.
+        partial_name : str
+            Partial key, ``'<name>@<spice_id>_by_<name>@<spice_id>'``.
+        position : ArrayWUnits
+            Position of the body the row belongs to.
+        full_state : dict
+            Direct representation of the initial state.
+        epoch : float
+            Preferred evaluation epoch (this leg's start).
+        body : Body
+            Body the row belongs to.
+
+        Returns
+        -------
+        ArrayWUnits or None
+            The partial, or ``None`` when it cannot be evaluated.
+        """
+        if fm is None:
+            return None
+
+        def _query(at_epoch):
+            return fm._collect_partials(
+                name=partial_name,
+                position=position,
+                current_state=full_state,
+                epoch=at_epoch,
+                body=body,
+            )
+
+        try:
+            return _query(epoch)
+        except Exception:
+            # Fall through to an epoch the mass profile covers.
+            pass
+
+        for owner in (body, self._primary_body):
+            spans = getattr(owner, "_mass_profiles_tspan", None)
+            if not spans:
+                continue
+            span = np.asarray(spans[-1], dtype=float).ravel()
+            try:
+                return _query(0.5 * (float(span[0]) + float(span[-1])))
+            except Exception:
+                continue
+
+        return None
+
     def _accumulate_and_save_stm_units(self):
         """
         Build the units matrix for the State Transition Matrix (STM).
@@ -517,13 +715,13 @@ class Propagator:
 
         match self._tspan:
             case EpochArray():
-                # get t0 for EpochArray configuration
-                epoch0 = self._tspan.times.values[0]
+                # get t0 for EpochArray configuration (raw ET, rep-independent)
+                epoch0 = float(self._tspan.et[0])
             case tuple():
                 # get t0 for tuple of t0, tf EpochArrays configuration
-                epoch0 = self._tspan[0].times.values
+                epoch0 = float(self._tspan[0].et)
 
-        full_state = self._full_state_vector._make_direct_representation(Y0)
+        full_state = self._force_model_state(Y0)
 
         # Helper: position unit for a given body from template state
         def _get_position_unit(target_body):
@@ -583,26 +781,25 @@ class Propagator:
             # Pick the correct force model for this body
             fm = self._get_force_model_for_body(body)
 
-            # Build the 'dot' part name, as in ode()
-            param_dot_text = ".".join([str(x) for x in param_dot[:-1]])
+            # Partial keys are '<name>@<spice_id>_by_<name>@<spice_id>', the
+            # format ode() builds and _collect_partials parses. Anything else
+            # fails to parse and silently yields no partial, which would leave
+            # every STM entry unitless.
+            dot_sid = getattr(body, "spice_id", None)
 
             # ========================================================
             # Loop over state components (columns)
             # ========================================================
             for param in self._full_state_vector.state_definition:
-                param_text = ".".join([str(x) for x in param[:-1]])
-                partial_name = "_by_".join([param_dot_text, param_text])
+                param_sid = getattr(param[-1], "spice_id", None)
+                if (param[0], param_sid) in self._dormant_parameters:
+                    continue
+                partial_name = (
+                    f"{name_dot}@{dot_sid}_by_{param[0]}@{param_sid}"
+                )
 
-                partial = (
-                    fm._collect_partials(
-                        name=partial_name,
-                        position=position,
-                        current_state=full_state,
-                        epoch=epoch0,
-                        body=body,
-                    )
-                    if fm is not None
-                    else None
+                partial = self._probe_partial_units(
+                    fm, partial_name, position, full_state, epoch0, body
                 )
 
                 if partial is not None:
@@ -725,15 +922,46 @@ class Propagator:
         """
         return self._primary_body
 
+    @primary_body.setter
+    def primary_body(self, value: Spacecraft) -> None:
+        """Shorthand for ``reinitialize(primary_body=value)``."""
+        self.reinitialize(primary_body=value)
+
+    @property
+    def state_vector(self) -> StateArray:
+        """
+        The initial state as it was given, in its original frames.
+
+        Setting it is shorthand for ``reinitialize(state_vector=value)``: the
+        force models are re-bound and the next :meth:`propagate` starts from
+        the new state. The tspan is left alone, so a state at another epoch
+        needs a matching tspan as well (``reinitialize(state_vector=...,
+        tspan=...)`` does both in one rebuild).
+
+        :base: Propagator
+        :type: scb.StateArray
+        """
+        return self._full_state_vector_original_frames
+
+    @state_vector.setter
+    def state_vector(self, value: StateArray) -> None:
+        self.reinitialize(state_vector=value)
+
     @property
     def full_state_vector(self) -> StateArray:
         """
         The state vector associated with the propagation.
 
+        Setting it is the same as setting :attr:`state_vector`.
+
         :base: Propagator
         :type: scb.StateArray
         """
         return self._full_state_vector
+
+    @full_state_vector.setter
+    def full_state_vector(self, value: StateArray) -> None:
+        self.reinitialize(state_vector=value)
 
     @property
     def full_state_vector_original_frames(self) -> StateArray:
@@ -779,10 +1007,19 @@ class Propagator:
 
     @base_frame.setter
     def base_frame(self, input_val):
+        """
+        Change the propagation frame and rebuild. ``None`` means J2000.
+
+        The state is converted afresh from its original frames, so switching
+        frames back and forth never compounds conversions.
+        """
         if input_val is None:
             input_val = J2000
 
-        self._base_frame = input_val
+        self.reinitialize(
+            state_vector=self._full_state_vector_original_frames,
+            base_frame=input_val,
+        )
 
     @property
     def t0(self) -> EpochArray:
@@ -814,6 +1051,22 @@ class Propagator:
         """
         return self._tspan
 
+    @tspan.setter
+    def tspan(self, value: EpochArray | Tuple[EpochArray, EpochArray] | list) -> None:
+        """
+        Replace the time span, e.g. to run a loaded propagator for longer.
+
+        Shorthand for ``reinitialize(tspan=value)``: the force models are
+        re-bound to the new span and the next :meth:`propagate` integrates it
+        from the same initial state. A two-element list is taken as a
+        ``(t0, tf)`` tuple. The first epoch must stay the state epoch; to start
+        from a different state, call :meth:`reinitialize` with ``state_vector``
+        as well.
+        """
+        if isinstance(value, list) and len(value) == 2:
+            value = tuple(value)
+        self.reinitialize(tspan=value)
+
     @property
     def backward(self) -> bool:
         """
@@ -824,36 +1077,160 @@ class Propagator:
         """
         return self._backward
 
+    @backward.setter
+    def backward(self, value: bool) -> None:
+        """Shorthand for ``reinitialize(backward=value)``."""
+        self.reinitialize(backward=bool(value))
+
     @property
     def look_event(self) -> str | None:
         """
-        The event type for the propagator.
+        The event type for the propagator. Settable; ``None`` turns it off.
 
         :base: Propagator
         :type: str
         """
         return self._look_event
 
+    @look_event.setter
+    def look_event(self, value: str | None) -> None:
+        # Only read when propagate() builds its event function, so nothing
+        # needs rebuilding (and reinitialize() cannot clear it to None).
+        self._look_event = value
+
+    @property
+    def convert_to_original_frame(self) -> bool:
+        """
+        Whether propagate() maps the results back to the original frames.
+        Settable.
+
+        :base: Propagator
+        :type: bool
+        """
+        return self._convert_to_original_frame
+
+    @convert_to_original_frame.setter
+    def convert_to_original_frame(self, value: bool) -> None:
+        self._convert_to_original_frame = bool(value)
+
+    @property
+    def mass_is_variable(self) -> bool:
+        """
+        Whether the spacecraft mass is modelled as varying. Settable; turning
+        it on requires :attr:`primary_body` to be a Spacecraft.
+
+        :base: Propagator
+        :type: bool
+        """
+        return self._mass_is_variable
+
+    @mass_is_variable.setter
+    def mass_is_variable(self, value: bool) -> None:
+        previous = self._mass_is_variable
+        self._mass_is_variable = bool(value)
+        try:
+            self._validate_configuration()
+        except TypeError:
+            self._mass_is_variable = previous
+            raise
+
+    @property
+    def display_progress(self) -> bool:
+        """
+        Whether propagate() shows a progress bar. Settable.
+
+        :base: Propagator
+        :type: bool
+        """
+        return self._display_progress
+
+    @display_progress.setter
+    def display_progress(self, value: bool) -> None:
+        self._display_progress = bool(value)
+
     # --- Propagation Settings ---
     @property
     def atol(self) -> float:
         """
-        Absolute tolerance for numerical integration.
+        Absolute tolerance for numerical integration. Settable.
 
         :base: Propagator
         :type: float
         """
         return self._atol
 
+    @atol.setter
+    def atol(self, value: float) -> None:
+        # Tolerances are only read by the integrator call; no rebuild needed.
+        self._atol = float(value)
+
     @property
     def rtol(self) -> float:
         """
-        Relative tolerance for numerical integration.
+        Relative tolerance for numerical integration. Settable.
 
         :base: Propagator
         :type: float
         """
         return self._rtol
+
+    @rtol.setter
+    def rtol(self, value: float) -> None:
+        self._rtol = float(value)
+
+    @classmethod
+    def _validate_densifier(cls, n_densifier) -> int:
+        """Check ``n_densifier`` is a whole number of at least 1 and return it."""
+        # bool is a subclass of int, and True would silently read as 1.
+        if isinstance(n_densifier, bool) or not isinstance(
+            n_densifier, (int, numpy.integer)
+        ):
+            raise cls.DensifierValueError(
+                f"n_densifier must be an integer, not {type(n_densifier).__name__}. "
+                "Use 1 to keep the integrator's own steps, or a larger whole "
+                "number to resample each step into that many sub-intervals."
+            )
+        if n_densifier < 1:
+            raise cls.DensifierValueError(
+                f"n_densifier is {n_densifier}, but a step cannot be split into "
+                "fewer than one sub-interval. Use 1 to keep the integrator's own "
+                "steps, or a larger whole number to subdivide them."
+            )
+        return int(n_densifier)
+
+    def _densify_epochs(self, step_epochs):
+        """Place ``n_densifier - 1`` extra epochs inside every integration step.
+
+        The step endpoints are reproduced exactly, so the returned grid is a
+        superset of ``step_epochs``: densifying adds samples, it never moves the
+        ones the integrator already produced. Works in either time direction,
+        since the sub-intervals inherit the sign of the steps they subdivide.
+        """
+        n_sub = self._n_densifier
+        return numpy.concatenate(
+            [
+                numpy.linspace(t_a, t_b, n_sub + 1)[:-1]
+                for t_a, t_b in zip(step_epochs[:-1], step_epochs[1:])
+            ]
+            + [step_epochs[-1:]]
+        )
+
+    @property
+    def n_densifier(self) -> int:
+        """
+        Number of sub-intervals each integration step is resampled into.
+
+        Defaults to ``10``; ``1`` returns the integrator's own steps unchanged.
+        Only a ``(t0, tf)`` tuple tspan under ``"DOP853"`` is densified -- an
+        :class:`EpochArray` tspan and ``"IAS15"`` have no solver-chosen grid or
+        no interpolant to refine, and the default is a no-op there.
+        """
+        return self._n_densifier
+
+    @n_densifier.setter
+    def n_densifier(self, value: int) -> None:
+        """Shorthand for ``reinitialize(n_densifier=value)``."""
+        self.reinitialize(n_densifier=value)
 
     @property
     def integrator(self) -> str:
@@ -865,6 +1242,11 @@ class Propagator:
         """
         return self._integrator
 
+    @integrator.setter
+    def integrator(self, value: str) -> None:
+        """Shorthand for ``reinitialize(integrator=value)``."""
+        self.reinitialize(integrator=value)
+
     @property
     def propagate_STM(self) -> bool:
         """
@@ -874,6 +1256,11 @@ class Propagator:
         :type: bool
         """
         return self._propagate_STM
+
+    @propagate_STM.setter
+    def propagate_STM(self, value: bool) -> None:
+        """Shorthand for ``reinitialize(propagate_STM=value)``."""
+        self.reinitialize(propagate_STM=bool(value))
 
     @property
     def integrationYs(self) -> numpy.ndarray | None:
@@ -894,6 +1281,16 @@ class Propagator:
         :type: np.ndarray
         """
         return self._STM0
+
+    @STM0.setter
+    def STM0(self, value: numpy.ndarray) -> None:
+        """
+        Shorthand for ``reinitialize(STM0=value)``; flattened or square.
+        ``None`` resets it to the identity.
+        """
+        if value is None:
+            value = np.identity(self._full_state_vector.size)
+        self.reinitialize(STM0=value)
 
     @property
     def STM_units(self) -> numpy.ndarray | None:
@@ -1023,6 +1420,14 @@ class Propagator:
         """
         return self._force_models
 
+    @force_models.setter
+    def force_models(self, value: Union[ForceModel, Sequence[ForceModel]]) -> None:
+        """
+        Shorthand for ``reinitialize(force_models=value)``. The models are
+        used as given (not copied) and re-bound to the current state.
+        """
+        self.reinitialize(force_models=value)
+
     # ----------------------#
     # endregion Properties #
     # ----------------------#
@@ -1141,6 +1546,16 @@ class Propagator:
             _,
         ) = self._precompute_indices()
 
+        # Template that ode() copies each step and overwrites with the
+        # integrated (dynamic) slices. Its STATIC entries are the only source
+        # of static parameter values seen by the force models, so it has to be
+        # rebuilt here rather than only in __init__: reinitialize() is how the
+        # OD filter feeds an updated estimate back in between iterations, and a
+        # stale template silently pins every estimated static parameter at its
+        # a priori value. The filter then re-derives the same correction every
+        # iteration and never converges.
+        self._y_full0 = self.full_state_vector.values0.values.copy().reshape(-1)
+
         self._n_full = self._full_state_vector.size
         self._n_red = self._reduced_state_vector.size
         primary_sid = getattr(self._primary_body, "spice_id", None)
@@ -1223,6 +1638,10 @@ class Propagator:
                 var_name = param[0]
                 var_body = param[-1]
                 var_sid = getattr(var_body, "spice_id", None)
+                # A dormant parameter has no partials: its columns stay zero,
+                # so its STM block remains the identity.
+                if (var_name, var_sid) in self._dormant_parameters:
+                    continue
                 col_s, col_e = indices_map.get((var_name, var_sid), (None, None))
                 if None not in (col_s, col_e):
                     pname = f"{dot_name}@{dot_sid}_by_{var_name}@{var_sid}"
@@ -1231,8 +1650,78 @@ class Propagator:
                 (row_s, row_e, pos_s, pos_e, pos_unit, fm, dot_body, col_entries)
             )
 
+        # First ode() call prunes structurally-None partial entries from the plan.
+        self._stm_plan_pruned = False
+
         # Cache env-var flag so ode() doesn't hit os.environ every step
         self._check_partials = os.environ.get("check_force_model_partials") == "TRUE"
+
+    def _force_model_state(self, y_full: np.ndarray) -> dict:
+        """
+        Direct representation of the full state, as the force models see it.
+
+        Dormant parameters are left out. Force models resolve numbered burn
+        parameters by their base name (``k_thrust1`` answers a lookup of
+        ``k_thrust``), so a thrust group merely carried through another burn arc
+        would otherwise drive that arc's thrust.
+
+        Parameters
+        ----------
+        y_full : np.ndarray
+            Flat full state vector.
+
+        Returns
+        -------
+        dict
+            Mapping ``(name, spice_id)`` to the component values.
+        """
+        state = self._full_state_vector._make_direct_representation(y_full)
+        for key in self._dormant_parameters:
+            state.pop(key, None)
+        return state
+
+    def list_forces(self) -> dict:
+        """
+        The forces acting on each integrated object, as readable labels.
+
+        Returns
+        -------
+        dict
+            Maps the name of every object whose position is integrated — the
+            spacecraft and any celestial body propagated alongside it — to
+            the labels of the forces its force model applies, in that model's
+            :attr:`~scarabaeus.ForceModelTranslation.dynamics_mode_list` order.
+            Entries follow state order.
+
+        See Also
+        --------
+        scarabaeus.ForceModelTranslation.list_forces : The labels of one force model.
+        scarabaeus.MissionSequence.list_forces : The same listing, leg by leg.
+
+        Notes
+        -----
+        The labels are those of
+        :meth:`~scarabaeus.ForceModelTranslation.list_forces` on the bound
+        force models, so they reflect what acts during propagation rather
+        than what was configured: the origin's point-mass term reinstated
+        next to a non-central harmonics field, the integrated bodies added to
+        the third-body term, a harmonics truncation clamped by its file.
+
+        Examples
+        --------
+        >>> prop.list_forces()
+        {'ORCCA': ['ThreeBodyGravity(SUN, MOON)', 'CannonballSRP', 'PointMassGravity(EARTH)'],
+         'Moon': ['ThreeBodyGravity(SUN)', 'PointMassGravity(EARTH)']}
+        """
+        forces, seen = {}, set()
+        for name, _, _, dynamics, owner, _ in self._full_state_vector.state:
+            sid = getattr(owner, "spice_id", None)
+            if name != "position" or dynamics != "dynamic" or sid in seen:
+                continue
+            seen.add(sid)
+            fm = self._fm_cache.get(sid)
+            forces[owner.name] = fm.list_forces() if fm is not None else []
+        return forces
 
     def _get_force_model_for_body(self, body) -> ForceModel:
         """
@@ -1294,7 +1783,7 @@ class Propagator:
         y_full = self._y_full0.copy()
         for i0r, i1r, i0f, i1f in self._red_to_full_slices:
             y_full[i0f:i1f] = y_state[i0r:i1r]
-        full_state = self.full_state_vector._make_direct_representation(y_full)
+        full_state = self._force_model_state(y_full)
 
         # ============================================================
         # 1) Dynamics of reduced state  (plan built once in __init__)
@@ -1314,7 +1803,7 @@ class Propagator:
                     entry[6],
                     entry[7],
                 )
-                position = ArrayWUnits(y_state[pos_s:pos_e], pos_unit)
+                position = ArrayWUnits.from_trusted(y_state[pos_s:pos_e], pos_unit)
                 if kind == "acceleration":
                     Y_dot[s:e] = fm._compute_total_acceleration(
                         position=position,
@@ -1339,41 +1828,71 @@ class Propagator:
             STM_current = stm_flat.reshape((n_full, n_full))
             STM_dot = np.zeros((n_full, n_full))
 
-            for (
-                row_s,
-                row_e,
-                pos_s,
-                pos_e,
-                pos_unit,
-                fm,
-                dot_body,
-                col_entries,
-            ) in self._stm_plan:
-                if fm is None:
-                    continue
-                position = ArrayWUnits(y_state[pos_s:pos_e], pos_unit)
-                for pname, col_s, col_e in col_entries:
-                    partial = fm._collect_partials(
-                        name=pname,
-                        position=position,
-                        current_state=full_state,
-                        epoch=epoch,
-                        body=dot_body,
-                    )
-                    if partial is None:
+            if self._stm_plan_pruned:
+                # Fast path: the plan has already been reduced to fm-present rows
+                # with only non-None partials and validated block shapes, so the
+                # per-step None/shape guards are unnecessary.
+                for (
+                    row_s, row_e, pos_s, pos_e, pos_unit, fm, dot_body, col_entries
+                ) in self._stm_plan:
+                    position = ArrayWUnits.from_trusted(y_state[pos_s:pos_e], pos_unit)
+                    for pname, col_s, col_e in col_entries:
+                        partial = fm._collect_partials(
+                            name=pname,
+                            position=position,
+                            current_state=full_state,
+                            epoch=epoch,
+                            body=dot_body,
+                        )
+                        STM_dot[row_s:row_e, col_s:col_e] = np.atleast_2d(
+                            np.asarray(
+                                partial.values if hasattr(partial, "values") else partial,
+                                dtype=float,
+                            )
+                        )
+            else:
+                # First evaluation: drop column entries whose partial is
+                # structurally None (e.g. d(velocity)/d(position)) and rows that
+                # contribute nothing, then validate shapes once. None-ness depends
+                # only on the state definition / active force models (not epoch or
+                # state), so the pruned plan is reused on every later step.
+                pruned_plan = []
+                for (
+                    row_s, row_e, pos_s, pos_e, pos_unit, fm, dot_body, col_entries
+                ) in self._stm_plan:
+                    if fm is None:
                         continue
-                    block = np.atleast_2d(
-                        np.asarray(
-                            partial.values if hasattr(partial, "values") else partial,
-                            dtype=float,
+                    position = ArrayWUnits.from_trusted(y_state[pos_s:pos_e], pos_unit)
+                    kept_cols = []
+                    for pname, col_s, col_e in col_entries:
+                        partial = fm._collect_partials(
+                            name=pname,
+                            position=position,
+                            current_state=full_state,
+                            epoch=epoch,
+                            body=dot_body,
                         )
-                    )
-                    if block.shape != (row_e - row_s, col_e - col_s):
-                        raise ValueError(
-                            f"Partial '{pname}' returned shape {block.shape}, "
-                            f"expected ({row_e - row_s}, {col_e - col_s})."
+                        if partial is None:
+                            continue
+                        block = np.atleast_2d(
+                            np.asarray(
+                                partial.values if hasattr(partial, "values") else partial,
+                                dtype=float,
+                            )
                         )
-                    STM_dot[row_s:row_e, col_s:col_e] = block
+                        if block.shape != (row_e - row_s, col_e - col_s):
+                            raise ValueError(
+                                f"Partial '{pname}' returned shape {block.shape}, "
+                                f"expected ({row_e - row_s}, {col_e - col_s})."
+                            )
+                        STM_dot[row_s:row_e, col_s:col_e] = block
+                        kept_cols.append((pname, col_s, col_e))
+                    if kept_cols:
+                        pruned_plan.append(
+                            (row_s, row_e, pos_s, pos_e, pos_unit, fm, dot_body, kept_cols)
+                        )
+                self._stm_plan = pruned_plan
+                self._stm_plan_pruned = True
 
             # dPhi/dt = A * Phi
             Y_dot[n_red:] = (STM_dot @ STM_current).ravel()
@@ -1412,29 +1931,54 @@ class Propagator:
         # Reset A-matrix accumulation list for this run
         self._As_list = []
 
+        # Restore the [reduced state | STM] row the integrator expects; a
+        # previous run leaves the full state there instead.
+        self._reset_integration_state()
+
         # Handle dynamic mass initialization
         self._initialize_mass_profile()
 
         fun_ode = lambda t, y: self.ode(epoch=t, Y=y)
 
-        # condition time span for selected integrator
+        # condition time span for selected integrator (raw ET, rep-independent)
         match self.tspan:
             case EpochArray():
-                dt = (self.tspan.times[1] - self.tspan.times[0]).values
-                tspan_to_integrator = (
-                    self.tspan.times.values
-                )  # convert to array of floats
+                dt = float(self.tspan.et[1] - self.tspan.et[0])
+                tspan_to_integrator = self.tspan.et  # array of floats
             case tuple():
-                dt = (self.tspan[1].times - self.tspan[0].times).values
+                dt = float(self.tspan[1].et - self.tspan[0].et)
                 # convert to tuple of floats
                 tspan_to_integrator = (
-                    self.tspan[0].times.values,
-                    self.tspan[1].times.values,
+                    float(self.tspan[0].et),
+                    float(self.tspan[1].et),
                 )
 
         # Integrate the ODE
         match self.integrator:
             case "IAS15":
+                # Checked here rather than in __init__ because reinitialize()
+                # can change the integrator after construction. Only an asked-for
+                # value is an error; the default just does not apply here.
+                if self._n_densifier > 1 and self._n_densifier_explicit:
+                    raise self.DensifierIntegratorError(
+                        f"n_densifier is {self._n_densifier}, but IAS15 returns "
+                        "only its own step endpoints and builds no interpolant to "
+                        "resample between them. Set n_densifier=1, or integrate "
+                        'with integrator="DOP853", whose dense output the extra '
+                        "epochs are drawn from."
+                    )
+
+                # IAS15 is handed the state alone (no flattened STM appended),
+                # so the STM block of the ODE would find nothing to reshape.
+                if self._propagate_STM:
+                    raise self.IAS15STMError(
+                        'integrator="IAS15" cannot propagate the STM yet: it '
+                        "integrates the state alone, without the STM appended. "
+                        "Set propagate_STM=False to integrate the trajectory "
+                        'with IAS15, or use integrator="DOP853" if the STM is '
+                        "needed."
+                    )
+
                 # input handling
                 if self.full_state_vector.size != self._reduced_state_vector.size:
                     raise ValueError(
@@ -1478,20 +2022,32 @@ class Propagator:
                 # condition tspan for scipy integrator
                 match self.tspan:
                     case EpochArray():
-                        t_start = self.tspan.times[0].values
-                        t_end = self.tspan.times[-1].values
+                        # An EpochArray already names every output epoch, so
+                        # there is no solver-chosen grid left to densify. Only an
+                        # asked-for value is an error; the default just does not
+                        # apply here, and the requested grid is returned as-is.
+                        if self._n_densifier > 1 and self._n_densifier_explicit:
+                            raise self.DensifierGridError(
+                                f"n_densifier is {self._n_densifier}, but tspan is "
+                                "an EpochArray, which already fixes every output "
+                                "epoch. Densifying refines the grid the integrator "
+                                "picks for itself, so pass tspan as a (t0, tf) "
+                                "tuple of EpochArrays, or set n_densifier=1 and "
+                                "request the epochs you want directly."
+                            )
 
-                        t_eval = self.tspan.times.values
+                        t_start = float(self.tspan.et[0])
+                        t_end = float(self.tspan.et[-1])
+
+                        t_eval = self.tspan.et
                     case tuple():
-                        raise ValueError(
-                            "Non-selective time steps currently "
-                            "unsupported for DOP853 integration. "
-                            "Provide an EpochArray instead of tuple."
-                        )
-                        # t_start = self.tspan[0].times.values
-                        # t_end   = self.tspan[1].times.values
+                        # (t0, tf) bounds only: t_eval=None hands the choice of
+                        # output times to DOP853's own step-size control, which
+                        # is what the tuple asks for.
+                        t_start = float(self.tspan[0].et)
+                        t_end = float(self.tspan[-1].et)
 
-                        # t_eval = None
+                        t_eval = None
 
                 total_time = abs(t_end - t_start)
 
@@ -1512,20 +2068,21 @@ class Propagator:
                             pbar.refresh()
                         return 0
 
-                    # Get batch boundaries if piecewise GM is active
+                    # Get batch boundaries of every batch-grid model in play
+                    # (piecewise GM, piecewise polynomial). Each grid is read
+                    # off the built sub-model, whose t0 is the batch origin in
+                    # raw ET: the force model's own t0 is rebound to this leg's
+                    # start, which would slide the boundaries with every leg of
+                    # a sequence.
                     batch_breakpoints = []
-                    for fm in self._force_models:
-                        if (
-                            hasattr(fm, "pfogm_batch_length")
-                            and fm.pfogm_batch_length is not None
-                            and hasattr(fm, "pfogm_n_batches")
-                            and hasattr(fm, "t0")
-                        ):
-                            for k in range(1, fm.pfogm_n_batches):
-                                bp = fm.t0.times.values + k * fm.pfogm_batch_length
-                                if t_start < bp < t_end:
-                                    batch_breakpoints.append(bp)
-                            break
+                    batch_models = self._batch_grid_models()
+                    t_lo, t_hi = min(t_start, t_end), max(t_start, t_end)
+                    for batch_model in batch_models:
+                        batch_model.clear_batch_window()
+                        for k in range(1, batch_model.n_batches):
+                            bp = batch_model.t0 + k * batch_model.batch_length
+                            if t_lo < bp < t_hi:
+                                batch_breakpoints.append(bp)
 
                     # Build arc boundaries: [t_start, breakpoint_1, ..., t_end]
                     arc_boundaries = sorted(
@@ -1549,8 +2106,25 @@ class Propagator:
                         t_arc_end = arc_boundaries[i + 1]
                         is_last_arc = i == len(arc_boundaries) - 2
 
+                        # Arcs are cut at batch boundaries, so each one lives in
+                        # a single batch. Pinning it keeps the dynamics
+                        # continuous right up to the arc's closing epoch, which
+                        # would otherwise already belong to the next batch.
+                        for batch_model in batch_models:
+                            batch_model.pin_batch_window(t_arc_start, t_arc_end)
+
                         # Avoid duplicate evaluation at internal boundaries
-                        if self._backward:
+                        if t_eval is None:
+                            # Solver-chosen output times: nothing to slice, only
+                            # the arc end is pulled off an internal boundary.
+                            t_arc_eval = None
+                            if is_last_arc:
+                                t_span_end = t_arc_end
+                            elif self._backward:
+                                t_span_end = t_arc_end + eps_time
+                            else:
+                                t_span_end = t_arc_end - eps_time
+                        elif self._backward:
                             if not is_last_arc:
                                 t_arc_eval = t_eval[
                                     (t_eval <= t_arc_start) & (t_eval > t_arc_end)
@@ -1580,7 +2154,7 @@ class Propagator:
                             continue
 
                         # If there are no requested output times in this arc, still advance the state
-                        if len(t_arc_eval) == 0:
+                        if t_arc_eval is not None and len(t_arc_eval) == 0:
                             self._ode_sol = solve_ivp(
                                 fun=fun_ode,
                                 t_span=(t_arc_start, t_span_end),
@@ -1629,13 +2203,36 @@ class Propagator:
                         )
                         y_current = self._ode_sol.sol(restart_time)
 
-                        # Concatenate outputs without duplicating the first sample of each later arc
-                        if all_t:
-                            all_t.append(self._ode_sol.t)
-                            all_y.append(self._ode_sol.y)
+                        # With no t_eval the output sits on the solver's own
+                        # adaptive steps, which an SPK then has to interpolate
+                        # across. Resampling each step from the dense output
+                        # keeps the grid fine where the steps are short and
+                        # coarse where they are long, instead of imposing one
+                        # fixed interval over the whole arc. The step endpoints
+                        # survive unchanged, so this only ever adds epochs --
+                        # including the terminal event time, which the event
+                        # handler below still finds at the end of the arc.
+                        # t_arc_eval is None exactly when the solver chose the
+                        # grid; a requested grid is returned untouched.
+                        if (
+                            t_arc_eval is None
+                            and self._n_densifier > 1
+                            and self._ode_sol.t.size > 1
+                        ):
+                            arc_t = self._densify_epochs(self._ode_sol.t)
+                            arc_y = self._ode_sol.sol(arc_t)
                         else:
-                            all_t.append(self._ode_sol.t)
-                            all_y.append(self._ode_sol.y)
+                            arc_t = self._ode_sol.t
+                            arc_y = self._ode_sol.y
+
+                        # Concatenate outputs without duplicating the first sample of each later arc
+                        all_t.append(arc_t)
+                        all_y.append(arc_y)
+
+                    # The pin belongs to the arc loop only; anything evaluating
+                    # the model afterwards resolves its own batch again.
+                    for batch_model in batch_models:
+                        batch_model.clear_batch_window()
 
                     # Stitch arcs back together so the rest of propagate() works unchanged
                     self._ode_sol.t = numpy.concatenate(all_t)
@@ -1664,23 +2261,46 @@ class Propagator:
                 if self._ode_sol.status == 1 and self._ode_sol.t_events:
                     t_event = self._ode_sol.t_events[0][0]
                     y_event = self._ode_sol.y[:, self._ode_sol.t == t_event].flatten()
+                    # With solver-chosen output times there is no grid to
+                    # resume onto, so the remainder is stepped the same way.
+                    resume_eval = (
+                        None
+                        if t_eval is None
+                        else self.tspan.time[self.tspan.time > t_event]
+                    )
                     sol_event = solve_ivp(
                         fun=self.ode2,
-                        t_span=(t_event, self.tspan.time[-1]),
+                        t_span=(t_event, t_end),
                         y0=y_event,
                         method=self.integrator,
-                        t_eval=self.tspan.time[self.tspan.time > t_event],
+                        t_eval=resume_eval,
                         rtol=self.rtol,
                         atol=self.atol,
-                        dense_output=False,
+                        # Only built when something is going to resample it.
+                        dense_output=resume_eval is None and self._n_densifier > 1,
                     )
                     if sol_event:
-                        # Combine the initial and resumed solutions
+                        # The stretch past the event is stepped like any other,
+                        # so it is densified like any other.
+                        if (
+                            resume_eval is None
+                            and self._n_densifier > 1
+                            and sol_event.t.size > 1
+                        ):
+                            resume_t = self._densify_epochs(sol_event.t)
+                            resume_y = sol_event.sol(resume_t)
+                        else:
+                            resume_t = sol_event.t
+                            resume_y = sol_event.y
+
+                        # Combine the initial and resumed solutions; [1:] drops
+                        # the repeat of the event epoch, which densifying keeps
+                        # exactly where it was.
                         self._ode_sol.t = np.concatenate(
-                            (self._ode_sol.t, sol_event.t[1:])
+                            (self._ode_sol.t, resume_t[1:])
                         )
                         self._ode_sol.y = np.concatenate(
-                            (self._ode_sol.y, sol_event.y[:, 1:]), axis=1
+                            (self._ode_sol.y, resume_y[:, 1:]), axis=1
                         )
 
                 # Flip to ascending time order for backward propagation so that
@@ -1812,8 +2432,14 @@ class Propagator:
 
         # Convert the propagated state back to the original frames
         if self._convert_to_original_frame:
+            # A (t0, tf) tuple declares no grid, so the epochs the integrator
+            # produced are the ones to convert on.
+            output_epochs = (
+                self._times if isinstance(self.tspan, tuple) else self.tspan
+            )
+
             # Preallocate list
-            propagated_states_original = [None] * self.tspan.size
+            propagated_states_original = [None] * output_epochs.size
 
             # Convert full_state to a NumPy array for efficient indexing
             full_state_array = np.array(full_state)
@@ -1821,10 +2447,14 @@ class Propagator:
             original_frames = self._original_frames  # Avoid repeated attribute lookups
 
             # Create epoch array for frame transformations
-            epochs_array = self.tspan_original_frame
+            epochs_array = (
+                self._times
+                if isinstance(self._tspan_original_frame, tuple)
+                else self.tspan_original_frame
+            )
 
             # Extract state components for all time steps in one pass
-            for i, epoch in enumerate(self.tspan):
+            for i, epoch in enumerate(output_epochs):
                 # print(i)
                 current_state_values = full_state_array[i]  # Extract state at time `i`
                 state_components = []
@@ -1863,7 +2493,9 @@ class Propagator:
 
                 # Create final StateArray with converted components
                 propagated_states_original[i] = StateArray(
-                    epoch=epoch, origin=self.origin, state=state_components
+                    epoch=epoch,
+                    origin=self._prop_origin,
+                    state=StateDefinition.from_components(state_components),
                 )
 
             # Store in class
@@ -1960,6 +2592,7 @@ class Propagator:
         atol: float | None = None,
         rtol: float | None = None,
         integrator: str | None = None,
+        n_densifier: int | None = None,
         propagate_STM: bool | None = None,
         STM0: np.ndarray | None = None,
         look_event: str | None = None,
@@ -1968,6 +2601,7 @@ class Propagator:
         maneuver: Maneuver = None,
         force_models: Optional[Union[ForceModel, Sequence[ForceModel]]] = None,
         backward: bool | None = None,
+        dormant_parameters: Iterable[tuple[str, int]] | None = None,
     ) -> "Propagator":
         """
         Reconfigure the propagator with updated inputs and rebuild its internal state.
@@ -1986,8 +2620,11 @@ class Propagator:
             Updated absolute / relative tolerances.
         integrator : str, optional
             Updated integrator identifier.
+        n_densifier : int, optional
+            Updated number of sub-intervals per integration step.
         propagate_STM : bool, optional
-            Whether to propagate the STM.
+            Whether to propagate the STM. Not yet supported with
+            ``integrator="IAS15"`` (see :class:`Propagator.IAS15STMError`).
         STM0 : np.ndarray, optional
             Updated initial STM (flattened or matrix); reshaped internally.
         look_event : str, optional
@@ -2001,6 +2638,15 @@ class Propagator:
         force_model : ForceModel or sequence of ForceModel, optional
             Replace the current force model set with the provided one(s).
             Each will be re-initialized against the (possibly updated) state.
+        backward : bool, optional
+            Whether to integrate backward in time.
+        dormant_parameters : iterable of (str, int), optional
+            ``(name, spice_id)`` of static state components carried through
+            this arc without acting on it. They keep their value and an
+            identity STM block, and the force models never see them. Used by
+            :class:`~scarabaeus.ScenarioSetup` to keep one parameter across the
+            arcs that do not model it (e.g. a thrust group resumed after a
+            coast). An empty iterable clears the set.
 
         Returns
         -------
@@ -2019,14 +2665,31 @@ class Propagator:
             self._prop_origin = state_vector.origin
             self._t0 = state_vector.epoch
 
-        # Update tspan
+        # Update tspan. Track the force-model rebind times (fm_t0/fm_tf); they are
+        # left as None when tspan is not updated this call so that they fall back
+        # to the existing tspan below -- the force models are re-bound on EVERY
+        # reinitialize (e.g. the OD filter calls reinitialize(state_vector=...)
+        # with no tspan between iterations) and always need valid t0/tf.
+        fm_t0 = None
+        fm_tf = None
         if tspan is not None:
             self._tspan_original_frame = copy.deepcopy(tspan)
-            self._tspan = (
-                copy.deepcopy(tspan).to(sys="TDB")
-                if tspan.system != "TDB"
-                else copy.deepcopy(tspan)
-            )
+            self._tspan = copy.deepcopy(tspan)
+
+            # normalize to TDB and find new force model times (raw ET)
+            match self._tspan:
+                case EpochArray():
+                    if self._tspan.system != "TDB":
+                        self._tspan = self._tspan.to(sys="TDB")
+                    fm_t0 = float(self._tspan.et[0])
+                    fm_tf = float(self._tspan.et[-1])
+                case tuple():
+                    self._tspan = tuple(
+                        t.to(sys="TDB") if t.system != "TDB" else t
+                        for t in self._tspan
+                    )
+                    fm_t0 = float(self._tspan[0].et)
+                    fm_tf = float(self._tspan[1].et)
 
         # If t0 not set yet (e.g. only tspan passed), try to infer from tspan
         if getattr(self, "_t0", None) is None and hasattr(self, "_tspan"):
@@ -2034,6 +2697,29 @@ class Propagator:
                 self._t0 = self._tspan[0]
             except Exception:
                 pass
+
+        # When tspan was not updated this call, derive the force-model rebind
+        # times from the existing tspan so fm_t0/fm_tf are always defined.
+        if fm_t0 is None or fm_tf is None:
+            existing_tspan = getattr(self, "_tspan", None)
+            match existing_tspan:
+                case EpochArray():
+                    ts = (
+                        existing_tspan
+                        if existing_tspan.system == "TDB"
+                        else existing_tspan.to(sys="TDB")
+                    )
+                    fm_t0 = float(ts.et[0])
+                    fm_tf = float(ts.et[-1])
+                case tuple() if len(existing_tspan) >= 2:
+                    t0e, tfe = existing_tspan[0], existing_tspan[-1]
+                    fm_t0 = float((t0e.to(sys="TDB") if t0e.system != "TDB" else t0e).et)
+                    fm_tf = float((tfe.to(sys="TDB") if tfe.system != "TDB" else tfe).et)
+                case _:
+                    raise RuntimeError(
+                        "Propagator.reinitialize: cannot determine force-model "
+                        "times; no valid tspan is set on the propagator."
+                    )
 
         # Update backward flag
         if backward is not None:
@@ -2050,14 +2736,19 @@ class Propagator:
             self._rtol = rtol
         if integrator is not None:
             self._integrator = integrator
+        if n_densifier is not None:
+            self._n_densifier = self._validate_densifier(n_densifier)
+            self._n_densifier_explicit = True
         if propagate_STM is not None:
             self._propagate_STM = propagate_STM
         if look_event is not None:
             self._look_event = look_event
         if base_frame is not None:
-            self.base_frame = base_frame
+            self._base_frame = base_frame
         if convert_to_original_frame is not None:
             self._convert_to_original_frame = convert_to_original_frame
+        if dormant_parameters is not None:
+            self._dormant_parameters = frozenset(dormant_parameters)
 
         # Update STM0
         if STM0 is not None:
@@ -2096,16 +2787,16 @@ class Propagator:
 
         # Re-bind all force models to the (possibly updated) state & frame
         for fm in self._force_models:
-            fm.initialize_force_models(
-                state_vector=self._full_state_vector,
-                base_frame=self.base_frame,
-            )
+            fm.initialize_force_models(state_vector = self._full_state_vector,
+                                       base_frame   = self.base_frame,
+                                       t0           = fm_t0,
+                                       tf           = fm_tf)
 
         # Internal frame work & consistency checks
         self._convert_to_base_frame()
         self._validate_configuration()
 
-        # Rebuild reduced state & integration arrays
+        # Rebuild reduced state & integration arrays    
         self._create_reduced_state_vector()
 
         n_state = self._full_state_vector.size
@@ -2113,13 +2804,21 @@ class Propagator:
             # If STM0 not set yet, default to identity
             self._STM0 = np.identity(n_state).reshape(n_state**2)
 
-        # Resize integration storage
+        # Resize integration storage. As in the constructor, a (t0, tf) tuple
+        # leaves the number of output times up to the integrator, so only the
+        # initial condition can be allocated here.
+        match self.tspan:
+            case EpochArray():
+                init_size = self.tspan.size
+            case tuple():
+                init_size = 1
+
         self._ys = np.zeros(
-            (self.tspan.size, self._reduced_state_vector.size + self._STM0.size)
+            (init_size, self._reduced_state_vector.size + self._STM0.size)
         )
         self._As = np.zeros((0, n_state, n_state))
         self._As_list = []
-        self._times = np.zeros((self.tspan.size, 1))
+        self._times = np.zeros((init_size, 1))
 
         # Initial condition: reduced state at t0 + STM0
         self._ys[0] = np.concatenate(
@@ -2150,88 +2849,103 @@ class Propagator:
         """
         force_models_data = []
         for fm in getattr(self, "_force_models", []):
-            if hasattr(fm, "to_dict"):
-                force_models_data.append(
-                    {
-                        "class": fm.__class__.__name__,
-                        "config": fm.to_dict(),
-                    }
-                )
-            else:
-                force_models_data.append(
-                    {
-                        "class": fm.__class__.__name__,
-                        "config": None,
-                    }
-                )
+            force_models_data.append(
+                {
+                    "class": fm.__class__.__name__,
+                    "config": fm.to_dict() if hasattr(fm, "to_dict") else None,
+                }
+            )
 
         return {
             "primary_body": (
-                self._primary_body.name
+                owner_to_dict(self._primary_body)
                 if getattr(self, "_primary_body", None) is not None
                 else None
             ),
             "base_frame": self.base_frame.name if hasattr(self, "base_frame") else None,
             "convert_to_original_frame": self._convert_to_original_frame,
             "state_vector": self._full_state_vector_original_frames.to_dict(),
-            "tspan": self._tspan_original_frame.to_dict(),
+            "tspan": self._tspan_to_dict(),
             "atol": self._atol,
             "rtol": self._rtol,
             "integrator": self._integrator,
+            # None when left at the default, so from_dict does not turn the
+            # default into an explicit request (that one is checked against
+            # EpochArray grids and IAS15).
+            "n_densifier": self._n_densifier if self._n_densifier_explicit else None,
             "propagate_STM": self._propagate_STM,
-            "STM0": self._STM0.tolist() if hasattr(self, "_STM0") else None,
+            "STM0": (
+                self._STM0.tolist()
+                if getattr(self, "_STM0", None) is not None
+                else None
+            ),
             "look_event": self._look_event,
             "mass_is_variable": self._mass_is_variable,
+            "display_progress": self._display_progress,
+            "backward": getattr(self, "_backward", False),
             "force_models": force_models_data,
         }
+
+    def _tspan_to_dict(self) -> dict:
+        """Serialize ``tspan`` (an EpochArray or a (t0, tf) tuple of EpochArrays)."""
+        tspan = self._tspan_original_frame
+        if isinstance(tspan, tuple):
+            return {"kind": "tuple", "data": [t.to_dict() for t in tspan]}
+        return {"kind": "epoch_array", "data": tspan.to_dict()}
+
+    @staticmethod
+    def _tspan_from_dict(d) -> "EpochArray | tuple":
+        """Inverse of :meth:`_tspan_to_dict`."""
+        if isinstance(d, dict) and d.get("kind") == "tuple":
+            return tuple(EpochArray.from_dict(x) for x in d["data"])
+        payload = d["data"] if isinstance(d, dict) and "kind" in d else d
+        return EpochArray.from_dict(payload)
 
     @classmethod
     def from_dict(cls, data: dict) -> "Propagator":
         """
-        Reconstruct a Propagator instance from a dictionary produced by ``to_dict``.
+        Reconstruct a Propagator from a dict produced by :meth:`to_dict`.
 
-        This expects that each serialized force model entry provides enough
-        information (via `"class"` and `"config"`) to reconstruct the
-        corresponding :class:`ForceModel` subclass.
+        The reconstructed Propagator reproduces the original setup: rebuilding
+        it and calling :meth:`propagate` yields the same propagated states. The
+        single ``primary_body`` instance is reused as the owner of the matching
+        state components so the spacecraft is not duplicated.
 
         Parameters
         ----------
         data : dict
             Serialized propagator configuration.
-
-        Returns
-        -------
-        Propagator
-            A new Propagator instance with reconstructed state, time span,
-            and force models.
         """
         # --- Core objects ---
-        primary_name = data.get("primary_body")
-        primary_body = Spacecraft(primary_name) if primary_name is not None else None
+        primary_body = (
+            owner_from_dict(data["primary_body"])
+            if data.get("primary_body") is not None
+            else None
+        )
 
         base_frame_name = data.get("base_frame")
         base_frame = Frame(base_frame_name) if base_frame_name is not None else J2000
 
-        state_vector = StateArray.from_dict(data["state_vector"])
-        tspan = EpochArray.from_dict(data["tspan"])
+        owner_overrides = (
+            {primary_body.spice_id: primary_body} if primary_body is not None else {}
+        )
+        state_vector = StateArray.from_dict(
+            data["state_vector"], owner_overrides=owner_overrides
+        )
+        tspan = cls._tspan_from_dict(data["tspan"])
 
-        # --- Rebuild force models ---
-        force_models_cfg = data.get("force_models", [])
+        # --- Rebuild force models (primary_body / t0 re-supplied here) ---
         force_models = []
-
-        for fm_info in force_models_cfg:
+        for fm_info in data.get("force_models", []):
             cls_name = fm_info.get("class")
             cfg = fm_info.get("config", None)
 
-            # You can expand this mapping as you add more subclasses.
             if cls_name == "ForceModelTranslation":
-                if hasattr(ForceModelTranslation, "from_dict") and cfg is not None:
-                    fm = ForceModelTranslation.from_dict(cfg)
-                else:
-                    # Minimal fallback: require primary body and basic flags in cfg
+                if cfg is None:
                     raise ValueError(
-                        "ForceModelTranslation config missing or from_dict not implemented."
+                        "ForceModelTranslation config missing in serialized data."
                     )
+                fm = ForceModelTranslation.from_dict(cfg, primary_body=primary_body)
             elif cls_name == "ForceModelRotation":
                 fm = ForceModelRotation()
             else:
@@ -2239,7 +2953,6 @@ class Propagator:
                     f"Unknown or unsupported ForceModel subclass '{cls_name}' "
                     "in Propagator.from_dict."
                 )
-
             force_models.append(fm)
 
         if not force_models:
@@ -2253,36 +2966,111 @@ class Propagator:
         STM0 = np.array(stm0_arr) if stm0_arr is not None else None
 
         # --- Instantiate Propagator ---
-        prop = cls(
+        return cls(
             primary_body=primary_body,
             state_vector=state_vector,
             tspan=tspan,
-            force_model=force_models,
+            force_models=force_models,
             base_frame=base_frame,
             atol=data.get("atol", 2.220446049250313e-14),
             rtol=data.get("rtol", 2.220446049250313e-14),
             integrator=data.get("integrator", "DOP853"),
+            n_densifier=data.get("n_densifier"),
             propagate_STM=data.get("propagate_STM", True),
             STM0=STM0,
             look_event=data.get("look_event"),
             convert_to_original_frame=data.get("convert_to_original_frame", False),
             mass_is_variable=data.get("mass_is_variable", False),
+            display_progress=data.get("display_progress", True),
+            backward=data.get("backward", False),
         )
 
-        return prop
+    def save(self, filepath, fmt: str = None) -> "Path":
+        """
+        Save this Propagator's reproducible configuration to a JSON or pickle file.
+
+        The file can be reloaded with :meth:`load` to reconstruct an equivalent
+        Propagator. The on-disk format follows ``fmt`` (``"json"`` or
+        ``"pickle"``); when ``fmt`` is ``None`` it is inferred from the file
+        extension (``.pkl`` or ``.pickle`` gives pickle, otherwise JSON). Returns the
+        resolved path.
+        """
+        return _dump_serialized(self.to_dict(), filepath, fmt=fmt)
+
+    @classmethod
+    def load(cls, filepath, fmt: str = None) -> "Propagator":
+        """Reconstruct a Propagator from a file written by :meth:`save`.
+
+        Reads JSON or pickle; the format follows ``fmt`` or is inferred from the
+        file extension.
+        """
+        return cls.from_dict(_load_serialized(filepath, fmt=fmt))
+
+    def _batch_grid_models(self) -> list:
+        """
+        Return the sub-models in play that live on a batch grid.
+
+        These are the piecewise Gauss-Markov and piecewise polynomial models:
+        their dynamics jump (or kink) at batch boundaries, so the integrator
+        must stop there. The sub-model is what owns the batch grid in raw ET;
+        the force model wrapping it also answers to ``t0``, but that one is
+        rebound to whichever leg is being propagated.
+
+        Returns
+        -------
+        list of PiecewiseFirstOrderGaussMarkov or PiecewisePolynomialAcceleration
+        """
+        batch_models = []
+        for fm in self._force_models:
+            inner_models = getattr(fm, "force_models", None)
+            if isinstance(inner_models, dict):
+                for key in (
+                    "PiecewiseFirstOrderGaussMarkov",
+                    "PiecewisePolynomialAcceleration",
+                ):
+                    model = inner_models.get(key)
+                    if model is not None:
+                        batch_models.append(model)
+        return batch_models
 
     def _sync_fm_spacecraft_mass_profile(self) -> None:
-        """Push the primary body's current mass profile into FiniteBurn sub-models."""
-        updated_profile = self._primary_body.mass_profile
+        """
+        Share the primary body's mass history with every sub-model holding a
+        copy of that spacecraft.
+
+        Force models are deep-copied when the propagator is built, so each
+        sub-model that scales with mass (SRP, thrust) carries its own copy of
+        the spacecraft, frozen at construction. The mass profile is fitted onto
+        the propagator's own body, so without this the copies keep whatever
+        history existed when they were cloned: harmless while the mass is still
+        a constant, but wrong the moment a previous propagation has turned it
+        into a polynomial, since the copy's profiles then cover the wrong span.
+
+        The profile lists are shared rather than copied, so later legs appending
+        to the primary body stay visible to the sub-models: one spacecraft, one
+        mass history.
+        """
+        primary = self._primary_body
+        primary_id = getattr(primary, "spice_id", None)
+
         for fm in self._force_models:
-            inner_models = getattr(fm, "force_models", {})
-            fb = (
-                inner_models.get("FiniteBurn")
-                if isinstance(inner_models, dict)
-                else None
+            inner_models = getattr(fm, "force_models", None)
+            models = (
+                list(inner_models.values()) if isinstance(inner_models, dict) else []
             )
-            if fb is not None and hasattr(fb, "_spacecraft"):
-                fb._spacecraft._mass_profile = updated_profile
+            models.append(fm)
+
+            for model in models:
+                spacecraft = getattr(model, "_spacecraft", None)
+                if spacecraft is None or spacecraft is primary:
+                    continue
+                if getattr(spacecraft, "spice_id", None) != primary_id:
+                    continue
+
+                spacecraft._mass_profile = primary._mass_profile
+                spacecraft._mass_units = primary._mass_units
+                spacecraft._mass_profiles = primary._mass_profiles
+                spacecraft._mass_profiles_tspan = primary._mass_profiles_tspan
 
     def _initialize_mass_profile(self):
         """
@@ -2291,18 +3079,23 @@ class Propagator:
         If the associated force model defines a maneuver (finite burn with
         prescribed mass flow), integrate m(t) over the propagation timespan.
         Otherwise, assume constant mass over [t0, tf] and fit a trivial profile.
+
+        The constant is the mass the spacecraft has when this leg starts: the
+        previously stored profile is sampled at ``t0`` (clamped into the span it
+        was fitted over), so a coast leg following a burn carries the burn's
+        propellant consumption forward instead of resetting to the pre-burn mass.
         """
 
-        # Short-hands for times
+        # Short-hands for times (raw ET, rep-independent)
         match self._tspan:
             case EpochArray():
                 # EpochArray configuration
-                t0 = self._tspan.times.values[0]
-                tf = self._tspan.times.values[-1]
+                t0 = float(self._tspan.et[0])
+                tf = float(self._tspan.et[-1])
             case tuple():
                 # tuple of t0, tf EpochArrays configuration
-                t0 = self._tspan[0].times.values
-                tf = self._tspan[1].times.values
+                t0 = float(self._tspan[0].et)
+                tf = float(self._tspan[1].et)
 
         # Select the relevant force model for the primary spacecraft
         # Prefer a model explicitly tied to this spacecraft/body if available.
@@ -2330,17 +3123,26 @@ class Propagator:
             # Initial total mass at t0
             m0 = self._primary_body.mass(t0)
 
+            # Maneuver stores mass_flow coefficients highest degree first (the
+            # constant rate is the last entry), the same ordering FiniteBurn
+            # evaluates thrust with. Reversing them turns a constant rate into
+            # the t^6 coefficient of an absolute-ET polynomial.
+            mass_flow_coeffs = np.asarray(maneuver.mass_flow.values, dtype=float)
+
             def mass_dynamics(t, m):
-                # maneuver.mass_flow assumed as polynomial coefficients
-                poly = np.poly1d(maneuver.mass_flow.values[::-1])
-                m_dot = poly(t)
-                return -m_dot
+                return -np.polyval(mass_flow_coeffs, t)
+
+            # epochs to sample the mass profile at (raw ET, rep-independent);
+            # a (t0, tf) tuple has no inner grid -> let the solver choose
+            t_eval_mass = (
+                self._tspan.et if isinstance(self._tspan, EpochArray) else None
+            )
 
             sol = solve_ivp(
                 mass_dynamics,
                 t_span=(t0, tf),
                 y0=[m0.values],
-                t_eval=self._tspan.times.values,
+                t_eval=t_eval_mass,
                 method=self._integrator,
                 rtol=self._rtol,
                 atol=self._atol,
@@ -2373,8 +3175,17 @@ class Propagator:
                 m_val = float(np.asarray(mass_profile.values).ravel()[0])
                 m_units = mass_profile.units
             else:
-                # polynomial — read value at any valid stored time
-                t_valid = float(self._primary_body._mass_profiles_tspan[-1][0])
+                # polynomial — sample it at THIS leg's start, clamped into the
+                # span the stored profile was fitted over. Reading the span's
+                # first sample instead would rewind the mass to what it was when
+                # the previous leg began, throwing away the propellant a
+                # preceding burn consumed.
+                t_span_prev = np.asarray(
+                    self._primary_body._mass_profiles_tspan[-1], dtype=float
+                ).ravel()
+                t_lo = float(min(t_span_prev[0], t_span_prev[-1]))
+                t_hi = float(max(t_span_prev[0], t_span_prev[-1]))
+                t_valid = float(np.clip(t0, t_lo, t_hi))
                 poly = self._primary_body._mass_profiles[-1]
                 m_val = float(poly(t_valid))
                 m_units = self._primary_body._mass_units
@@ -2388,3 +3199,4 @@ class Propagator:
                 units=m_units,
             )
             self._mass_profile = self._primary_body.mass_profile
+            self._sync_fm_spacecraft_mass_profile()

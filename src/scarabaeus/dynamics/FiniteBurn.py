@@ -25,18 +25,20 @@ km, sec, rad, N, m, kN, kg = Units.get_units(["km", "sec", "rad", "N", "m", "kN"
 #  Class Definition  #
 # --------------------#
 class FiniteBurn(DynamicModel):
-    """ Models the acceleration induced by a finite-duration burn with estimable thrust
-    magnitude and pointing-bias parameters.
+    """ Models the acceleration induced by a finite-duration burn with estimable
+    thrust magnitude and pointing-bias parameters.
 
-    This model represents a continuous thrust arc in which the spacecraft acceleration
-    is computed from the commanded thrust magnitude, the spacecraft mass, and the thrust
-    direction. In addition to the nominal maneuver polynomials, the model supports three
-    estimable parameters retrieved from the ``StateArray`` and
-    optionally overridden at runtime through ``current_state``:
+    This model represents a continuous thrust arc in which the spacecraft
+    acceleration is computed from the commanded thrust magnitude, the spacecraft
+    mass, and the thrust direction. In addition to the nominal maneuver
+    polynomials, the model supports three estimable parameters read from the
+    propagated state ``current_state``:
 
     * ``k_thrust`` (unitless): multiplicative scale factor on thrust magnitude.
-    * ``dRA`` (rad): additive right-ascension bias applied to the nominal thrust direction.
-    * ``dDEC`` (rad): additive declination bias applied to the nominal thrust direction.
+    * ``dRA`` (rad): additive right-ascension bias applied to the nominal thrust
+      direction.
+    * ``dDEC`` (rad): additive declination bias applied to the nominal thrust
+      direction.
 
     The acceleration is computed as
 
@@ -46,7 +48,7 @@ class FiniteBurn(DynamicModel):
         = \\frac{k_{\\mathrm{thrust}}\\,T(t)}{m(t)}\\,\\hat{\\mathbf{u}}(t)
 
     where :math:`T(t)` is the thrust magnitude in kN and :math:`m(t)` is
-    spacecraft mass in kg; dividing kN by kg gives km/s² directly.
+    spacecraft mass in kg; dividing kN by kg gives km/s^2 directly.
     The unit direction :math:`\\hat{\\mathbf{u}}(t)` is formed
     from biased angles
 
@@ -66,37 +68,39 @@ class FiniteBurn(DynamicModel):
         \\sin\\delta
         \\end{bmatrix}.
 
-    The nominal angles :math:`(\\alpha_0,\\delta_0)` are obtained in one of two ways:
+    The nominal angles :math:`(\\alpha_0,\\delta_0)` are obtained in one of two
+    ways:
 
-    1. If the maneuver object provides ``maneuver.ra`` and ``maneuver.dec`` polynomials,
-       they are evaluated directly.
+    1. If the maneuver object provides ``maneuver.ra`` and ``maneuver.dec``
+       polynomials, they are evaluated directly.
     2. Otherwise, the direction is derived from the evaluated direction-component
-       polynomials ``maneuver.ux``, ``maneuver.uy``, ``maneuver.uz`` by normalization and
-       conversion to :math:`(\\alpha_0,\\delta_0)`.
+       polynomials ``maneuver.ux``, ``maneuver.uy``, ``maneuver.uz`` by
+       normalization and conversion to :math:`(\\alpha_0,\\delta_0)`.
 
     Parameters
     ----------
     spacecraft : Spacecraft
-        Spacecraft object providing the mass model ``spacecraft.mass(epoch)`` used in the
-        thrust-to-acceleration conversion.
-
+        Spacecraft object providing the mass model ``spacecraft.mass(epoch)``
+        used in the thrust-to-acceleration conversion.
     base_frame : Frame
         Reference frame in which the burn acceleration is returned.
-
     maneuver : Maneuver
-        Maneuver definition providing thrust magnitude and direction polynomials. Required
-        fields are ``thrust`` and either:
-          * ``ra`` and ``dec`` polynomials, or
-          * ``ux``, ``uy``, ``uz`` direction-component polynomials.
+        Maneuver definition providing thrust magnitude and direction
+        polynomials. Required fields are ``thrust`` and either the ``ra`` and
+        ``dec`` polynomials, or the ``ux``, ``uy``, ``uz`` direction-component
+        polynomials.
 
-    state_vector : StateArray
-        StateArray used to initialize cached defaults for ``k_thrust``, ``dRA``, and
-        ``dDEC`` (keyed by owner ``spice_id``).
+    See Also
+    --------
+    scarabaeus.CannonballSRP : Reads an estimable SRP scale factor from the state the same way.
+    scarabaeus.Maneuver : Provides maneuver polynomials for thrust magnitude and direction.
+    scarabaeus.Spacecraft : Provides mass model required for thrust-to-acceleration conversion.
+    scarabaeus.ImpulsiveBurn : Instantaneous delta-v model.
 
     Notes
     -----
-    During initialization, the class scans the provided ``StateArray`` and caches default
-    values for each estimable parameter keyed by the owner's ``spice_id``. Expected state
+    The estimable parameters are read from the propagated state on every
+    evaluation, keyed by ``(name, spice_id)`` of the owner. Expected state
     entries are of the form:
 
     .. code-block:: python
@@ -105,25 +109,22 @@ class FiniteBurn(DynamicModel):
         ("dRA",      1, "estimated", "static", owner, ArrayWUnits(0.0, "rad"))
         ("dDEC",     1, "estimated", "static", owner, ArrayWUnits(0.0, "rad"))
 
-    At runtime the parameter resolution priority is: (1) cached initialization values,
-    (2) ``current_state[(name, spice_id)]`` if present (allowing filter/OD updates),
-    (3) a conservative fallback (``k_thrust=1``, ``dRA=0``, ``dDEC=0``).
+    The parameter resolution priority is (see :meth:`_get_param`):
+    (1) ``current_state[(name, spice_id)]`` if present, (2) a value a caller
+    pushed into :attr:`k_thrust_map`, :attr:`dra_map` or :attr:`ddec_map`,
+    (3) an indexed entry such as ``("k_thrust1", spice_id)`` in
+    ``current_state``, (4) a conservative fallback (``k_thrust=1``, ``dRA=0``,
+    ``dDEC=0``).
 
     The model provides analytic partial derivatives:
-    :math:`\\partial\\mathbf{a}/\\partial k_{\\mathrm{thrust}}` (3×1) and
-    :math:`\\partial\\mathbf{a}/\\partial[d\\alpha\\; d\\delta]` (3×2).  The acceleration
-    is position-independent, so :meth:`_compute_partial_by_position` returns zeros.
+    :math:`\\partial\\mathbf{a}/\\partial k_{\\mathrm{thrust}}` of shape (3, 1)
+    and :math:`\\partial\\mathbf{a}/\\partial[d\\alpha,\\ d\\delta]` of shape
+    (3, 2). The acceleration is position-independent, so
+    :meth:`_compute_partial_by_position` returns zeros.
 
     The RA/DEC bias parameterization becomes ill-conditioned near the poles
     (:math:`\\cos\\delta \\to 0`). If near-polar thrusting is expected, a local
     tangent-plane perturbation may be preferable.
-
-    See Also
-    --------
-    scarabaeus.CannonballSRP : Uses the same StateArray-scan pattern for an estimable SRP scale factor.
-    scarabaeus.Maneuver : Provides maneuver polynomials for thrust magnitude and direction.
-    scarabaeus.Spacecraft : Provides mass model required for thrust-to-acceleration conversion.
-    scarabaeus.ImpulsiveBurn : Instantaneous delta-v model.
 
     Examples
     --------
@@ -142,7 +143,7 @@ class FiniteBurn(DynamicModel):
         state_vector = scb.StateArray(epoch=epochs[0], frame="J2000", origin=scb.CelestialBody("Earth"), state=state)
 
         # Create the model
-        fb = FiniteBurn(spacecraft=sc, base_frame="J2000", maneuver=man, state_vector=state_vector)
+        fb = FiniteBurn(spacecraft=sc, base_frame="J2000", maneuver=man)
 
         # During OD/filtering, override values through current_state:
         current_state = {
@@ -162,19 +163,18 @@ class FiniteBurn(DynamicModel):
         spacecraft: Spacecraft,
         base_frame: Frame,
         maneuver: Maneuver,
-        state_vector: StateArray,
     ):
         # take in arguments
         self.maneuver = maneuver
         self._ref_frame = base_frame
         self._spacecraft = spacecraft
-        self._state_vector = state_vector
 
-        # Cache params per owner (spice_id)
+        # Estimable burn parameters are read from the propagated state on every
+        # evaluation (see _get_param). These maps stay as an override hook for
+        # callers that push a value in directly.
         self._k_thrust_map: dict[int, float] = {}
         self._dra_map: dict[int, float] = {}
         self._ddec_map: dict[int, float] = {}
-        self._initialize_param_maps(state_vector)
 
     # -------------------------#
     # region ====> Properties #
@@ -195,30 +195,35 @@ class FiniteBurn(DynamicModel):
         return self._spacecraft
 
     @property
-    def state_vector(self) -> StateArray:
-        """
-        StateArray used to initialize cached estimable-parameter defaults.
-        """
-        return self._state_vector
-
-    @property
     def k_thrust_map(self) -> dict[int, float]:
         """
-        Cached default thrust scale factors (unitless) keyed by owner spice_id.
+        Caller-supplied thrust scale-factor overrides (unitless), keyed by owner
+        ``spice_id``.
+
+        Empty by default; an entry here is used only when ``current_state`` holds
+        no ``("k_thrust", spice_id)`` entry (see :meth:`_get_param`).
         """
         return self._k_thrust_map
 
     @property
     def dra_map(self) -> dict[int, float]:
         """
-        Cached default RA biases (rad) keyed by owner spice_id.
+        Caller-supplied right-ascension bias overrides, in rad, keyed by owner
+        ``spice_id``.
+
+        Empty by default; an entry here is used only when ``current_state`` holds
+        no ``("dRA", spice_id)`` entry (see :meth:`_get_param`).
         """
         return self._dra_map
 
     @property
     def ddec_map(self) -> dict[int, float]:
         """
-        Cached default DEC biases (rad) keyed by owner spice_id.
+        Caller-supplied declination bias overrides, in rad, keyed by owner
+        ``spice_id``.
+
+        Empty by default; an entry here is used only when ``current_state`` holds
+        no ``("dDEC", spice_id)`` entry (see :meth:`_get_param`).
         """
         return self._ddec_map
 
@@ -245,72 +250,73 @@ class FiniteBurn(DynamicModel):
 
     def _base_param_name(self, name: str) -> str:
         """
-        Return the base estimable-parameter name by stripping a trailing
-        maneuver index, if present.
+        Strip a trailing maneuver index from an estimable-parameter name.
+
+        Parameters
+        ----------
+        name : str
+            Parameter name, possibly indexed, e.g. ``"dRA2"``.
+
+        Returns
+        -------
+        str
+            The name with surrounding whitespace and trailing digits removed.
 
         Examples
         --------
-        "k_thrust"  -> "k_thrust"
-        "k_thrust1" -> "k_thrust"
-        "dRA2"      -> "dRA"
-        "dDEC3"     -> "dDEC"
+        .. code-block:: python
+
+            fb._base_param_name("k_thrust")   # "k_thrust"
+            fb._base_param_name("k_thrust1")  # "k_thrust"
+            fb._base_param_name("dRA2")       # "dRA"
+            fb._base_param_name("dDEC3")      # "dDEC"
         """
         return re.sub(r"\d+$", "", str(name).strip())
-
-    def _initialize_param_maps(self, state_array: StateArray) -> None:
-        """
-        Scan the StateArray and store default values per owner (spice_id).
-
-        Expected entries (examples):
-          ("k_thrust", 1, "estimated", "static", sc, ArrayWUnits(1.0, None))
-          ("dRA",      1, "estimated", "static", sc, ArrayWUnits(0.0, "rad"))
-          ("dDEC",     1, "estimated", "static", sc, ArrayWUnits(0.0, "rad"))
-        """
-        for entry in state_array.state:
-            if len(entry) < 6:
-                continue
-
-            name, _, _, _, owner, raw_val = entry
-            name_base = self._base_param_name(name)
-            if name_base not in ("k_thrust", "dRA", "dDEC"):
-                continue
-
-            spice_id = getattr(owner, "spice_id", None)
-            if spice_id is None:
-                raise ValueError(
-                    f"FiniteBurn: '{name}' entry requires an owner with 'spice_id'. Got owner={owner!r}."
-                )
-
-            # Extract numeric value robustly (same style as CannonballSRP)
-            if hasattr(raw_val, "quantity"):
-                vals = raw_val.quantity.values
-            elif hasattr(raw_val, "values"):
-                vals = raw_val.values
-            else:
-                vals = raw_val
-
-            v = float(np.atleast_1d(vals)[0])
-
-            if name_base == "k_thrust":
-                self._k_thrust_map[spice_id] = v
-            elif name_base == "dRA":
-                self._dra_map[spice_id] = v
-            elif name_base == "dDEC":
-                self._ddec_map[spice_id] = v
 
     def _get_param(
         self, current_state: dict, body: Body, name: str, default: float
     ) -> float:
         """
-        Resolve parameter for a given body (owner) with priority:
-          1) cached from StateArray maps
-          2) current_state[(name, spice_id)] if present
-          3) fallback default
+        Resolve an estimable burn parameter for one owner.
+
+        The lookup order is:
+
+        1. ``current_state[(name, spice_id)]``, so an estimated burn parameter
+           takes effect;
+        2. a value a caller pushed into :attr:`k_thrust_map`, :attr:`dra_map` or
+           :attr:`ddec_map`;
+        3. the first ``current_state`` entry of the same owner whose name with its
+           maneuver index stripped equals ``name``, e.g. ``("dRA2", spice_id)``;
+        4. ``default``.
+
+        Parameters
+        ----------
+        current_state : dict
+            The propagated state, keyed by ``(name, spice_id)``.
+        body : Body
+            Owner of the parameter. A body without a ``spice_id`` always gets
+            ``default``.
+        name : str
+            Base parameter name: ``"k_thrust"``, ``"dRA"`` or ``"dDEC"``.
+        default : float
+            Value returned when no entry is found.
+
+        Returns
+        -------
+        float or ArrayBox
+            The parameter value, or the traced box when autograd is tracing (see
+            :meth:`~scarabaeus.DynamicModel._scalar_from_state`).
         """
         spice_id = getattr(body, "spice_id", None)
 
-        # 1) cached
         if spice_id is not None:
+            # 1) propagated state
+            key = (name, spice_id)
+            if key in current_state:
+                val = current_state[key]
+                return self._scalar_from_state(val)
+
+            # 2) caller-supplied override
             if name == "k_thrust" and spice_id in self._k_thrust_map:
                 return self._k_thrust_map[spice_id]
             if name == "dRA" and spice_id in self._dra_map:
@@ -318,19 +324,13 @@ class FiniteBurn(DynamicModel):
             if name == "dDEC" and spice_id in self._ddec_map:
                 return self._ddec_map[spice_id]
 
-            # 2) current_state override
-            key = (name, spice_id)
-            if key in current_state:
-                val = current_state[key]
-                return float(val.values if hasattr(val, "values") else val)
-
             # also allow indexed names in current_state, e.g. k_thrust1, dRA2, dDEC3
             for (k_name, k_sid), val in current_state.items():
                 if k_sid != spice_id:
                     continue
                 if self._base_param_name(k_name) != name:
                     continue
-                return float(val.values if hasattr(val, "values") else val)
+                return self._scalar_from_state(val)
 
         # 3) fallback
         return default
@@ -365,12 +365,14 @@ class FiniteBurn(DynamicModel):
                 return values
             case 7:
                 # Evaluate the 6th-order polynomial: y = c6*t^6 + c5*t^5 + ... + c0
+                # values.values is in descending order of degree (index 0 = t^6
+                # coefficient, index 6 = constant term), so values.values[i]
+                # pairs directly with exponent (6 - i) -- no reversal needed.
                 # Coefficients carry units [base_unit/s^i]; multiplication by t^i [s^i]
                 # cancels the time dependence, so the result always carries the base unit.
-                coeffs = values.values[::-1]
-                y = sum(coeffs[i] * t ** (6 - i) for i in range(7))
+                y = sum(values.values[i] * t ** (6 - i) for i in range(7))
                 base_unit = (
-                    values.units[0]
+                    values.units[-1]
                     if isinstance(values.units, (list, np.ndarray))
                     else values.units
                 )
@@ -446,8 +448,78 @@ class FiniteBurn(DynamicModel):
 
     def _nominal_ra_dec(self, epoch: float) -> tuple[float, float]:
         """
-        Get nominal RA/DEC either from maneuver.ra/dec polynomials
-        or by converting maneuver.(ux,uy,uz) direction to angles.
+        Nominal thrust RA/DEC at ``epoch``, memoized per epoch.
+
+        :meth:`compute_acceleration` and the thrust partials all request the nominal
+        pointing at the same epoch within one RHS step, so the (epoch-only)
+        polynomial evaluation is computed once and reused. Delegates the actual
+        computation to :meth:`_compute_nominal_ra_dec`.
+
+        Parameters
+        ----------
+        epoch : float
+            Epoch at which to evaluate the nominal thrust direction, in ephemeris
+            time (seconds past J2000).
+
+        Returns
+        -------
+        tuple of float
+            ``(ra, dec)`` nominal right ascension and declination in radians.
+        """
+        if self.__dict__.get("_radec_epoch") != epoch:
+            self._radec_cache = self._compute_nominal_ra_dec(epoch)
+            self._radec_epoch = epoch
+        return self._radec_cache
+
+    def _thrust_at(self, epoch: float) -> ArrayWUnits:
+        """
+        Nominal thrust magnitude at ``epoch``, memoized per epoch.
+
+        Evaluated by :meth:`compute_acceleration` and the thrust partials at the
+        same epoch within one RHS step, so the thrust polynomial is evaluated once
+        and reused.
+
+        Parameters
+        ----------
+        epoch : float
+            Epoch at which to evaluate the thrust polynomial, in ephemeris time
+            (seconds past J2000).
+
+        Returns
+        -------
+        ArrayWUnits
+            Nominal thrust magnitude at ``epoch`` (force units, e.g. Newtons).
+        """
+        if self.__dict__.get("_thrust_epoch") != epoch:
+            self._thrust_cache = self._evaluate_polynomial(self.maneuver.thrust, epoch)
+            self._thrust_epoch = epoch
+        return self._thrust_cache
+
+    def _compute_nominal_ra_dec(self, epoch: float) -> tuple[float, float]:
+        """
+        Evaluate the nominal thrust direction as right ascension / declination.
+
+        The nominal pointing is taken directly from the ``maneuver.ra`` / ``maneuver.dec``
+        polynomials when present; otherwise it is derived by evaluating the
+        ``maneuver.(ux, uy, uz)`` direction polynomials, normalizing, and converting
+        the unit direction to angles.
+
+        Parameters
+        ----------
+        epoch : float
+            Epoch at which to evaluate the nominal thrust direction, in ephemeris
+            time (seconds past J2000).
+
+        Returns
+        -------
+        tuple of float
+            ``(ra, dec)`` nominal right ascension and declination in radians.
+
+        Raises
+        ------
+        ValueError
+            If the derived direction vector ``(ux, uy, uz)`` has zero norm, so that
+            RA/DEC cannot be defined.
         """
         if hasattr(self.maneuver, "ra") and hasattr(self.maneuver, "dec"):
             ra0 = self._evaluate_polynomial(self.maneuver.ra, epoch).values
@@ -512,7 +584,7 @@ class FiniteBurn(DynamicModel):
         """
 
         # thrust magnitude
-        T = self._evaluate_polynomial(self.maneuver.thrust, epoch)  # N
+        T = self._thrust_at(epoch)  # N
         m_sc = self._spacecraft.mass(epoch)  # kg
 
         # estimable params (Cannonball-style)
@@ -535,7 +607,7 @@ class FiniteBurn(DynamicModel):
         self, position, current_state, epoch, body
     ) -> np.ndarray:
         """
-        Return the partial derivative of finite-burn acceleration w.r.t. position.
+        Compute the partial of the burn acceleration with respect to position.
 
         Finite-burn thrust does not depend on spacecraft position, so this
         partial is identically zero.
@@ -554,7 +626,7 @@ class FiniteBurn(DynamicModel):
         Returns
         -------
         np.ndarray
-            3×3 zero matrix.
+            (3, 3) zero matrix.
         """
 
         return np.zeros((3, 3))
@@ -567,25 +639,32 @@ class FiniteBurn(DynamicModel):
         body: Body,
     ) -> np.ndarray:
         """
-        Computes the partial derivative of the spacecraft's acceleration with respect to the thrust magnitude (k_thrust) at a given epoch.
+        Compute the partial of the burn acceleration with respect to ``k_thrust``.
+
+        .. math::
+
+            \\frac{\\partial\\mathbf{a}}{\\partial k_{\\mathrm{thrust}}}
+            = \\frac{T(t)}{m(t)}\\,\\hat{\\mathbf{u}}(\\alpha_0 + d\\alpha,\\,
+            \\delta_0 + d\\delta)
 
         Parameters
         ----------
         position : np.ndarray
-            The current position vector of the spacecraft (unused in this method).
+            Current position vector of the spacecraft. Unused.
         current_state : dict
-            The current state dictionary containing possible perturbation parameters such as 'dRA' and 'dDEC'.
+            The propagated state, from which ``dRA`` and ``dDEC`` are read.
         epoch : float
-            The current epoch (time) at which to evaluate the thrust and spacecraft mass.
+            Epoch at which the thrust and spacecraft mass are evaluated, in TDB
+            seconds.
         body : Body
-            The celestial body object providing context for the maneuver and parameter retrieval.
+            Owner of the burn parameters.
 
         Returns
         -------
         np.ndarray
-            A (3, 1) array representing the partial derivative of the acceleration vector with respect to the thrust magnitude, in km/s².
+            (3, 1) partial, in km/s^2.
         """
-        T = float(self._evaluate_polynomial(self.maneuver.thrust, epoch).values)  # kN
+        T = float(self._thrust_at(epoch).values)  # kN
         m_sc = float(self._spacecraft.mass(epoch).values)
 
         ra0, dec0 = self._nominal_ra_dec(epoch)
@@ -603,30 +682,40 @@ class FiniteBurn(DynamicModel):
         body: Body,
     ) -> np.ndarray:
         """
-        Computes the partial derivatives of the acceleration vector with respect to right ascension (RA) and declination (DEC) biases.
+        Compute the partials of the burn acceleration with respect to the RA and
+        DEC biases.
 
-        This method calculates the Jacobian matrix representing the sensitivity of the thrust acceleration direction to small changes in RA and DEC biases.
-        The computation uses the current spacecraft state, epoch, and body parameters to evaluate the thrust, mass, and orientation.
+        .. math::
+
+            \\frac{\\partial\\mathbf{a}}{\\partial[d\\alpha,\\ d\\delta]}
+            = \\frac{k_{\\mathrm{thrust}}\\,T(t)}{m(t)}
+            \\left[\\frac{\\partial\\hat{\\mathbf{u}}}{\\partial\\alpha},\\
+            \\frac{\\partial\\hat{\\mathbf{u}}}{\\partial\\delta}\\right]
+
+        evaluated at the biased angles :math:`\\alpha_0 + d\\alpha` and
+        :math:`\\delta_0 + d\\delta`.
 
         Parameters
         ----------
         position : np.ndarray
-            The current position vector of the spacecraft (shape: (3,)).
+            Current position vector of the spacecraft. Unused.
         current_state : dict
-            Dictionary containing the current state parameters, including possible thrust scaling and RA/DEC biases.
+            The propagated state, from which ``k_thrust``, ``dRA`` and ``dDEC`` are
+            read.
         epoch : float
-            The current epoch (time) at which to evaluate the partial derivatives.
+            Epoch at which the thrust, mass and nominal angles are evaluated, in
+            TDB seconds.
         body : Body
-            The celestial body object providing context for the maneuver.
+            Owner of the burn parameters.
 
         Returns
         -------
         np.ndarray
-            A (3, 2) Jacobian matrix where the first column is the partial derivative with respect to RA bias,
-            and the second column is the partial derivative with respect to DEC bias.
+            (3, 2) Jacobian, in km/s^2/rad: the first column is the partial with
+            respect to ``dRA``, the second with respect to ``dDEC``.
         """
 
-        T = float(self._evaluate_polynomial(self.maneuver.thrust, epoch).values)  # kN
+        T = float(self._thrust_at(epoch).values)  # kN
         m_sc = float(self._spacecraft.mass(epoch).values)
 
         k_thrust = self._get_param(current_state, body, "k_thrust", default=1.0)
@@ -650,28 +739,32 @@ class FiniteBurn(DynamicModel):
         self, position, current_state, epoch, body
     ) -> np.ndarray:
         """
-        Computes the partial derivative of the spacecraft's acceleration with respect to thrust direction.
+        Compute the partial of the burn acceleration with respect to the thrust
+        magnitude :math:`T`.
+
+        .. math::
+
+            \\frac{\\partial\\mathbf{a}}{\\partial T}
+            = \\frac{k_{\\mathrm{thrust}}}{m(t)}\\,\\hat{\\mathbf{u}}(\\alpha_0 + d\\alpha,\\,
+            \\delta_0 + d\\delta)
 
         Parameters
         ----------
         position : np.ndarray
-            The current position vector of the spacecraft (unused in this method).
+            Current position vector of the spacecraft. Unused.
         current_state : dict
-            The current state dictionary containing parameters for the spacecraft and environment.
-        epoch : astropy.time.Time or float
-            The current epoch or time at which the computation is performed.
-        body : object
-            The celestial body or environment context for the computation.
+            The propagated state, from which ``k_thrust``, ``dRA`` and ``dDEC`` are
+            read.
+        epoch : float
+            Epoch at which the mass and nominal angles are evaluated, in TDB
+            seconds.
+        body : Body
+            Owner of the burn parameters.
 
         Returns
         -------
         np.ndarray
-            The partial derivative vector (shape: (3,)) representing the effect of thrust direction on acceleration, in km/s².
-        Notes
-        -----
-        - The thrust direction is determined by the nominal right ascension and declination, with optional deviations (`dRA`, `dDEC`) from the current state.
-        - The thrust magnitude is scaled by `k_thrust` and normalized by the spacecraft mass at the given epoch.
-        - Thrust is stored in kN, so thrust / mass gives km/s² directly.
+            (3,) partial, in km/s^2 per kN (that is, 1/kg).
         """
 
         ra0, dec0 = self._nominal_ra_dec(epoch)
@@ -687,30 +780,30 @@ class FiniteBurn(DynamicModel):
         self, position, current_state, epoch, body
     ) -> np.ndarray:
         """
-        Computes the partial derivatives of the acceleration with respect to the thrust direction components.
+        Compute the partials of the burn acceleration with respect to the thrust
+        direction components.
 
-        This method calculates the normalized acceleration magnitude based on the current thrust,
-        spacecraft mass, and a thrust scaling parameter. It returns a diagonal matrix representing
-        the partial derivatives of the acceleration with respect to each direction component.
+        Treating the three components of :math:`\\hat{\\mathbf{u}}` as independent
+        gives :math:`\\partial\\mathbf{a}/\\partial\\hat{\\mathbf{u}} =
+        (k_{\\mathrm{thrust}}\\,T/m)\\,\\mathbf{I}_3`.
 
         Parameters
         ----------
         position : np.ndarray
-            The current position vector of the spacecraft (unused in this method).
+            Current position vector of the spacecraft. Unused.
         current_state : dict
-            The current state of the spacecraft, used to extract parameters.
-        epoch : float or compatible
-            The current epoch or time at which the computation is performed.
-        body : object
-            The celestial body object, used for parameter extraction.
+            The propagated state, from which ``k_thrust`` is read.
+        epoch : float
+            Epoch at which the thrust and mass are evaluated, in TDB seconds.
+        body : Body
+            Owner of the burn parameters.
 
         Returns
         -------
         np.ndarray
-            A 3x3 diagonal matrix containing the partial derivatives of the acceleration
-            with respect to the thrust direction components, scaled appropriately.
+            (3, 3) diagonal matrix, in km/s^2.
         """
-        T = float(self._evaluate_polynomial(self.maneuver.thrust, epoch).values)
+        T = float(self._thrust_at(epoch).values)
         m_sc = float(self._spacecraft.mass(epoch).values)
         k_thrust = self._get_param(current_state, body, "k_thrust", default=1.0)
         a_norm = (k_thrust * T) / m_sc

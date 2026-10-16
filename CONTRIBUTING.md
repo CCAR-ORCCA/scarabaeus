@@ -26,18 +26,19 @@ existing functionality does not cover it.
 
 ### 1. Set up a development environment
 
-Follow the [Developer Installation](docs/online_documentation/sphinx_files/user_guide/install.rst)
-instructions (clone → venv → `pip install -e . --group dev` → `maturin develop` → `pre-commit install`).
+Fork the [GitHub repository](https://github.com/CCAR-ORCCA/scarabaeus), then follow the
+[Developer Installation](docs/online_documentation/sphinx_files/user_guide/install.rst)
+instructions on your fork (clone → venv → `pip install -e . --group dev` → `maturin develop` → `pre-commit install`).
 
 For a complete guide see [DEVELOPMENT.md](DEVELOPMENT.md).
 
 ### 2. Branch naming
 
-Branch from `develop` and use descriptive names, e.g. `feature/add-xyz`, `fix/filter-bug`.
+Branch from `main` and use descriptive names, e.g. `feature/add-xyz`, `fix/filter-bug`.
 
 ### 3. Code style
 
-- Follow the [style guide](docs/online_documentation/sphinx_files/dev_guide/style_guide.rst).
+- Follow the [style guide](docs/online_documentation/sphinx_files/development/contributing/style_guide.rst).
 - Document all public classes and methods using **NumPy-style docstrings**.
 - Do not commit Jupyter notebook outputs (`nbstripout` pre-commit hook enforces this).
 
@@ -46,15 +47,15 @@ Branch from `develop` and use descriptive names, e.g. `feature/add-xyz`, `fix/fi
 Add or update tests in `tests/` for any changed behaviour:
 
 ```bash
-pytest tests/unit_testing/       # fast, isolated
-pytest tests/integration_testing/ # end-to-end scenarios
+pytest tests/python_tests/unit_testing/       # fast, isolated
+pytest tests/python_tests/integration_testing/ # end-to-end scenarios
 ```
 
 All tests must pass before a pull request will be merged.
 
 ### 5. Submit a pull request
 
-- Open a PR against the `develop` branch.
+- Open a PR from your fork against the `main` branch.
 - Write a clear description of what changed and why.
 - Reference any related Issues (e.g. `Closes #42`).
 - A maintainer will review and may request changes before merging.

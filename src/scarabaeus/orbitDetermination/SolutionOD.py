@@ -13,12 +13,25 @@ from scarabaeus import (
     ArrayWFrame,
     StateArray,
     StateDefinition,
+    SpiceManager,
 )
 from typing import Optional, Dict, List, Tuple, Union
 import scarabaeus.utils.NumpyWrapper as np
 import json
 import pickle
+import warnings
+from datetime import datetime, timezone
 from pathlib import Path
+
+import scarabaeus
+from scarabaeus.utils.Serialization import (
+    awu_to_dict,
+    dump_json,
+    dump,
+    format_suffix,
+    to_jsonable,
+    with_format_suffix,
+)
 
 # ------------------#
 #  Generate Units  #
@@ -30,7 +43,7 @@ sec = Units.get_units("sec")
 #  Class Definition  #
 # --------------------#
 class SolutionOD:
-    """Stores and manages the results of an orbit determination process.
+    r"""Stores and manages the results of an orbit determination process.
 
     Encapsulates all outputs from a filter including state deviations, covariances,
     residuals, and optional debugging quantities. Storage is controlled by OutputSettings.
@@ -55,7 +68,8 @@ class SolutionOD:
         [n_epochs x n_states].
     deviation_cumulative : np.ndarray, optional
         Cumulative state deviation wrt the **first** (initial) reference trajectory,
-        accumulated across all iterations [n_epochs x n_states].
+        accumulated across all iterations up to and including this one
+        [n_epochs x n_states].
         Equal to ``deviation_est`` for single-iteration runs.
     state_est : np.ndarray, optional
         Absolute state estimate (reference + deviation_est) at each measurement
@@ -80,21 +94,115 @@ class SolutionOD:
     debug : dict, optional
         Debug quantities (Kalman gains, innovation covariances, NIS).
 
+    See Also
+    --------
+    scarabaeus.FilterOD : Base filter class that produces this solution.
+    scarabaeus.OutputSettings : Controls which quantities are stored.
+
     Notes
     -----
     Storage of each quantity is controlled by the flags in the associated
     :class:`~scarabaeus.OutputSettings` instance.  Quantities not selected are
     left as ``None`` and not computed during the filter run.
 
-    See Also
-    --------
-    scarabaeus.FilterOD : Base filter class that produces this solution.
-    scarabaeus.OutputSettings : Controls which quantities are stored.
+    :meth:`save` and :meth:`create_JSON` write self-describing files: the
+    metadata labels every state index (owner, SPICE ID, frame, units) and
+    records the a priori state and covariance, the convergence test and the
+    provenance; the solution blocks add the estimate at the initial epoch.
+    Covariances are written either in full or as diagonals, never both.
+
+    **Choosing a mapped solution.** State and covariance mapping use the same
+    data-cutoff convention. For an existing ``solution`` and target
+    :class:`~scarabaeus.EpochArray` called ``epochs``:
+
+    .. code-block:: python
+
+        # Filtered: each target uses measurements through that target time.
+        filtered = solution.propagate_state_covariance(
+            epochs, use_smoothed=False, lookback_s=0.0)
+
+        # Rolling prediction: each target uses measurements through 14 days earlier.
+        prediction_14d = solution.propagate_state_covariance(
+            epochs, use_smoothed=False, lookback_s=14 * 86400.0)
+
+        # Reconstruction: every target uses the final filter update.
+        reconstructed = solution.propagate_state_covariance(
+            epochs, use_smoothed=False, use_all_data=True)
+
+    Each result is a list of ``(StateArray, covariance)`` pairs in requested
+    epoch order. For covariance-only analyses, use
+    :meth:`propagate_covariance` with the same cutoff keywords; such analyses
+    do not store state deviations. Covariance rows follow the nominal state
+    component order, and entry ``(i, j)`` has the product of component ``i``
+    and ``j`` units.
+
+    For a selected update at epoch :math:`r`, mapping to :math:`t` uses
+
+    .. math::
+
+        A(t,r) &= \Phi(t,t_0)\Phi(r,t_0)^{-1}, \\
+        \hat x(t) &= x_{\mathrm{nom}}(t) + A(t,r)\delta x(r), \\
+        P(t) &= A(t,r)P(r)A(t,r)^T.
+
+    These are linearized mappings around the fitted nominal reference. They
+    add no measurements or process noise. Reconstruction maps the final
+    covariance; it is not a stochastic backward smoother. When coverage is
+    insufficient or STM interpolation is rejected, mapping reintegrates the
+    nominal reference on copies of the propagator. The correction is added
+    once.
+
+    The default ``lookback_s=None`` retains the older API convention: a
+    continuous arc maps its final update inside/after the measurement arc and
+    its first update before it. Specify ``lookback_s=0.0, use_smoothed=False``
+    for a causal filtered product. An explicit cutoff before the first update
+    uses the prior; the prior covariance must be available. Simultaneous
+    updates retain their order, and the last one at a cutoff is selected.
+
+    Consider-augmented covariance is included by default when considered
+    parameters are present. A smoothed augmented history is unavailable, so
+    those queries need ``use_smoothed=False``. A paired query requires both
+    smoothed histories or neither, preventing mixed state and covariance
+    products.
+
+    Sequences use local leg STMs, with shared nodes assigned to the later leg.
+    Positive lookback and all-data reconstruction across sequence events
+    currently raise ``NotImplementedError`` because they require event
+    transition maps.
+
+    **Reading and saving results.** :meth:`estimated_trajectory` reads each
+    measurement epoch's own update and requires an epoch match within one
+    microsecond. Use :meth:`propagate_state` for arbitrary epochs. Sequence
+    parameter results are grouped by leg and contain only the requested rows
+    for each leg, in request order. :meth:`map_state_deviation_to_epoch` maps
+    corrections to nominal initial epochs and returns one vector per sequence
+    leg in either sequence mapping mode.
+
+    :meth:`UQ_compute` uses normalized particle weights consistently for the
+    mean, population covariance, intervals and effective sample size. Its
+    covariance diagonal equals the squared reported standard deviations; this
+    is not an unbiased sample covariance with an N-1 correction.
+
+    :meth:`serialize` preserves the update timeline, component frame/units,
+    residual epochs, sequence layout and multi-arc global results alongside
+    stored arrays. :meth:`deserialize` can inspect and export those results
+    without the original filter. Trajectory queries and propagation require
+    reattaching the matching fitted filter, since the pickle does not embed
+    its propagator or SPICE kernels.
 
     References
     ----------
-    Tapley, B. D., Schutz, B. E., & Born, G. H. (2004). Statistical Orbit Determination. Elsevier Academic Press. ISBN 978-0-12-683630-1.
+    .. [1] Tapley, B. D., Schutz, B. E., & Born, G. H. (2004). *Statistical Orbit
+       Determination*. Elsevier Academic Press. ISBN 978-0-12-683630-1.
     """
+
+    class ElementConversionError(ValueError):
+        """Raised when the estimate cannot be expressed in orbital elements —
+        the body is not in the state vector, or its gravitational parameter is
+        not available."""
+
+    class DebugHistoryError(ValueError):
+        """Raised when filter debug histories that pair up per measurement
+        update differ in length."""
 
     # --------------------#
     # region Constructor #
@@ -104,6 +212,25 @@ class SolutionOD:
         filter_obj: FilterOD,
         output_settings: Optional[OutputSettings] = None,
     ):
+        """Initialize stored results and metadata from a filter.
+
+        Parameters
+        ----------
+        filter_obj : FilterOD
+            Filter whose available results and measurement epochs are read.
+            The solution retains this object for subsequent trajectory queries.
+        output_settings : OutputSettings or None, optional
+            Quantities to retain. None uses ``filter_obj.settings.output`` when
+            available, otherwise a new OutputSettings instance.
+
+        Notes
+        -----
+        Initializes optional result attributes, captures initial frame/units,
+        and calls :meth:`_store_solution_data`. Particle UQ and requested debug
+        quantities may be computed during storage. The absolute state remains
+        lazy, and construction does not run the orbit-determination filter.
+        Stored filter arrays are not necessarily independent copies.
+        """
         self._filter = filter_obj
 
         # Use filter's output settings if not provided
@@ -111,14 +238,21 @@ class SolutionOD:
             if hasattr(filter_obj.settings, "output"):
                 self.output_settings = filter_obj.settings.output
             else:
-                from scarabaeus import OutputSettings
-
                 self.output_settings = OutputSettings()
         else:
             self.output_settings = output_settings
 
         # Extract timestamps
         self.timestamps = self._extract_timestamps()
+
+        # Frame + units of the estimated state, captured once here from the
+        # filter's initial state vector. The filter runs on raw numbers and
+        # never carries this metadata through the computation; it is recorded
+        # at the start so the saved outputs can be labelled correctly.
+        (self._state_frame, self._state_units,
+         self._state_components) = self._capture_initial_frame_units()
+        # Creation time, written as provenance by save()/create_JSON().
+        self._created_utc = datetime.now(timezone.utc).isoformat()
 
         # Initialize all attributes to None
         self.deviation_est = None
@@ -131,6 +265,19 @@ class SolutionOD:
         self.prefits = None
         self.postfits = None
         self.postfits_smoother = None
+        # Per-entry reception epochs (TDB seconds) paralleling prefits/postfits,
+        # keyed by dataset name: {dataset: [t2, ...]}. Captured from the filter so
+        # serialized residuals can carry a time tag.
+        self.prefit_epochs = None
+        self.postfit_epochs = None
+        self.postfit_epochs_smooth = None
+        # Epoch of every state-deviation / covariance row (= filter timeline grid,
+        # measurements ∪ events). Longer than ``timestamps`` for sequences.
+        self.timeline = None
+        # Forward solution at each sequence node in the previous leg's definition
+        # (sequential filters), used to map the final estimate back through it.
+        self._node_deviations = None
+        self._node_covariances = None
         self.uq_metrics = None
         self.debug = None
         # Multi-arc global parameter combination result (set by MultiFilterOD).
@@ -159,8 +306,9 @@ class SolutionOD:
 
     @property
     def n_states(self) -> int:
-        """Number of states in the state vector."""
-        return self.filter.n
+        """Number of states in the state vector (the full union for a sequence)."""
+        # filter.n holds the width of the leg the filter last processed
+        return getattr(self.filter, "n_global", self.filter.n)
 
     @property
     def is_covariance_analysis(self) -> bool:
@@ -212,19 +360,646 @@ class SolutionOD:
         return np.sqrt(np.diag(self.multi_arc_global["P_G"]))
 
     def _extract_timestamps(self) -> np.ndarray:
-        """Extract timestamps from measurement data."""
+        """Read spacecraft measurement epochs from the filter's measurement data.
+
+        Returns
+        -------
+        ndarray
+            TDB seconds returned by ``measurement_data.get_spacecraft_times()``,
+            converted to a NumPy array without additional sorting or deduplication.
+
+        Notes
+        -----
+        This is the measurement grid, not the deviation/covariance update grid.
+        Sequence event epochs are provided separately by :meth:`_timeline_epochs`.
+        """
         return np.array(self.filter.measurement_data.get_spacecraft_times())
+
+    # ---------------------------------------------------------------------
+    # Sequence layout helpers
+    #
+    # The state-deviation and covariance histories are built over the filter
+    # *timeline* (unique union of measurement and event epochs), which for a
+    # sequence is longer than the measurement-only ``timestamps``. These helpers
+    # attach an epoch and a leg index to every row, and describe each leg's state
+    # layout, so the saved solution is self-describing for sequence runs.
+    # ---------------------------------------------------------------------
+    def _timeline_epochs(self) -> Optional[np.ndarray]:
+        """Select the epoch grid used to index deviation and covariance rows.
+
+        Returns
+        -------
+        ndarray or None
+            Flattened floating-point TDB seconds, preserving stored row order
+            and duplicate epochs. None means no nonempty grid is available.
+
+        Notes
+        -----
+        Uses ``self.timeline`` when it is not None, otherwise the filter's
+        ``timeline_times``. If that selected grid is empty or missing, falls
+        back to measurement ``timestamps``. An explicitly empty solution timeline
+        therefore also falls back to measurements. This helper neither sorts
+        nor validates row counts; consumers must check alignment with histories.
+        """
+        tl = self.timeline if self.timeline is not None else getattr(
+            self.filter, "timeline_times", None
+        )
+        if tl is not None and len(tl) > 0:
+            return np.asarray(tl, dtype=float).ravel()
+        if self.timestamps is not None and len(self.timestamps) > 0:
+            return np.asarray(self.timestamps, dtype=float).ravel()
+        return None
+
+    def _leg_index_for_epoch(self, t: float) -> Optional[int]:
+        """Return the leg index a timeline epoch ``t`` belongs to.
+
+        Parameters
+        ----------
+        t : float
+            Epoch in TDB seconds.
+
+        Returns
+        -------
+        int or None
+            Zero-based index into ``filter.legs_epochs``. The later leg wins
+            at shared boundaries or overlaps. Epochs at/after the final leg end
+            map to the final leg. None is returned if legs are absent, t is
+            before the first leg, or t falls in an uncovered interior gap.
+
+        Notes
+        -----
+        Membership uses each leg's first and last stored epochs as an inclusive
+        span, not exact membership in its sampling grid. Comparisons are exact;
+        no relative tolerance is applied to large TDB timestamps.
+        """
+        legs = getattr(self.filter, "legs_epochs", None)
+        if not legs:
+            return None
+        nlegs = len(legs)
+        for i in reversed(range(nlegs)):
+            leg = legs[i]
+            leg_arr = np.asarray(leg, dtype=float).ravel()
+            if leg_arr.size == 0:
+                continue
+            t0, t1 = leg_arr[0], leg_arr[-1]
+            if t0 <= t <= t1:
+                return i
+        # Epoch at/after the final leg end, or otherwise unmatched.
+        last = np.asarray(legs[-1], dtype=float).ravel()
+        if last.size and t >= last[-1]:
+            return nlegs - 1
+        return None
+
+    def _deviation_history(self, use_smoothed=True):
+        """Return deviation rows aligned with a validated, sorted timeline.
+
+        Parameters
+        ----------
+        use_smoothed : bool, optional
+            Select a nonempty smoothed history when True; otherwise, or when
+            smoothing is unavailable, select the filtered history. Defaults
+            to ``True``.
+
+        Returns
+        -------
+        timeline : ndarray, shape (n_updates,)
+            Ascending TDB seconds, retaining event rows and simultaneous updates.
+        deviations : list of ndarray
+            Flattened corrections in timeline order and nominal component units.
+            Sequence rows can have padding for shorter state definitions.
+        smoothing : bool
+            Whether the selected history contains smoothed corrections.
+
+        Raises
+        ------
+        ValueError
+            If the history is absent/empty, row counts differ, or epochs are
+            nonfinite.
+
+        Notes
+        -----
+        Sorting is stable: simultaneous rows keep their filter order, so callers
+        can select the last update. Stored histories are not reordered in place.
+        """
+        smoothing = (use_smoothed and self.deviation_smooth is not None
+                     and len(self.deviation_smooth) > 0)
+        source = self.deviation_smooth if smoothing else self.deviation_est
+        if source is None or len(source) == 0:
+            raise ValueError("No state deviation history available.")
+        timeline = self._timeline_epochs()
+        if timeline is None or len(timeline) != len(source):
+            raise ValueError("State deviation history and filter timeline lengths differ.")
+        if not np.isfinite(timeline).all():
+            raise ValueError("State deviation history epochs must be finite.")
+        order = np.argsort(timeline, kind="stable")
+        return timeline[order], [np.asarray(source[i], float).ravel() for i in order], smoothing
+
+    @staticmethod
+    def _matching_epoch_index(timeline, t):
+        """Match a stored epoch to microsecond precision.
+
+        Parameters
+        ----------
+        timeline : ndarray, shape (n_updates,)
+            Finite TDB seconds; sorting is not required.
+        t : float
+            Requested epoch in TDB seconds.
+
+        Returns
+        -------
+        int
+            Closest stored epoch's index. If several rows share that exact
+            stored time, return the last row in their original order.
+
+        Raises
+        ------
+        ValueError
+            If the timeline is empty or no epoch is within 1e-6 seconds.
+
+        Notes
+        -----
+        This selects a row without propagating its correction. Callers evaluate
+        the nominal state at the matched stored time, not at a nearby input time.
+        """
+        distances = np.abs(timeline - t)
+        if (len(distances) == 0 or not np.isfinite(distances).all()
+                or distances.min() > 1e-6):
+            raise ValueError(f"Epoch {t} does not match a stored filter epoch.")
+        nearest = int(np.argmin(distances))
+        return int(np.flatnonzero(timeline == timeline[nearest])[-1])
+
+    def _reference_model(self, leg=None):
+        """Select the nominal initial state for an arc or sequence leg.
+
+        Parameters
+        ----------
+        leg : int or None, optional
+            Zero-based continuous-leg index, excluding event nodes. None selects
+            the continuous arc's ``propagator.full_state_vector``. Defaults to
+            ``None``.
+
+        Returns
+        -------
+        StateArray
+            Initial state with its actual epoch, component order, owners, units
+            and frames. This references the filter's model; copy before editing.
+        """
+        if leg is not None:
+            return self.filter.legs_model[leg]
+        return self.filter.propagator.full_state_vector
+
+    def _integrate_reference(self, times, leg=None):
+        """Sample the nominal state and STMs without changing the fitted propagator.
+
+        Parameters
+        ----------
+        times : iterable of float
+            Sample epochs in TDB seconds; order and duplicates do not matter.
+        leg : int or None, optional
+            Zero-based sequence leg, or None for a continuous arc. A leg is
+            extended with its own dynamics, without executing sequence events.
+            Defaults to ``None``.
+
+        Returns
+        -------
+        stms : dict of float to ndarray
+            STMs at requested times and the nominal initial epoch, referenced
+            to that initial epoch with identity STM0.
+        states : dict of float to StateArray
+            Uncorrected nominal states at the same epochs, retaining the selected
+            model's component layout, units and frames.
+
+        Raises
+        ------
+        ValueError
+            If sequence propagators cannot be matched to their leg models.
+            Integration and sampling failures also propagate to the caller.
+
+        Notes
+        -----
+        Every matrix is integrated from the actual initial state epoch. Both
+        sides of that epoch use separate copies, so mixed forward/backward
+        requests share the same reference and never apply a correction twice.
+        """
+        from copy import deepcopy
+        from scarabaeus import Trajectory
+
+        model = self._reference_model(leg)
+        propagator = self.filter.propagator
+        if leg is not None:
+            sequence = self.filter.trajectory.sequence_definition
+            # Nodes and impulsive burns hold a propagator too; legs_model keeps
+            # only the StateArray models, so pair each leg with its own.
+            propagators = [p for m, p in zip(sequence.models, sequence.props)
+                           if isinstance(m, StateArray) and isinstance(p, Propagator)]
+            if len(propagators) != len(self.filter.legs_model):
+                raise ValueError("Sequence leg propagators do not match its state models.")
+            propagator = propagators[leg]
+            # A leg starts from the state the sequence carried across its node,
+            # not from its model's values (a template after the first leg).
+            leg_start = float(np.asarray(self.filter.legs_epochs[leg], float).ravel()[0])
+            model = self._nominal_state(leg_start, leg)
+        epoch0 = float(np.asarray(model.epoch.et).ravel()[0])
+        identity = np.eye(model.size)
+        stms, states = {epoch0: identity}, {epoch0: deepcopy(model)}
+        for backward in (True, False):
+            targets = sorted(set(float(t) for t in times
+                                 if (t < epoch0 if backward else t > epoch0)))
+            if not targets:
+                continue
+            grid = np.unique(np.r_[epoch0, targets])
+            prop = deepcopy(propagator)
+            prop.reinitialize(
+                state_vector=deepcopy(model),
+                tspan=EpochArray(grid[::-1] if backward else grid, sys="TDB"),
+                backward=backward, propagate_STM=True, STM0=identity.copy(),
+            )
+            prop.propagate(display_progress=False)
+            sampled = prop.propagated_state_array
+            trajectory = Trajectory("tmp_solution_reference", state_array=sampled)
+            trajectory.add_STMs(prop.STM, timestamps=sampled.epoch)
+            for t in targets:
+                stms[t] = np.asarray(trajectory.get_STM(epoch=t), float)
+                states[t] = sampled.get_state_at_epoch(EpochArray(t, sys="TDB"))
+        return stms, states
+
+    def _nominal_state(self, t, leg=None):
+        """Read all nominal components in their original state-vector order.
+
+        Parameters
+        ----------
+        t : float
+            Requested epoch in TDB seconds.
+        leg : int or None, optional
+            Zero-based sequence leg, or None for a continuous arc. Defaults
+            to ``None``.
+
+        Returns
+        -------
+        StateArray
+            Single-epoch uncorrected state with original component owners,
+            units, frames and estimation/dynamics modes.
+
+        Raises
+        ------
+        ValueError
+            If a primary-body query cannot represent the full state, nominal
+            parameters are missing, or parameter dimensions disagree. Messages
+            containing ``Cannot extrapolate`` request integration fallback in
+            :meth:`propagate_state`. Other trajectory query failures propagate.
+
+        Notes
+        -----
+        Exact stored samples contain all bodies. Otherwise a single-body query
+        provides Cartesian coordinates, converted to the model's units, and
+        nominal parameters. Multiple-body states require integration when the
+        requested epoch has no exact stored sample.
+        """
+        trajectory = self.filter.trajectory
+        sampled = getattr(trajectory, "_state_array", None)
+        if sampled is not None and leg is None:
+            et = np.asarray(sampled.epoch.et, float).ravel()
+            indices = np.flatnonzero(et == t)
+            if len(indices):
+                epoch = (sampled.epoch if np.ndim(sampled.epoch.et) == 0 else
+                         sampled.epoch[int(indices[0])])
+                return sampled.get_state_at_epoch(epoch)
+        model = self._reference_model(leg)
+        if sum(entry[0] == "position" for entry in model.state) != 1:
+            # Trajectory.get_state exposes only its primary body's Cartesian
+            # state. Integrate all bodies together rather than duplicating it.
+            raise ValueError("Cannot extrapolate the full state from a primary-body query.")
+        nominal = trajectory.get_state(
+            epoch_input=EpochArray(t, sys="TDB"), idx_leg_input=leg)
+        parameters = nominal.get("parameters")
+        parameters = None if parameters is None else np.asarray(parameters.values).ravel()
+        components, offset = [], 0
+        for name, size, est, dyn, owner, template in model.state:
+            if name in ("position", "velocity"):
+                values = nominal[name].convert_to(template.quantity.units).values
+            elif parameters is not None:
+                values = parameters[offset:offset + size]
+                offset += size
+                if len(values) != size:
+                    raise ValueError("Nominal parameter vector does not match the state definition.")
+            else:
+                raise ValueError("Cannot extrapolate missing nominal parameter values.")
+            components.append((name, size, est, dyn, owner, ArrayWFrame(
+                ArrayWUnits(np.asarray(values).ravel(), template.quantity.units), template.frame)))
+        return StateArray(EpochArray(t, sys="TDB"), model.origin,
+                          StateDefinition.from_components(components))
+
+    @staticmethod
+    def _correct_state(nominal, deviation):
+        """Add one correction, retaining each component's owner, units and frame.
+
+        Parameters
+        ----------
+        nominal : StateArray
+            Uncorrected state at a single epoch.
+        deviation : array_like, shape (nominal.size,)
+            Additive correction in nominal component order, units and frames.
+            Remove sequence storage padding before calling this helper.
+
+        Returns
+        -------
+        StateArray
+            Corrected state at the same epoch with all component metadata
+            preserved. Neither input is modified.
+
+        Raises
+        ------
+        ValueError
+            If the correction dimension differs from the nominal state size.
+        """
+        deviation = np.asarray(deviation, float).ravel()
+        if len(deviation) != nominal.size:
+            raise ValueError("State deviation size does not match the nominal state.")
+        components, offset = [], 0
+        for name, size, est, dyn, owner, template in nominal.state:
+            values = np.asarray(template.quantity.values).ravel() + deviation[offset:offset + size]
+            components.append((name, size, est, dyn, owner, ArrayWFrame(
+                ArrayWUnits(values, template.quantity.units), template.frame)))
+            offset += size
+        return StateArray(nominal.epoch, nominal.origin,
+                          StateDefinition.from_components(components))
+
+    def _legs_metadata(self) -> Optional[List[Dict]]:
+        """Describe each sequence leg's epoch span and state-vector columns.
+
+        Returns
+        -------
+        list of dict or None
+            One entry per ``filter.legs_model``, in leg order, with ``index``,
+            ``epoch_start``/``epoch_end`` in TDB seconds, ``n_states`` and a
+            ``components`` list in the schema of :meth:`_components_metadata`.
+            None means leg models or epoch grids are unavailable.
+
+        Notes
+        -----
+        Column offsets restart at zero for each leg and exclude storage padding
+        from wider legs. An unreadable model state yields an empty component
+        list and zero size; a missing epoch grid yields None bounds. The result
+        describes layouts without copying the propagated state histories.
+        """
+        legs_model = getattr(self.filter, "legs_model", None)
+        legs_epochs = getattr(self.filter, "legs_epochs", None)
+        if not legs_model or not legs_epochs:
+            return None
+
+        out = []
+        for i, model in enumerate(legs_model):
+            try:
+                state_def = model.state
+            except Exception:
+                state_def = []
+
+            components = self._components_metadata(state_def)
+            cursor = components[-1]["index_end"] if components else 0
+
+            leg_arr = (
+                np.asarray(legs_epochs[i], dtype=float).ravel()
+                if i < len(legs_epochs)
+                else np.array([])
+            )
+            out.append(
+                {
+                    "index": i,
+                    "epoch_start": float(leg_arr[0]) if leg_arr.size else None,
+                    "epoch_end": float(leg_arr[-1]) if leg_arr.size else None,
+                    "n_states": cursor,
+                    "components": components,
+                }
+            )
+        return out
+
+    def _sequence_extras(self) -> Dict:
+        """Assemble timeline and sequence-layout fields for serialization.
+
+        Returns
+        -------
+        dict
+            Available fields among ``timeline_epochs``, ``events_epochs``,
+            ``leg_index`` and ``legs``. Epochs are lists of TDB seconds;
+            ``leg_index`` parallels timeline rows and may contain None for
+            uncovered epochs. ``legs`` uses :meth:`_legs_metadata`'s schema.
+
+        Notes
+        -----
+        Starts with a shallow copy of metadata retained during deserialization.
+        A current timeline replaces its saved counterpart. Event and leg fields
+        are refreshed only when the filter exposes nonempty event epochs, so
+        saved layout metadata remains usable without an attached live filter.
+        This helper constructs a dictionary; it does not write a file.
+        """
+        extras: Dict = dict(getattr(self, "_saved_sequence_extras", {}))
+
+        timeline = self._timeline_epochs()
+        if timeline is not None:
+            extras["timeline_epochs"] = [float(t) for t in timeline]
+
+        events = getattr(self.filter, "events_epochs", None)
+        if events is not None and len(events) > 0:
+            extras["events_epochs"] = [
+                float(e) for e in np.asarray(events, dtype=float).ravel()
+            ]
+            if timeline is not None:
+                extras["leg_index"] = [
+                    self._leg_index_for_epoch(float(t)) for t in timeline
+                ]
+            legs_meta = self._legs_metadata()
+            if legs_meta is not None:
+                extras["legs"] = legs_meta
+
+        return extras
+
+    @staticmethod
+    def _components_metadata(state_def) -> List[Dict]:
+        """Describe each component of a state definition, in state order.
+
+        Parameters
+        ----------
+        state_def : iterable of tuple
+            Entries ``(name, dim, estimation, dynamics, owner, value)`` of a
+            ``StateDefinition`` (``StateArray.state``); trailing fields may be
+            missing.
+
+        Returns
+        -------
+        list of dict
+            One dict per component with ``name``, ``dim``, ``estimation``,
+            ``dynamics``, the owning body's ``owner`` name and ``spice_id``, the
+            ``frame`` name, ``units`` (``Units.to_dict()``) and zero-based
+            ``index_start``/``index_end`` (end exclusive) into the state vector.
+            Fields the entry does not provide are None.
+
+        Notes
+        -----
+        Labels only: values are not read, converted or copied.
+        """
+        components = []
+        cursor = 0
+        for entry in state_def:
+            dim = int(entry[1])
+            owner = entry[4] if len(entry) > 4 else None
+            value = entry[5] if len(entry) > 5 else None
+            units = getattr(getattr(value, "quantity", None), "units", None)
+            components.append(
+                {
+                    "name": entry[0],
+                    "dim": dim,
+                    "estimation": entry[2] if len(entry) > 2 else None,
+                    "dynamics": entry[3] if len(entry) > 3 else None,
+                    "owner": getattr(owner, "name", None),
+                    "spice_id": getattr(owner, "spice_id", None),
+                    "frame": getattr(getattr(value, "frame", None), "name", None),
+                    "units": units.to_dict() if hasattr(units, "to_dict") else None,
+                    "index_start": cursor,
+                    "index_end": cursor + dim,
+                }
+            )
+            cursor += dim
+        return components
+
+    @staticmethod
+    def _state_labels(components: List[Dict]) -> List[str]:
+        """Name every state-vector index, e.g. ``"Sat.position[0] [km]"``.
+
+        Parameters
+        ----------
+        components : list of dict
+            Component descriptions as returned by :meth:`_components_metadata`.
+
+        Returns
+        -------
+        list of str
+            One label per state index: owner (when known), component name,
+            element index (for components of dimension > 1) and units name
+            (when known).
+        """
+        labels = []
+        for c in components:
+            owner = f"{c['owner']}." if c.get("owner") else ""
+            units = (c.get("units") or {}).get("name")
+            units = f" [{units}]" if units else ""
+            for k in range(c["dim"]):
+                element = f"[{k}]" if c["dim"] > 1 else ""
+                labels.append(f"{owner}{c['name']}{element}{units}")
+        return labels
+
+    @staticmethod
+    def _series_alignment(d: Dict) -> Dict:
+        """Map each per-epoch array in a solution dict to its timestamp axis.
+
+        Inspects the arrays actually present in the serialized solution ``d`` and,
+        by matching row counts, records for each one the timestamp field that
+        indexes it (``"timestamps"`` = measurement grid, ``"timeline_epochs"`` =
+        deviation/covariance grid = measurements and event nodes) together with its
+        length. Matching is based on lengths, not on the physical meaning of
+        each row or a comparison of individual epoch values.
+
+        Parameters
+        ----------
+        d : dict
+            A serialized solution dict (as built by :meth:`create_JSON` or the
+            per-iteration writer in :meth:`save`).
+
+        Returns
+        -------
+        dict
+            ``{array_name: {"n_rows": int, "timestamps": <field name or None>}}``
+            for every recognised per-epoch array present in ``d``.
+
+        Notes
+        -----
+        Only list-valued fields are inspected. ``timeline_epochs`` takes
+        precedence over ``timestamps`` when both lengths match; None marks a
+        series whose row count matches neither axis. The input is not modified.
+        """
+        # Candidate timestamp axes, longest first so an exact-length match prefers
+        # the most specific axis when the two happen to be equal length.
+        axes = {
+            name: len(d[name])
+            for name in ("timeline_epochs", "timestamps")
+            if isinstance(d.get(name), list)
+        }
+        series = (
+            "state_estimated",
+            "deviation_estimated",
+            "deviation_cumulative",
+            "deviation_smoothed",
+            "covariance_diagonals",
+            "covariance_smooth_diagonals",
+            "covariance_consider_diagonals",
+            "covariance_full",
+            "covariance_smooth_full",
+            "covariance_consider_full",
+            "leg_index",
+            "nis_statistics",
+        )
+        alignment = {}
+        for name in series:
+            arr = d.get(name)
+            if not isinstance(arr, list):
+                continue
+            n = len(arr)
+            match = next((ax for ax, ln in axes.items() if ln == n), None)
+            alignment[name] = {"n_rows": n, "timestamps": match}
+        return alignment
+
+    @staticmethod
+    def _has_consider_rows(rows) -> bool:
+        """
+        Whether a consider covariance history holds any covariance.
+
+        A sequence may consider states on some legs only, its rows being
+        ``None`` elsewhere, while the filter's ``has_consider`` is its last
+        leg's.
+
+        Parameters
+        ----------
+        rows : list of (numpy.ndarray or None) or None
+            Consider covariance history, one entry per timeline epoch.
+
+        Returns
+        -------
+        bool
+            Whether any entry of ``rows`` is a covariance.
+        """
+        return rows is not None and any(P is not None for P in rows)
 
     def _store_solution_data(self) -> None:
         """
-        Store solution data based on output settings.
+        Populate solution attributes from available filter results.
 
-        Populates attributes according to OutputSettings flags.
+        Returns
+        -------
+        None
+            Updates this solution in place according to ``output_settings``.
+
+        Notes
+        -----
+        Covariance-analysis mode stores selected covariance histories and the
+        update timeline, then returns without deviations, residuals or UQ.
+        Full-filter mode also retains selected deviations, cumulative deviations,
+        residuals and their epochs, and smoothed quantities. Ragged deviation
+        rows are right-padded with zeros to the widest state definition.
+
+        Particle data triggers :meth:`UQ_compute`, and debug flags trigger
+        :meth:`_collect_debug_data`. Absolute states are left for lazy evaluation
+        through ``state_est``. Available arrays may be retained by reference;
+        this is not a deep snapshot of the filter. Disabled or unavailable
+        quantities are not cleared when this helper is called again.
         """
         # Covariance analysis mode: only covariances
         if self.is_covariance_analysis:
             if self.output_settings.save_covariance_history:
                 self.covariance_est = self.filter.covariance_history
+            if (self.output_settings.save_consider_covariance_history
+                    and self._has_consider_rows(
+                        getattr(self.filter, "covariance_consider_history", None))):
+                self.covariance_consider = self.filter.covariance_consider_history
+            self.timeline = getattr(self.filter, "timeline_times", None)
             return
 
         # Full filter mode: store based on settings
@@ -256,14 +1031,19 @@ class SolutionOD:
                                 dev[i, : r.size] = r
                         self.deviation_est = dev
 
-        # Cumulative deviation wrt first reference (across all iterations)
+        # Cumulative deviation wrt first reference (across all iterations): the
+        # deviation earlier iterations applied to the reference, plus this one.
+        # Rows are paired by epoch, since the filter epochs move between passes.
         if self.deviation_est is not None:
-            cum = getattr(self.filter, "_cumulative_deviation", None)
-            if cum is not None:
-                self.deviation_cumulative = np.atleast_2d(np.asarray(cum, dtype=float))
-            else:
-                # Single-iteration run: cumulative == current deviation
-                self.deviation_cumulative = self.deviation_est.copy()
+            self.deviation_cumulative = self.deviation_est.copy()
+            applied = getattr(self.filter, "_cumulative_deviation", None)
+            if applied is not None:
+                self.deviation_cumulative = FilterOD._accumulate_deviation(
+                    np.atleast_2d(np.asarray(applied, dtype=float)),
+                    getattr(self.filter, "_cumulative_epochs", None),
+                    self.deviation_est,
+                    np.asarray(getattr(self.filter, "timeline_times", []), dtype=float),
+                )
             # state_est is computed lazily on first access via the property
 
         # Estimated covariances
@@ -271,34 +1051,48 @@ class SolutionOD:
             if hasattr(self.filter, "covariance_history"):
                 self.covariance_est = self.filter.covariance_history
 
+        # Filter timeline (epoch of every deviation/covariance row)
+        self.timeline = getattr(self.filter, "timeline_times", None)
+
+        # Forward node solutions of this pass (rebuilt by every filter run)
+        self._node_deviations = getattr(self.filter, "_node_deviations", None)
+        self._node_covariances = getattr(self.filter, "_node_covariances", None)
+
         # Pre-fit residuals
         if self.output_settings.save_prefit_residuals:
             if hasattr(self.filter, "prefit_residuals"):
                 self.prefits = self.filter.prefit_residuals
+                self.prefit_epochs = getattr(self.filter, "prefit_epochs", None)
 
         # Post-fit residuals
         if self.output_settings.save_postfit_residuals:
             if hasattr(self.filter, "postfit_residuals"):
                 self.postfits = self.filter.postfit_residuals
+                self.postfit_epochs = getattr(self.filter, "postfit_epochs", None)
 
         # Consider covariances
-        if (
-            self.output_settings.save_consider_covariance_history
-            and self.filter.has_consider
+        if self.output_settings.save_consider_covariance_history and self._has_consider_rows(
+            getattr(self.filter, "covariance_consider_history", None)
         ):
-            if hasattr(self.filter, "covariance_consider_history"):
-                self.covariance_consider = self.filter.covariance_consider_history
+            self.covariance_consider = self.filter.covariance_consider_history
 
         # Smoothed solution
         if self.output_settings.save_smoothed_solution:
             if hasattr(self.filter, "smoothed_state_deviation"):
                 _ssd = self.filter.smoothed_state_deviation
-                if _ssd:
-                    self.deviation_smooth = np.array(_ssd)
+                if _ssd is not None and len(_ssd) > 0:
+                    rows = [np.asarray(row, float).ravel() for row in _ssd]
+                    width = max(len(row) for row in rows)
+                    self.deviation_smooth = np.zeros((len(rows), width))
+                    for i, row in enumerate(rows):
+                        self.deviation_smooth[i, :len(row)] = row
             if hasattr(self.filter, "smoothed_covariance"):
                 self.covariance_smooth = self.filter.smoothed_covariance
             if hasattr(self.filter, "postfit_residuals_smooth"):
                 self.postfits_smoother = self.filter.postfit_residuals_smooth
+                self.postfit_epochs_smooth = getattr(
+                    self.filter, "postfit_epochs_smooth", None
+                )
 
         # UQ metrics (always for particle filters)
         if hasattr(self.filter, "particles"):
@@ -314,15 +1108,153 @@ class SolutionOD:
         ):
             self.debug = self._collect_debug_data()
 
+    def _parameter_layout(self, idx_leg=None, t=None) -> tuple:
+        """
+        State definition and sidecar body the reference parameters belong to.
+
+        The reference trajectory returns, as ``parameters``, what its sidecar
+        holds: for a single arc the primary body's sidecar, for a sequence the
+        leg's, which carries every leg parameter. This names the state layout
+        and the body that sidecar was written for, so the deviation rows can be
+        picked with the same rule (:meth:`_parameter_deviation`).
+
+        Parameters
+        ----------
+        idx_leg : int, optional
+            Leg the deviation belongs to (sequences only).
+        t : float, optional
+            Epoch used to find the leg when ``idx_leg`` is not given.
+
+        Returns
+        -------
+        tuple
+            ``(state_definition, body_id)``; the definition is ``None`` when it
+            cannot be resolved, and ``body_id`` is ``None`` for a sequence.
+        """
+        if not getattr(self.filter, "flag_sequence", False):
+            traj = getattr(self.filter, "trajectory", None)
+            return (
+                getattr(traj, "state_definition", None),
+                getattr(getattr(traj, "body", None), "spice_id", None),
+            )
+        if idx_leg is None and t is not None:
+            idx_leg = self._leg_index_for_epoch(float(t))
+        legs = getattr(self.filter, "legs_model", None)
+        if idx_leg is None or not legs or not 0 <= idx_leg < len(legs):
+            return None, None
+        return getattr(legs[idx_leg], "state", None), None
+
+    @staticmethod
+    def _parameter_deviation(dev, state_definition, body_id=None) -> np.ndarray:
+        """
+        The rows of a state deviation that belong to a sidecar's parameters.
+
+        They are not simply ``dev[6:]``: that assumes the state opens with the
+        primary body's position and velocity and holds no others, and with a
+        second propagated body it would also take that body's position and
+        velocity, out of line with the nominal parameters it is added to. The
+        rows are picked by walking the state definition and keeping the entries
+        :meth:`SpiceManager._parameter_entries` assigns to the sidecar — the
+        rule that wrote it, so the two cannot drift apart.
+
+        Parameters
+        ----------
+        dev : array_like
+            State deviation. It may span the full state, be right-padded past
+            it (sequence legs of different widths are stacked), or hold the
+            estimated partition only, in which case a considered parameter has
+            no row and its deviation is zero.
+        state_definition : list or None
+            ``(name, dim, estimation, dynamics, owner, value)`` entries.
+        body_id : int, optional
+            SPICE id of the body whose sidecar holds the nominal parameters;
+            ``None`` selects every parameter.
+
+        Returns
+        -------
+        numpy.ndarray
+            The parameter deviation, in state order. Falls back to ``dev[6:]``
+            when the definition is missing or does not fit the deviation.
+        """
+        dev = np.asarray(dev, dtype=float).ravel()
+        # Materialise once: selection is by identity, so both walks must see
+        # the same tuples.
+        entries = list(state_definition or [])
+        if not entries:
+            return dev[6:]
+        selected = {
+            id(entry) for entry in SpiceManager._parameter_entries(entries, body_id)
+        }
+
+        # (selected, row in the full state, row in the estimated partition, dim)
+        blocks = []
+        n_full = n_est = 0
+        try:
+            for entry in entries:
+                dim = int(entry[1])
+                considered = entry[2] == "considered"
+                blocks.append(
+                    (id(entry) in selected, n_full, None if considered else n_est, dim)
+                )
+                n_full += dim
+                n_est += 0 if considered else dim
+        except (TypeError, IndexError, ValueError):
+            return dev[6:]
+
+        if dev.size >= n_full:
+            pieces = [dev[start : start + dim] for keep, start, _, dim in blocks if keep]
+        elif dev.size == n_est:
+            pieces = [
+                np.zeros(dim) if start is None else dev[start : start + dim]
+                for keep, _, start, dim in blocks
+                if keep
+            ]
+        else:
+            return dev[6:]
+        return np.concatenate(pieces) if pieces else np.zeros(0)
+
     def _compute_state_est(self) -> Optional[np.ndarray]:
         """
         Compute the absolute state estimate at each measurement epoch.
 
-        Returns an array of shape [n_epochs x n_states] where each row is
-        ``nominal_state[k] + deviation_est[k]``, i.e. the true estimate in
-        the last iteration's reference frame.
+        Returns
+        -------
+        ndarray or None
+            Array with one row per measurement epoch and as many columns as the
+            stored deviation history. Rows contain position, velocity and then
+            nominal parameters plus their filtered corrections, in the last
+            iteration's reference frame. Cartesian values are in km and km/s;
+            parameters use the trajectory's native component units. Missing
+            reference rows and inactive sequence padding remain NaN. None means
+            the trajectory/deviation history is absent or every reference query
+            failed.
 
-        Returns None if the filter does not expose trajectory state queries.
+        Raises
+        ------
+        ValueError
+            If the deviation timeline is empty, nonfinite or has the wrong row
+            count, a measurement epoch has no matching update, or nominal and
+            deviation dimensions cannot be combined.
+
+        Warns
+        -----
+        RuntimeWarning
+            If one or more nominal trajectory queries fail. A partial failure
+            returns the remaining rows; failure at every epoch returns None.
+
+        Notes
+        -----
+        ``deviation_est`` is indexed on the filter *timeline* (measurements and
+        event nodes), which is longer than the measurement-only ``timestamps``
+        for sequences. Each measurement epoch is therefore mapped to its row in
+        that timeline before the deviation is read; indexing ``deviation_est``
+        directly by the measurement counter would misalign every row after the
+        first event node that does not coincide with a measurement.
+
+        The last simultaneous update wins. This reader assumes position and
+        velocity occupy the first six deviation entries; the parameter rows are
+        picked with :meth:`_parameter_deviation`. It uses filtered deviations
+        without STM propagation or smoothing. Caching is performed by the ``state_est`` property, not here.
         """
         traj = getattr(self.filter, "trajectory", None)
         if traj is None or self.deviation_est is None:
@@ -334,63 +1266,84 @@ class SolutionOD:
             if self.deviation_est.ndim > 1
             else self.deviation_est.shape[0]
         )
-        out = np.zeros((n, n_states), dtype=float)
+        out = np.full((n, n_states), np.nan, dtype=float)
+        failures = []
 
         flag_seq = getattr(self.filter, "flag_sequence", False)
+
+        timeline, deviations, _ = self._deviation_history(use_smoothed=False)
 
         for k in range(n):
             _ts_k = self.timestamps[k]
             t_k = float(_ts_k.values if hasattr(_ts_k, 'values') else _ts_k)
             ep_k = EpochArray(np.array([t_k]), sys="TDB")
 
-            if flag_seq:
-                idx_leg = next(
-                    (
-                        (
-                            i + 1
-                            if ep_k[0].times.values == leg[-1]
-                            and i != len(self.filter.legs_epochs) - 1
-                            else i
-                        )
-                        for i, leg in enumerate(self.filter.legs_epochs)
-                        if (
-                            (ep_k[0].times.values in leg)
-                            if isinstance(leg, np.ndarray)
-                            else (ep_k[0].times.values == leg)
-                        )
-                    ),
-                    None,
-                )
-            else:
-                idx_leg = None
+            dev_idx = self._matching_epoch_index(timeline, t_k)
+            idx_leg = self._leg_index_for_epoch(t_k) if flag_seq else None
 
             try:
                 nom = traj.get_state(epoch_input=ep_k[0], idx_leg_input=idx_leg)
-            except Exception:
+            except Exception as exc:
+                failures.append(exc)
                 continue
 
-            dev = self.deviation_est[k].ravel()
+            dev = deviations[dev_idx]
             pos_nom = np.asarray(nom["position"].values).ravel()
             vel_nom = np.asarray(nom["velocity"].values).ravel()
 
             row = np.concatenate([pos_nom + dev[:3], vel_nom + dev[3:6]])
 
-            if nom["parameters"] is not None and len(dev) > 6:
+            par_dev = self._parameter_deviation(
+                dev, *self._parameter_layout(idx_leg, t_k)
+            )
+            if nom["parameters"] is not None and par_dev.size:
                 par_nom = np.asarray(nom["parameters"].values).ravel()
-                row = np.concatenate([row, par_nom + dev[6:]])
+                row = np.concatenate([row, par_nom + par_dev[: len(par_nom)]])
 
             out[k, : len(row)] = row
+
+        # An epoch outside the reference span is a legitimate miss, so single
+        # failures are tolerated — but they must not leave a row of zeros, which reads
+        # as a spacecraft at the centre of the origin body rather than as
+        # missing data. Say so, and refuse to return an array that is entirely
+        # made up of those rows.
+        if failures:
+            first = failures[0]
+            if len(failures) == n:
+                warnings.warn(
+                    "state_est is unavailable: the reference state could not be "
+                    f"read at any of the {n} measurement epochs "
+                    f"(first error: {type(first).__name__}: {first}).",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                return None
+            warnings.warn(
+                f"state_est is missing {len(failures)} of {n} rows: the "
+                "reference state could not be read at those epochs, which are "
+                f"left as NaN (first error: {type(first).__name__}: {first}).",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
         return out
 
     def _collect_debug_data(self) -> Dict:
         """
-        Collect debug quantities into a dictionary.
+        Collect available debug quantities selected by output settings.
 
         Returns
         -------
-        dict
-            Dictionary with debug data (Kalman gains, innovation cov, NIS).
+        dict or None
+            Selected keys among ``kalman_gains``, ``innovation_covariances`` and
+            ``nis_statistics``. Filter histories are retained by reference;
+            NIS, when available, is a newly computed array. None means no
+            requested quantity was available.
+
+        Notes
+        -----
+        This helper returns the dictionary without assigning ``self.debug``.
+        See :meth:`_compute_nis_statistics` for the histories NIS is built from.
         """
         debug_data = {}
 
@@ -415,50 +1368,78 @@ class SolutionOD:
         return debug_data if debug_data else None
 
     def _compute_nis_statistics(self) -> Optional[np.ndarray]:
-        """
-        Compute Normalized Innovation Squared (NIS) statistics.
-
-        NIS = r^T * S^(-1) * r
+        r"""Normalized innovation squared of every filter measurement update.
 
         Returns
         -------
-        np.ndarray or None
-            NIS values at each epoch, or None if data unavailable.
+        ndarray or None
+            One dimensionless value :math:`\nu_k^T S_k^{-1}\nu_k` per
+            measurement update, in processing order. A singular :math:`S_k`
+            gives NaN. None when the filter stores no innovations (covariance
+            analysis, a filter other than LKF, or ``save_nis_statistics``
+            off during the pass).
+
+        Raises
+        ------
+        DebugHistoryError
+            If the filter's innovation and innovation covariance histories
+            differ in length.
+
+        Notes
+        -----
+        :math:`\nu_k = y_k - H_k\bar{x}_k` is the pre-update innovation and
+        :math:`S_k = H_k\bar{P}_k H_k^T + R_k` its covariance, read from the
+        filter's ``innovations`` and ``innovation_covariances``, which hold one
+        entry per update. Post-fit residuals do not give the statistic: they
+        are correlated with the update and, once unwrapped, no longer grouped
+        by update. For a consistent filter each value is chi-squared with as
+        many degrees of freedom as measurements in its update.
         """
-        if self.postfits is None or self.debug is None:
+        innovations = getattr(self.filter, "innovations", None)
+        covariances = getattr(self.filter, "innovation_covariances", None)
+        if not innovations or covariances is None:
             return None
-
-        if "innovation_covariances" not in self.debug:
-            return None
-
-        innovation_covs = self.debug["innovation_covariances"]
+        if len(innovations) != len(covariances):
+            raise SolutionOD.DebugHistoryError(
+                f"{len(innovations)} innovations but {len(covariances)} innovation "
+                "covariances; both must hold one entry per measurement update."
+            )
 
         nis_values = []
-        for k, residual_data in enumerate(self.postfits):
-            residuals, _, _, _, _, _ = residual_data
-
-            if k < len(innovation_covs):
-                try:
-                    S_inv = self.filter._safe_inv(innovation_covs[k])
-                    nis = float(residuals.T @ S_inv @ residuals)
-                    nis_values.append(nis)
-                except np.linalg.LinAlgError:
-                    nis_values.append(np.nan)
-            else:
+        for nu, S in zip(innovations, covariances):
+            nu = np.asarray(nu, dtype=float).ravel()
+            try:
+                nis_values.append(float(nu @ np.linalg.solve(np.asarray(S, dtype=float), nu)))
+            except np.linalg.LinAlgError:
                 nis_values.append(np.nan)
 
-        return np.array(nis_values) if nis_values else None
+        return np.array(nis_values)
 
     def propagate_covariance(
         self,
         epochs: EpochArray,
         use_smoothed: bool = True,
+        *,
+        lookback_s: Optional[float] = None,
+        use_all_data: bool = False,
+        include_consider: bool = True,
+        apriori_covariance: Optional[np.ndarray] = None,
+        apriori_epoch: Optional[float] = None,
     ) -> List[np.ndarray]:
-        """
-        Propagate the estimated covariance to arbitrary epochs using trajectory STMs.
+        r"""Map covariance to arbitrary epochs using the trajectory STMs.
 
-        For epochs inside the measurement arc, uses stored trajectory STMs.
-        For epochs outside the arc, re-propagates from the nearest arc boundary.
+        With ``lookback_s=0`` the forward product uses the last update at or
+        before each epoch; a positive lookback moves that data cutoff earlier.
+        Reconstruction explicitly selects the final update with ``use_all_data``.
+        In both cases :math:`P(t)=\Phi(t,t_k)P(t_k)\Phi(t,t_k)^T` with the full
+        STM, including considered parameters and their cross-covariances.
+        No process noise or measurement updates are added during this mapping.
+
+        Stored STMs are used throughout their coverage, including before the
+        first measurement and after the last one. For a continuous arc, missing
+        or insufficiently accurate STMs are integrated on a copy of the
+        propagator along the same nominal reference; this never changes the
+        selected covariance or the filter's propagator.
 
         Parameters
         ----------
@@ -467,34 +1448,106 @@ class SolutionOD:
         use_smoothed : bool, optional
             If True and a smoothed solution is available, uses the smoothed covariance
             history (``covariance_smooth``) instead of the forward-filter history
-            (``covariance_est``).  Defaults to True.
-        """
-        from scarabaeus import Trajectory
+            (``covariance_est``). Defaults to True. Set False for a causal
+            filtered product or rolling forecast.
+        lookback_s : float or None, optional
+            Nonnegative interval between the plotted epoch and its data cutoff.
+            Zero uses measurements through t; 14*86400 uses measurements only
+            through t - 14 days. A cutoff cannot use a smoothed history, and
+            a positive lookback cannot be combined with ``use_all_data=True``.
+            Currently supported for continuous arcs. With None (the default),
+            preserve the original mapping convention: continuous arcs use the
+            final covariance inside/after the measurement arc and the first
+            covariance before it; sequences use the last timeline update.
+            This default is not a causal filtered product.
+        use_all_data : bool, optional
+            Map the final covariance to every requested epoch (deterministic
+            reconstruction). Defaults to False. Currently requires a continuous
+            arc; this is not a stochastic backward smoother.
+        include_consider : bool, optional
+            Include the consider-augmented covariance when the filter has
+            considered parameters (on a sequence, on the legs that consider
+            any; the others have no augmented one). Defaults to True. No smoothed augmented
+            history exists, and the filtered one is only stored with
+            ``save_consider_covariance_history``; in either case the
+            estimated-only covariance is mapped and a RuntimeWarning is issued.
+        apriori_covariance : ndarray, optional
+            Prior for cutoffs before the first update. Defaults to the filter's
+            initial covariance. A missing prior raises instead of using a
+            posterior containing future measurements.
+        apriori_epoch : float, optional
+            TDB epoch of the prior. Defaults to the filter's initial state epoch.
 
-        if self.covariance_est is None or len(self.covariance_est) == 0:
-            raise ValueError("No covariance history available.")
+        Returns
+        -------
+        list of ndarray
+            Covariances in requested epoch order, including repeated epochs.
+            Each matrix follows the full nominal state order and frames;
+            element (i,j) has the product of component i and j units. Sequence
+            legs may have different matrix sizes. Empty input returns [].
+
+        Raises
+        ------
+        ValueError
+            If histories or trajectory are unavailable; timeline lengths,
+            epochs, cutoffs or dimensions are invalid; an explicit cutoff uses
+            smoothing; or the required prior/consider covariance is missing.
+        NotImplementedError
+            For positive lookback or all-data reconstruction across sequence
+            events, which require event transition maps.
+        numpy.linalg.LinAlgError
+            If a reference STM is singular.
+
+        Notes
+        -----
+        For a selected covariance P(r), define A = Phi(t,t0) Phi(r,t0)^(-1).
+        The mapped covariance is P(t) = A P(r) A.T, explicitly symmetrized to
+        remove floating-point asymmetry. Mapping adds no process noise and
+        performs no new measurement update. All-data reconstruction is a
+        deterministic mapping of the final covariance, not a stochastic
+        backward smoother. All STMs in a ratio use the same nominal reference.
+
+        Examples
+        --------
+        For an existing solution and target EpochArray ``epochs``::
+
+            filtered = solution.propagate_covariance(
+                epochs, use_smoothed=False, lookback_s=0.0)
+            prediction_14d = solution.propagate_covariance(
+                epochs, use_smoothed=False, lookback_s=14 * 86400.0)
+            reconstructed = solution.propagate_covariance(
+                epochs, use_smoothed=False, use_all_data=True)
+
+        See Also
+        --------
+        propagate_state, propagate_state_covariance
+        """
         if epochs is None or getattr(epochs, "size", 0) == 0:
             return []
+        legacy_reference = lookback_s is None
+        lookback_s = 0.0 if lookback_s is None else float(lookback_s)
+        if not np.isfinite(lookback_s) or lookback_s < 0:
+            raise ValueError("lookback_s must be finite and nonnegative.")
+        if use_all_data and lookback_s != 0:
+            raise ValueError("use_all_data and lookback_s cannot be combined.")
+        is_sequence = getattr(self.filter, "flag_sequence", False)
+        if is_sequence and (lookback_s != 0 or use_all_data):
+            raise NotImplementedError(
+                "Rolling cutoffs and reconstruction across sequence events "
+                "require event transition maps; use a continuous arc."
+            )
 
         traj = getattr(self.filter, "trajectory", None)
         if traj is None:
             raise ValueError("Filter has no trajectory attached.")
 
-        _dev_source = (
-            self.deviation_smooth
-            if (use_smoothed and self.deviation_smooth is not None)
-            else self.deviation_est
-        )
-
+        smoothing = (use_smoothed and self.covariance_smooth is not None
+                     and len(self.covariance_smooth) > 0)
+        if smoothing and not legacy_reference and not use_all_data:
+            raise ValueError("A rolling data cutoff cannot use smoothed covariance.")
         # -------------------------
         # Helpers
         # -------------------------
-        def _epoch_to_float(ep) -> float:
-            try:
-                return float(ep.times.values)
-            except Exception:
-                return float(ep)
-
         def _as_matrix(Phi) -> np.ndarray:
             Phi = np.asarray(Phi, dtype=float)
             if Phi.ndim == 1:
@@ -506,24 +1559,6 @@ class SolutionOD:
             Phi_t = _as_matrix(Phi_t)
             Phi_ref = _as_matrix(Phi_ref)
             return Phi_t @ np.linalg.solve(Phi_ref, np.eye(Phi_ref.shape[0]))
-
-        def _get_leg_partition(i_leg):
-            """Return (idx_est, idx_con) for leg i_leg from the filter's legs_model."""
-            flag_seq = getattr(self.filter, "flag_sequence", False)
-            legs_model = getattr(self.filter, "legs_model", None)
-            if not flag_seq or legs_model is None or i_leg >= len(legs_model):
-                return None, None
-            state_def = legs_model[i_leg].state
-            idx_est_l, idx_con_l = [], []
-            cursor = 0
-            for entry in state_def:
-                name, dim, est_flag = entry[0], entry[1], entry[2]
-                if est_flag == "considered":
-                    idx_con_l.extend(range(cursor, cursor + dim))
-                else:
-                    idx_est_l.extend(range(cursor, cursor + dim))
-                cursor += dim
-            return np.asarray(idx_est_l, int), np.asarray(idx_con_l, int)
 
         def _prop(P_ref, Phi_t_ref) -> np.ndarray:
             Phi = _as_matrix(Phi_t_ref)
@@ -541,160 +1576,147 @@ class SolutionOD:
         def _build_epoch_array(t_arr):
             return EpochArray(np.asarray(t_arr, dtype=float), sys="TDB")
 
-        def _get_stm(traj_obj, t, idx):
-            return _as_matrix(traj_obj.get_STM(epoch=float(t), idx=idx))
-
         def _get_stm_seq(traj_obj, t, idx_leg):
             return _as_matrix(
                 traj_obj.get_STM_sequence(epoch=float(t), idx_leg=idx_leg)
             )
 
-        def _nearest_hist_idx(t) -> int:
-            idx = int(np.argmin(np.abs(t_hist - float(t))))
-            return max(0, min(idx, len(t_hist) - 1))
-
-        def _state_dev_at(t_ref) -> np.ndarray:
-            idx = int(np.argmin(np.abs(t_hist - float(t_ref))))
-            return np.asarray(_dev_source[idx], dtype=float).ravel()
-
-        def _reinitialize_at_estimated_state(t_ref):
-            sv = self.filter.propagator.full_state_vector
-            dev = _state_dev_at(t_ref)
-            sv_est = self.filter._apply_state_deviation(sv, dev)
-            self.filter.propagator.reinitialize(state_vector=sv_est)
-
         def _propagate_from_reference(t_ref, P_ref, t_targets) -> dict:
-            t_targets = np.asarray(t_targets, dtype=float)
             if len(t_targets) == 0:
                 return {}
-
-            is_backward = bool(np.all(t_targets < float(t_ref)))
-            all_t = np.unique(np.concatenate([[float(t_ref)], t_targets]))
-            if is_backward:
-                all_t = all_t[::-1]  # descending: t_ref first
-            ep_arr = _build_epoch_array(all_t)
-
-            # Build estimated state vector at t_ref
-            sv = self.filter.propagator.full_state_vector
-            dev = _state_dev_at(float(t_ref))
-            sv_est = self.filter._apply_state_deviation(sv, dev)
-
-            # Reinitialize with estimated state AND new tspan in one call.
-            self.filter.propagator.reinitialize(
-                state_vector=sv_est,
-                tspan=ep_arr,
-                backward=is_backward,
-            )
-            self.filter.propagator.propagate(display_progress=False)
-
-            # For backward propagation, propagate() flips the output to ascending
-            # time order so Trajectory.get_STM works. Mirror that flip here so
-            # all_t stays consistent with the trajectory's epoch ordering.
-            if is_backward:
-                all_t = all_t[::-1]  # ascending: [..., t_ref] (t_ref is last)
-                phi_ref_idx = len(all_t) - 1
-            else:
-                phi_ref_idx = 0
-
-            tmp_traj = Trajectory(
-                "tmp_covariance_propagation",
-                state_array=self.filter.propagator.propagated_state_array,
-            )
-            tmp_traj.add_STMs(self.filter.propagator.STM)
-
-            Phi_ref = _get_stm(tmp_traj, float(t_ref), idx=phi_ref_idx)
-
-            result = {}
-            for t in t_targets:
-                idx_t = int(np.argmin(np.abs(all_t - float(t))))
-                Phi_t = _get_stm(tmp_traj, float(t), idx=idx_t)
-                result[float(t)] = _prop(
-                    np.asarray(P_ref, float), _phi_ratio(Phi_t, Phi_ref)
-                )
-
-            return result
-
-        def _try_stm_nonseq(t, P_ref, Phi_ref):
-            idx_t = int(np.searchsorted(t_hist, float(t), side="left"))
-            idx_t = max(0, min(idx_t, len(t_hist) - 1))
-            try:
-                Phi_t = _get_stm(traj, float(t), idx=idx_t)
-                return _prop(P_ref, _phi_ratio(Phi_t, Phi_ref))
-            except ValueError as e:
-                if "Estimated interpolation error" in str(e):
-                    return None
-                raise
+            leg = self._leg_index_for_epoch(float(t_ref))
+            stms, _ = self._integrate_reference([t_ref, *t_targets], leg)
+            return {float(t): _prop(P_ref, _phi_ratio(stms[float(t)], stms[t_ref]))
+                    for t in t_targets}
 
         # -------------------------
         # Setup
         # -------------------------
-        t_req = np.asarray(
-            [_epoch_to_float(epochs[k]) for k in range(epochs.size)], dtype=float
-        )
-        t_hist = np.asarray(self.timestamps, dtype=float)
-        P_hist = (
-            self.covariance_smooth
-            if (
-                use_smoothed
-                and self.covariance_smooth is not None
-                and len(self.covariance_smooth) > 0
-            )
-            else self.covariance_est
-        )
+        t_req = np.asarray(epochs.et, dtype=float).ravel()
+        if not np.isfinite(t_req).all():
+            raise ValueError("Covariance mapping epochs must be finite.")
+        t_hist = self._timeline_epochs()
+        P_hist = self.covariance_smooth if smoothing else self.covariance_est
+        P_consider = self.covariance_consider
+        if P_consider is None or len(P_consider) == 0:
+            P_consider = getattr(self.filter, "covariance_consider_history", None)
+        if include_consider and (getattr(self.filter, "has_consider", False)
+                                 or self._has_consider_rows(P_consider)):
+            if smoothing:
+                reason = "no smoothed consider-augmented covariance exists"
+            elif not self._has_consider_rows(P_consider):
+                reason = "no consider-augmented covariance history was saved"
+            elif P_hist is None and any(P_c is None for P_c in P_consider):
+                reason = "the legs without considered states have no saved covariance"
+            else:
+                reason = None
+                # legs without considered states have no consider row: their
+                # covariance is already the full one
+                P_hist = list(P_consider) if P_hist is None else [
+                    P if P_c is None else P_c for P, P_c in zip(P_hist, P_consider)]
+            if reason is not None:
+                warnings.warn(
+                    f"Mapping the {'smoothed' if smoothing else 'filtered'} "
+                    f"covariance without considered-parameter uncertainty: "
+                    f"{reason}. Pass include_consider=False to silence this.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+        if P_hist is None or len(P_hist) == 0:
+            raise ValueError("No covariance history available.")
+        if t_hist is None or len(t_hist) != len(P_hist):
+            raise ValueError("Covariance history and filter timeline lengths differ.")
+        if not np.isfinite(t_hist).all():
+            raise ValueError("Covariance history epochs must be finite.")
+        # Simultaneous updates retain their filter order; the last one wins.
+        order = np.argsort(t_hist, kind="stable")
+        t_hist = t_hist[order]
+        P_hist = [np.asarray(P_hist[i], dtype=float) for i in order]
 
         # =========================================================
         # NON-SEQUENCE CASE
         # =========================================================
-        if not getattr(self.filter, "flag_sequence", False):
+        if not is_sequence:
+            propagator = self.filter.propagator
+            initial_state = propagator.full_state_vector
+            epoch0 = float(np.asarray(initial_state.epoch.et).ravel()[0])
+            prior_t = epoch0 if apriori_epoch is None else float(apriori_epoch)
+            if apriori_covariance is None:
+                prior = getattr(self.filter, "initial_covariance", None)
+                if prior is None:
+                    prior = getattr(getattr(self.filter, "settings", None),
+                                    "initial_covariance", None)
+                if prior is not None:
+                    apriori_covariance = prior.matrix_without_units()
 
-            t_arc_start = float(t_hist[0])
-            t_arc_end = float(t_hist[-1])
-
-            t_before = t_req[t_req < t_arc_start]
-            t_inside = t_req[(t_req >= t_arc_start) & (t_req <= t_arc_end)]
-            t_after = t_req[t_req > t_arc_end]
-
-            out_map = {}
-
-            # Inside arc — try stored STMs first, fallback to reprop
-            P_ref_inside = np.asarray(P_hist[-1], float)
-            Phi_ref_inside = _get_stm(traj, float(t_hist[-1]), idx=len(t_hist) - 1)
-
-            fallback_groups = {}
-            for t in t_inside:
-                P_t = _try_stm_nonseq(t, P_ref_inside, Phi_ref_inside)
-                if P_t is not None:
-                    out_map[float(t)] = P_t
+            references = []
+            for t in t_req:
+                index = (len(t_hist) - 1 if (use_all_data or
+                         (legacy_reference and t >= t_hist[0])) else
+                         int(np.searchsorted(t_hist, t - lookback_s, side="right")) - 1)
+                if index < 0 and (smoothing or legacy_reference):
+                    # Preserve boundary mapping for the legacy/smoothed product.
+                    index = 0
+                if index < 0:
+                    if apriori_covariance is None:
+                        raise ValueError("A prior covariance is required before the first update.")
+                    references.append((prior_t, np.asarray(apriori_covariance, float)))
                 else:
-                    idx_near = _nearest_hist_idx(float(t))
-                    fallback_groups.setdefault(idx_near, []).append(float(t))
+                    references.append((float(t_hist[index]), P_hist[index]))
 
-            for idx_ref, t_targets in fallback_groups.items():
-                out_map.update(
-                    _propagate_from_reference(
-                        float(t_hist[idx_ref]),
-                        np.asarray(P_hist[idx_ref], float),
-                        np.asarray(t_targets, float),
+            # Look up by epoch, never by measurement index on an unrelated STM
+            # grid. Cache repeated reference STMs across mapping epochs.
+            needed = {float(t) for t, (base_t, _) in zip(t_req, references) if t != base_t}
+            needed.update(base_t for t, (base_t, _) in zip(t_req, references) if t != base_t)
+            stms, missing = {}, []
+            for t in sorted(needed):
+                try:
+                    stms[t] = _as_matrix(traj.get_STM(epoch=t))
+                except ValueError as error:
+                    message = str(error).lower()
+                    if ("interpolation error" in message
+                            or "cannot extrapolate" in message):
+                        missing.append(t)
+                    else:
+                        raise
+
+            if missing:
+                from copy import deepcopy
+                from scarabaeus import Trajectory
+
+                # Reintegrate from the actual nominal state epoch, not from a
+                # boundary time with the initial state's coordinates relabelled.
+                # All STMs in a ratio must come from the same integration.
+                stms = {epoch0: np.eye(P_hist[0].shape[0])}
+                for backward in (True, False):
+                    targets = sorted(t for t in needed
+                                     if (t < epoch0 if backward else t > epoch0))
+                    if not targets:
+                        continue
+                    times = np.unique(np.r_[epoch0, targets])
+                    prop = deepcopy(propagator)
+                    prop.reinitialize(
+                        state_vector=deepcopy(initial_state),
+                        tspan=_build_epoch_array(times[::-1] if backward else times),
+                        backward=backward, propagate_STM=True,
+                        STM0=np.eye(P_hist[0].shape[0]),
                     )
-                )
-
-            # Before arc
-            if len(t_before) > 0:
-                out_map.update(
-                    _propagate_from_reference(
-                        t_arc_start, np.asarray(P_hist[0], float), t_before
+                    prop.propagate(display_progress=False)
+                    tmp_traj = Trajectory(
+                        "tmp_covariance_propagation",
+                        state_array=prop.propagated_state_array,
                     )
-                )
+                    tmp_traj.add_STMs(prop.STM, timestamps=prop.propagated_state_array.epoch)
+                    for t in targets:
+                        stms[t] = _as_matrix(tmp_traj.get_STM(epoch=t))
 
-            # After arc
-            if len(t_after) > 0:
-                out_map.update(
-                    _propagate_from_reference(
-                        t_arc_end, np.asarray(P_hist[-1], float), t_after
-                    )
-                )
-
-            return [out_map[float(t)] for t in t_req]
+            out = []
+            for t, (base_t, P_ref) in zip(t_req, references):
+                if t == base_t:
+                    out.append(0.5 * (P_ref + P_ref.T))
+                else:
+                    out.append(_prop(P_ref, _phi_ratio(stms[float(t)], stms[base_t])))
+            return out
 
         # =========================================================
         # SEQUENCE CASE
@@ -709,7 +1731,8 @@ class SolutionOD:
             return float(leg), float(leg)
 
         def _find_leg(t) -> int:
-            for i in range(nlegs):
+            # Shared event epochs belong to the newly initialized leg.
+            for i in reversed(range(nlegs)):
                 t0, t1 = _leg_bounds(i)
                 if t0 - 1e-12 <= float(t) <= t1 + 1e-12:
                     return i
@@ -717,17 +1740,9 @@ class SolutionOD:
                 return -1
             return nlegs
 
-        # Build the timeline that matches P_hist exactly.
-        # covariance_est has one entry per filter timeline step (meas + event epochs);
-        # t_hist contains only measurement epochs, so indexing P_hist by t_hist
-        # position is off by one for every post-event entry.
-        _meas_t = np.asarray(t_hist, dtype=float)
-        _evt_t = (
-            np.asarray(self.filter.events_epochs, dtype=float)
-            if hasattr(self.filter, "events_epochs") and len(self.filter.events_epochs) > 0
-            else np.array([])
-        )
-        _timeline = np.unique(np.concatenate([_meas_t, _evt_t]))
+        # Use the actual covariance-row timeline, including event epochs and
+        # simultaneous updates, rather than rebuilding a unique measurement grid.
+        _timeline = t_hist
 
         def _timeline_idx_at_or_before(t: float) -> int:
             """Index into _timeline (and P_hist) of the last entry <= t."""
@@ -759,7 +1774,7 @@ class SolutionOD:
             P_ref = np.asarray(P_hist[idx_ref], float)
 
             # Exact match: t lands on a known filter epoch — return directly.
-            if abs(t_ref - float(t)) < 1e-3:
+            if t_ref == float(t):
                 out_map[float(t)] = 0.5 * (P_ref + P_ref.T)
                 continue
 
@@ -771,7 +1786,7 @@ class SolutionOD:
                 # partitioning needed or desired here.
                 out_map[float(t)] = _prop(P_ref, _phi_ratio(Phi_t, Phi_ref))
             except ValueError as e:
-                if "Estimated interpolation error" in str(e):
+                if "interpolation error" in str(e).lower():
                     fallback_groups.setdefault(idx_ref, []).append(float(t))
                 else:
                     raise
@@ -788,14 +1803,14 @@ class SolutionOD:
         if len(t_before_all) > 0:
             out_map.update(
                 _propagate_from_reference(
-                    t_arc_global_start, np.asarray(P_hist[0], float), t_before_all
+                    float(t_hist[0]), np.asarray(P_hist[0], float), t_before_all
                 )
             )
 
         if len(t_after_all) > 0:
             out_map.update(
                 _propagate_from_reference(
-                    t_arc_global_end, np.asarray(P_hist[-1], float), t_after_all
+                    float(t_hist[-1]), np.asarray(P_hist[-1], float), t_after_all
                 )
             )
 
@@ -805,534 +1820,540 @@ class SolutionOD:
         self,
         epochs: EpochArray,
         use_smoothed: bool = True,
+        *,
+        lookback_s: Optional[float] = None,
+        use_all_data: bool = False,
+        apriori_deviation=None,
+        apriori_epoch: Optional[float] = None,
     ) -> List[StateArray]:
-        """
-        Propagate the estimated state to arbitrary epochs using trajectory STMs.
-
-        For epochs inside the measurement arc, uses stored trajectory STMs.
-        For epochs outside the arc, re-propagates from the nearest arc boundary.
+        r"""Map deviations with STMs and add them to the nominal state once.
 
         Parameters
         ----------
         epochs : EpochArray
-            Epochs where you want the estimated state.
+            Target epochs, converted to TDB seconds internally. None or an empty
+            array returns an empty list. Input order and duplicates are retained.
+        use_smoothed : bool, optional
+            Use a nonempty smoothed deviation history when available; otherwise
+            use filtered deviations. Defaults to True.
+        lookback_s : float or None, optional
+            Nonnegative data-cutoff interval in seconds. Zero selects the last
+            update at or before t; positive values select the last update at or
+            before t-lookback_s. None preserves the legacy convention: continuous
+            arcs use the final update inside/after the measurement arc and the
+            first update before it; sequences use the last timeline update.
+            The default is not a causal filtered estimate.
+        use_all_data : bool, optional
+            Reconstruct every target from the final update. Defaults to False.
+            Cannot be combined with positive lookback. Continuous arcs only.
+        apriori_deviation : array_like, optional
+            Prior correction for an explicit cutoff before the first update,
+            in full nominal component order and units. Defaults to the filter's
+            initial deviation, then its settings, then a zero vector.
+        apriori_epoch : float, optional
+            TDB epoch of the prior correction. Defaults to the nominal initial
+            state epoch. Ignored when all references are stored updates.
 
         Returns
         -------
         list of StateArray
-            One StateArray per requested epoch.
+            One corrected state per target. Component units, frames, owners and
+            ordering follow the nominal model. Sequence leg sizes may differ.
+
+        Raises
+        ------
+        ValueError
+            If a history or trajectory is absent; histories, epochs, cutoffs or
+            dimensions are invalid; an explicit cutoff selects smoothed data;
+            or reference and target belong to different sequence legs.
+        NotImplementedError
+            For positive lookback or all-data reconstruction on sequences;
+            these operations require event transition maps.
+        numpy.linalg.LinAlgError
+            If the reference STM is singular.
+
+        Notes
+        -----
+        For a selected correction at r and STMs sharing nominal origin t0,
+
+        .. math::
+
+            \hat x(t) = x_{\mathrm{nom}}(t)
+                + \Phi(t,t_0)\Phi(r,t_0)^{-1}\delta x_r.
+
+        This is linearized mapping about the fitted reference. It performs no
+        new filter update, adds no process noise, and is not a nonlinear
+        integration of the corrected state. The correction is added once.
+        Missing coverage or rejected STM interpolation triggers nominal
+        reintegration on copies, preserving the selected reference update and
+        the live filter. Shared sequence boundaries belong to the later leg.
+
+        Examples
+        --------
+        For an existing solution and target EpochArray ``epochs``::
+
+            filtered = solution.propagate_state(
+                epochs, use_smoothed=False, lookback_s=0.0)
+            prediction_14d = solution.propagate_state(
+                epochs, use_smoothed=False, lookback_s=14 * 86400.0)
+            reconstructed = solution.propagate_state(
+                epochs, use_smoothed=False, use_all_data=True)
+
+        See Also
+        --------
+        propagate_covariance : Covariance mapping with the same reference policy.
+        propagate_state_covariance : Return matched state/covariance pairs.
+        estimated_trajectory : Read each measurement epoch's own filter update.
         """
-        from scarabaeus import Trajectory
-
-        if self.deviation_est is None:
-            raise ValueError("No state deviation history available.")
-
+        if epochs is None or epochs.size == 0:
+            return []
+        t_hist, deviations, smoothing = self._deviation_history(use_smoothed)
         traj = getattr(self.filter, "trajectory", None)
         if traj is None:
             raise ValueError("Filter has no trajectory attached.")
+        legacy_reference = lookback_s is None
+        lookback_s = 0.0 if legacy_reference else float(lookback_s)
+        if not np.isfinite(lookback_s) or lookback_s < 0:
+            raise ValueError("lookback_s must be finite and nonnegative.")
+        if use_all_data and lookback_s != 0:
+            raise ValueError("use_all_data and lookback_s cannot be combined.")
+        if smoothing and not legacy_reference and not use_all_data:
+            raise ValueError("A rolling data cutoff cannot use smoothed deviations.")
+        sequence = getattr(self.filter, "flag_sequence", False)
+        if sequence and (lookback_s != 0 or use_all_data):
+            raise NotImplementedError(
+                "Rolling cutoffs and reconstruction across sequence events "
+                "require event transition maps; use a continuous arc.")
+        t_req = np.asarray(epochs.et, float).ravel()
+        if not np.isfinite(t_req).all():
+            raise ValueError("State mapping epochs must be finite.")
 
-        _dev_source = (
-            self.deviation_smooth
-            if (use_smoothed and self.deviation_smooth is not None)
-            else self.deviation_est
-        )
-
-        # -------------------------
-        # Helpers
-        # -------------------------
-        def _epoch_to_float(ep) -> float:
-            try:
-                return float(ep.times.values)
-            except Exception:
-                return float(ep)
-
-        def _as_matrix(Phi) -> np.ndarray:
-            Phi = np.asarray(Phi, dtype=float)
-            if Phi.ndim == 1:
-                n = int(np.sqrt(Phi.size))
-                Phi = Phi.reshape(n, n)
-            return Phi
-
-        def _build_epoch_array(t_arr):
-            return EpochArray(np.asarray(t_arr, dtype=float), sys="TDB")
-
-        def _get_stm(traj_obj, t, idx):
-            return _as_matrix(traj_obj.get_STM(epoch=float(t), idx=idx))
-
-        def _get_stm_seq(traj_obj, t, idx_leg):
-            return _as_matrix(
-                traj_obj.get_STM_sequence(epoch=float(t), idx_leg=idx_leg)
-            )
-
-        def _nearest_hist_idx(t) -> int:
-            idx = int(np.argmin(np.abs(t_hist - float(t))))
-            return max(0, min(idx, len(t_hist) - 1))
-
-        def _state_dev_at(t_ref) -> np.ndarray:
-            idx = int(np.argmin(np.abs(t_hist - float(t_ref))))
-            return np.asarray(_dev_source[idx], dtype=float).ravel()
-
-        def _reprop(t_ref, t_targets):
-            """Re-propagate from t_ref to t_targets. Returns (tmp_traj, all_t, is_backward)."""
-            t_targets_arr = np.asarray(t_targets, float)
-            is_backward = bool(np.all(t_targets_arr < float(t_ref)))
-            all_t = np.unique(np.concatenate([[float(t_ref)], t_targets_arr]))
-            if is_backward:
-                all_t = all_t[::-1]  # descending: t_ref first for backward integration
-            ep_arr = _build_epoch_array(all_t)
-            sv = self.filter.propagator.full_state_vector
-            dev = _state_dev_at(float(t_ref))
-            sv_est = self.filter._apply_state_deviation(sv, dev)
-            self.filter.propagator.reinitialize(
-                state_vector=sv_est,
-                tspan=ep_arr,
-                backward=is_backward,
-            )
-            self.filter.propagator.propagate()
-
-            # propagate() flips backward output to ascending order; mirror here
-            if is_backward:
-                all_t = all_t[::-1]  # ascending: [..., t_ref] (t_ref is last)
-            tmp_traj = Trajectory(
-                "tmp_state_propagation",
-                state_array=self.filter.propagator.propagated_state_array,
-            )
-            tmp_traj.add_STMs(self.filter.propagator.STM)
-            return tmp_traj, all_t, is_backward
-
-        def _nominal_from_propagated(all_t, t) -> dict:
-            """Extract nominal state directly from propagated_state_array — no SPICE."""
-            idx = int(np.argmin(np.abs(all_t - float(t))))
-
-            sa = self.filter.propagator.propagated_state_array
-            pos_nom = None
-            vel_nom = None
-            par_blocks = []
-
-            for entry in sa.state:
-                name, size, _, _, _, awf = entry
-                vals = np.asarray(awf.quantity.values)
-                v = vals[idx] if vals.ndim == 2 else vals.ravel()[:size]
-                if name == "position":
-                    pos_nom = np.asarray(v).ravel()
-                elif name == "velocity":
-                    vel_nom = np.asarray(v).ravel()
-                else:
-                    par_blocks.append(np.asarray(v).ravel())
-
-            return {
-                "position": pos_nom,
-                "velocity": vel_nom,
-                "parameters": np.concatenate(par_blocks) if par_blocks else None,
-            }
-
-        def _apply_stm_to_dev(Phi_t, Phi_ref, dx_ref) -> np.ndarray:
-            Phi_t = _as_matrix(Phi_t)
-            Phi_ref = _as_matrix(Phi_ref)
-            return (
-                Phi_t @ np.linalg.solve(Phi_ref, np.eye(Phi_ref.shape[0]))
-            ) @ np.asarray(dx_ref, float).ravel()
-
-        def _state_from_dev(t, dx, nominal=None) -> tuple:
-            """
-            Add deviation dx to nominal state at t.
-            If nominal is None, queries SPICE (inside-arc only).
-            If nominal is a dict, uses it directly (outside-arc safe).
-            """
-            if nominal is None:
-                ep = _build_epoch_array([float(t)])
-                ref = self.filter.trajectory.get_state(ep[0])
-                pos_nom = np.asarray(ref["position"].values).ravel()
-                vel_nom = np.asarray(ref["velocity"].values).ravel()
-                par_nom = (
-                    np.asarray(ref["parameters"].values).ravel()
-                    if ref.get("parameters") is not None
-                    else None
-                )
+        # Group by leg so local STMs are never mixed across a definition change.
+        groups = {}
+        for t in t_req:
+            leg = self._leg_index_for_epoch(t) if sequence else None
+            if sequence and leg is None:
+                first = float(np.asarray(self.filter.legs_epochs[0]).ravel()[0])
+                if t > first:
+                    raise ValueError(f"Epoch {t} lies in a gap between sequence legs.")
+                leg = 0
+            index = (len(t_hist) - 1 if (not sequence and (use_all_data or
+                     (legacy_reference and t >= t_hist[0]))) else
+                     int(np.searchsorted(t_hist, t - lookback_s, side="right")) - 1)
+            if index < 0 and (smoothing or legacy_reference):
+                index = 0
+            model = self._reference_model(leg)
+            if index < 0:
+                if sequence:
+                    raise ValueError("No state update in this sequence leg at the requested cutoff.")
+                base_t = (float(np.asarray(model.epoch.et).ravel()[0])
+                          if apriori_epoch is None else float(apriori_epoch))
+                prior = apriori_deviation
+                if prior is None:
+                    prior = getattr(self.filter, "initial_deviation", None)
+                if prior is None:
+                    prior = getattr(getattr(self.filter, "settings", None), "initial_deviation", None)
+                dx = np.zeros(model.size) if prior is None else np.asarray(prior, float).ravel()
             else:
-                pos_nom = nominal["position"]
-                vel_nom = nominal["velocity"]
-                par_nom = nominal.get("parameters")
+                base_t, dx = float(t_hist[index]), deviations[index]
+                if sequence:
+                    if self._leg_index_for_epoch(base_t) != leg:
+                        raise ValueError("State reference and target belong to different sequence legs.")
+                    dx = dx[:model.size]  # sequence storage pads shorter definitions
+            if not np.isfinite(base_t) or not np.isfinite(dx).all():
+                raise ValueError("State reference epoch and deviation must be finite.")
+            groups.setdefault(leg, []).append((float(t), base_t, dx))
 
-            pos = pos_nom + dx[:3]
-            vel = vel_nom + dx[3:6]
-            par = (par_nom + dx[6:]) if (par_nom is not None and len(dx) > 6) else None
-            return pos, vel, par
-
-        def _pack_as_state_array(t, pos, vel, par) -> StateArray:
-            """Pack pos/vel/par into a StateArray."""
-            ep = _build_epoch_array([float(t)])
-            new_components = []
-            par_offset = 0
-            for entry in self.filter.propagator.full_state_vector.state:
-                name, size, est_type, dyn_type, body, value_template = entry
-                if name == "position":
-                    vals = ArrayWFrame(
-                        ArrayWUnits(pos, value_template.quantity.units),
-                        value_template.frame,
-                    )
-                elif name == "velocity":
-                    vals = ArrayWFrame(
-                        ArrayWUnits(vel, value_template.quantity.units),
-                        value_template.frame,
-                    )
-                else:
-                    if par is not None:
-                        param_vals = np.asarray(par).ravel()[
-                            par_offset : par_offset + size
-                        ]
-                        par_offset += size
-                    else:
-                        param_vals = value_template.quantity.values
-                    vals = ArrayWFrame(
-                        ArrayWUnits(param_vals, value_template.quantity.units),
-                        value_template.frame,
-                    )
-                new_components.append((name, size, est_type, dyn_type, body, vals))
-
-            return StateArray(
-                epoch=ep,
-                origin=self.filter.propagator.full_state_vector.origin,
-                state=StateDefinition.from_components(new_components),
-            )
-
-        # -------------------------
-        # Setup
-        # -------------------------
-        t_req = np.asarray(
-            [_epoch_to_float(epochs[k]) for k in range(epochs.size)], dtype=float
-        )
-        t_hist = np.asarray(self.timestamps, dtype=float)
-
-        dx_ref_inside = _dev_source[-1].ravel()
-
-        # =========================================================
-        # NON-SEQUENCE CASE
-        # =========================================================
-        if not getattr(self.filter, "flag_sequence", False):
-
-            t_arc_start = float(t_hist[0])
-            t_arc_end = float(t_hist[-1])
-
-            t_before = t_req[t_req < t_arc_start]
-            t_inside = t_req[(t_req >= t_arc_start) & (t_req <= t_arc_end)]
-            t_after = t_req[t_req > t_arc_end]
-
-            pos_map = {}
-            vel_map = {}
-            par_map = {}
-
-            Phi_ref_inside = _get_stm(traj, float(t_hist[-1]), idx=len(t_hist) - 1)
-
-            # --- Inside arc: SPICE available ---
-            fallback_groups = {}
-            for t in t_inside:
-                idx_t = int(np.searchsorted(t_hist, float(t), side="left"))
-                idx_t = max(0, min(idx_t, len(t_hist) - 1))
-                try:
-                    Phi_t = _get_stm(traj, float(t), idx=idx_t)
-                    dx = _apply_stm_to_dev(Phi_t, Phi_ref_inside, dx_ref_inside)
-                    pos, vel, par = _state_from_dev(t, dx)  # uses SPICE
-                    pos_map[float(t)] = pos
-                    vel_map[float(t)] = vel
-                    par_map[float(t)] = par
-                except ValueError as e:
-                    if "Estimated interpolation error" in str(e):
-                        fallback_groups.setdefault(
-                            _nearest_hist_idx(float(t)), []
-                        ).append(float(t))
-                    else:
-                        raise
-
-            for idx_ref, t_targets in fallback_groups.items():
-                t_ref_f = float(t_hist[idx_ref])
-                dx_ref = _dev_source[idx_ref].ravel()
-                tmp_traj, all_t, is_backward = _reprop(
-                    t_ref_f, np.asarray(t_targets, float)
-                )
-                phi_ref_idx = len(all_t) - 1 if is_backward else 0
-                Phi_ref = _get_stm(tmp_traj, t_ref_f, idx=phi_ref_idx)
-                for t in t_targets:
-                    idx_t = int(np.argmin(np.abs(all_t - float(t))))
-                    Phi_t = _get_stm(tmp_traj, float(t), idx=idx_t)
-                    dx = _apply_stm_to_dev(Phi_t, Phi_ref, dx_ref)
-                    nom = _nominal_from_propagated(all_t, float(t))
-                    pos, vel, par = _state_from_dev(t, dx, nominal=nom)
-                    pos_map[float(t)] = pos
-                    vel_map[float(t)] = vel
-                    par_map[float(t)] = par
-
-            # --- Before arc: no SPICE, use tmp_traj nominal ---
-            if len(t_before) > 0:
-                dx_ref = _dev_source[0].ravel()
-                tmp_traj, all_t, is_backward = _reprop(t_arc_start, t_before)
-                phi_ref_idx = len(all_t) - 1 if is_backward else 0
-                Phi_ref = _get_stm(tmp_traj, t_arc_start, idx=phi_ref_idx)
-                for t in t_before:
-                    idx_t = int(np.argmin(np.abs(all_t - float(t))))
-                    Phi_t = _get_stm(tmp_traj, float(t), idx=idx_t)
-                    dx = _apply_stm_to_dev(Phi_t, Phi_ref, dx_ref)
-                    nom = _nominal_from_propagated(all_t, float(t))
-                    pos, vel, par = _state_from_dev(t, dx, nominal=nom)
-                    pos_map[float(t)] = pos
-                    vel_map[float(t)] = vel
-                    par_map[float(t)] = par
-
-            # --- After arc: no SPICE, use tmp_traj nominal ---
-            if len(t_after) > 0:
-                dx_ref = _dev_source[-1].ravel()
-                tmp_traj, all_t, is_backward = _reprop(t_arc_end, t_after)
-                phi_ref_idx = len(all_t) - 1 if is_backward else 0
-                Phi_ref = _get_stm(tmp_traj, t_arc_end, idx=phi_ref_idx)
-                for t in t_after:
-                    idx_t = int(np.argmin(np.abs(all_t - float(t))))
-                    Phi_t = _get_stm(tmp_traj, float(t), idx=idx_t)
-                    dx = _apply_stm_to_dev(Phi_t, Phi_ref, dx_ref)
-                    nom = _nominal_from_propagated(all_t, float(t))
-                    pos, vel, par = _state_from_dev(t, dx, nominal=nom)
-                    pos_map[float(t)] = pos
-                    vel_map[float(t)] = vel
-                    par_map[float(t)] = par
-
-            return [
-                _pack_as_state_array(
-                    t, pos_map[float(t)], vel_map[float(t)], par_map.get(float(t))
-                )
-                for t in t_req
-            ]
-
-        # =========================================================
-        # SEQUENCE CASE
-        # =========================================================
-        legs_epochs = self.filter.legs_epochs
-        nlegs = len(legs_epochs)
-
-        def _leg_bounds(i):
-            leg = legs_epochs[i]
-            if isinstance(leg, np.ndarray):
-                return float(leg[0]), float(leg[-1])
-            return float(leg), float(leg)
-
-        def _find_leg(t) -> int:
-            for i in range(nlegs):
-                t0, t1 = _leg_bounds(i)
-                if t0 - 1e-12 <= float(t) <= t1 + 1e-12:
-                    return i
-            if float(t) < float(_leg_bounds(0)[0]):
-                return -1
-            return nlegs
-
-        # Build the timeline that matches _dev_source exactly
-        # (measurement epochs + event epochs, same as filter timeline).
-        _meas_t = np.asarray(t_hist, dtype=float)
-        _evt_t = (
-            np.asarray(self.filter.events_epochs, dtype=float)
-            if hasattr(self.filter, "events_epochs") and len(self.filter.events_epochs) > 0
-            else np.array([])
-        )
-        _timeline = np.unique(np.concatenate([_meas_t, _evt_t]))
-
-        def _timeline_idx_at_or_before(t: float) -> int:
-            """Index into _timeline (and _dev_source) of the last entry <= t."""
-            j = int(np.searchsorted(_timeline, float(t), side="right") - 1)
-            return max(0, min(j, len(_dev_source) - 1))
-
-        t_arc_global_start = float(_leg_bounds(0)[0])
-        t_arc_global_end = float(_leg_bounds(nlegs - 1)[1])
-
-        t_before_all = t_req[t_req < t_arc_global_start]
-        t_after_all = t_req[t_req > t_arc_global_end]
-        t_inside_all = t_req[
-            (t_req >= t_arc_global_start) & (t_req <= t_arc_global_end)
-        ]
-
-        pos_map = {}
-        vel_map = {}
-        par_map = {}
-        fallback_groups = {}
-
-        # --- Inside arc: SPICE available ---
-        for t in t_inside_all:
-            i_leg = _find_leg(float(t))
-            i_leg = max(0, min(i_leg, nlegs - 1))
-
-            # Use the last timeline epoch at or before t as the forward reference.
-            idx_ref = _timeline_idx_at_or_before(float(t))
-            t_ref = float(_timeline[idx_ref])
-            dx_ref = _dev_source[idx_ref].ravel()
-
+        result = {}
+        for leg, requests in groups.items():
+            needed = {t for target, base, _ in requests for t in (target, base)}
             try:
-                Phi_ref = _get_stm_seq(traj, t_ref, i_leg)
-                Phi_t = _get_stm_seq(traj, float(t), i_leg)
-                dx = _apply_stm_to_dev(Phi_t, Phi_ref, dx_ref)
-                pos, vel, par = _state_from_dev(t, dx)  # uses SPICE
-                pos_map[float(t)] = pos
-                vel_map[float(t)] = vel
-                par_map[float(t)] = par
-            except ValueError as e:
-                if "Estimated interpolation error" in str(e):
-                    fallback_groups.setdefault(idx_ref, []).append(float(t))
-                else:
+                stms = {}
+                for target, base, _ in requests:
+                    if target == base:
+                        continue
+                    for t in (target, base):
+                        if t not in stms:
+                            value = (traj.get_STM(epoch=t) if leg is None else
+                                     traj.get_STM_sequence(epoch=t, idx_leg=leg))
+                            stms[t] = np.asarray(value, float)
+                nominal = {t: self._nominal_state(t, leg) for t, _, _ in requests}
+            except ValueError as error:
+                message = str(error).lower()
+                # Sequence STM lookups say "(no extrapolation)" off the leg grid.
+                if not any(key in message for key in
+                           ("interpolation error", "cannot extrapolate", "no extrapolation")):
                     raise
-
-        for idx_ref, t_targets in fallback_groups.items():
-            t_ref_f = float(_timeline[idx_ref])
-            dx_ref = _dev_source[idx_ref].ravel()
-            tmp_traj, all_t, is_backward = _reprop(
-                t_ref_f, np.asarray(t_targets, float)
-            )
-            phi_ref_idx = len(all_t) - 1 if is_backward else 0
-            Phi_ref = _get_stm(tmp_traj, t_ref_f, idx=phi_ref_idx)
-            for t in t_targets:
-                idx_t = int(np.argmin(np.abs(all_t - float(t))))
-                Phi_t = _get_stm(tmp_traj, float(t), idx=idx_t)
-                dx = _apply_stm_to_dev(Phi_t, Phi_ref, dx_ref)
-                nom = _nominal_from_propagated(all_t, float(t))
-                pos, vel, par = _state_from_dev(t, dx, nominal=nom)
-                pos_map[float(t)] = pos
-                vel_map[float(t)] = vel
-                par_map[float(t)] = par
-
-        # --- Before all legs ---
-        if len(t_before_all) > 0:
-            dx_ref = _dev_source[0].ravel()
-            tmp_traj, all_t, is_backward = _reprop(t_arc_global_start, t_before_all)
-            phi_ref_idx = len(all_t) - 1 if is_backward else 0
-            Phi_ref = _get_stm(tmp_traj, t_arc_global_start, idx=phi_ref_idx)
-            for t in t_before_all:
-                idx_t = int(np.argmin(np.abs(all_t - float(t))))
-                Phi_t = _get_stm(tmp_traj, float(t), idx=idx_t)
-                dx = _apply_stm_to_dev(Phi_t, Phi_ref, dx_ref)
-                nom = _nominal_from_propagated(all_t, float(t))
-                pos, vel, par = _state_from_dev(t, dx, nominal=nom)
-                pos_map[float(t)] = pos
-                vel_map[float(t)] = vel
-                par_map[float(t)] = par
-
-        # --- After all legs ---
-        if len(t_after_all) > 0:
-            dx_ref = _dev_source[-1].ravel()
-            tmp_traj, all_t, is_backward = _reprop(t_arc_global_end, t_after_all)
-            phi_ref_idx = len(all_t) - 1 if is_backward else 0
-            Phi_ref = _get_stm(tmp_traj, t_arc_global_end, idx=phi_ref_idx)
-            for t in t_after_all:
-                idx_t = int(np.argmin(np.abs(all_t - float(t))))
-                Phi_t = _get_stm(tmp_traj, float(t), idx=idx_t)
-                dx = _apply_stm_to_dev(Phi_t, Phi_ref, dx_ref)
-                nom = _nominal_from_propagated(all_t, float(t))
-                pos, vel, par = _state_from_dev(t, dx, nominal=nom)
-                pos_map[float(t)] = pos
-                vel_map[float(t)] = vel
-                par_map[float(t)] = par
-
-        return [
-            _pack_as_state_array(
-                t, pos_map[float(t)], vel_map[float(t)], par_map.get(float(t))
-            )
-            for t in t_req
-        ]
+                # Rebuild *both* numerator and denominator on one reference.
+                stms, nominal = self._integrate_reference(needed, leg)
+            for t, base_t, dx in requests:
+                mapped = dx if t == base_t else stms[t] @ np.linalg.solve(stms[base_t], dx)
+                result[t] = self._correct_state(nominal[t], mapped)
+        return [result[float(t)] for t in t_req]
 
     def propagate_state_covariance(
         self,
         epochs: EpochArray,
         use_smoothed: bool = True,
+        *,
+        lookback_s: Optional[float] = None,
+        use_all_data: bool = False,
+        include_consider: bool = True,
+        apriori_deviation=None,
+        apriori_covariance=None,
+        apriori_epoch: Optional[float] = None,
     ) -> List[tuple]:
-        """
-        Propagate both the estimated state and covariance to arbitrary epochs.
+        """Map state and covariance using the same data cutoff and smoothing.
 
         Parameters
         ----------
         epochs : EpochArray
-            Epochs where you want the estimated state and covariance.
+            Target epochs. None or an empty array returns an empty list.
         use_smoothed : bool, optional
-            If True and a smoothed solution is available, uses smoothed deviations.
-            Defaults to True.
+            Use both smoothed histories if available. Defaults to True. If
+            neither is stored, use filtered histories. If only one is stored,
+            raise instead of mixing smoothed and filtered solution products.
+        lookback_s : float or None, optional
+            Data-cutoff interval in seconds, as in :meth:`propagate_state`.
+            None preserves legacy reference selection; zero uses data through
+            t; positive values use data through t-lookback_s.
+        use_all_data : bool, optional
+            Reconstruct every target from the final update. Defaults to False;
+            cannot be combined with positive lookback. Continuous arcs only.
+        include_consider : bool, optional
+            Include consider-augmented covariance when the filter has considered
+            parameters. Defaults to True. Falls back to the estimated-only
+            covariance, with a RuntimeWarning, when no augmented history fits
+            (always the case when smoothing).
+        apriori_deviation : array_like, optional
+            Prior correction in nominal component units for cutoffs before data.
+            Defaults to the filter's initial deviation or zero.
+        apriori_covariance : array_like, optional
+            Full prior covariance for cutoffs before data. Defaults to the
+            filter's initial covariance. Element (i,j) has the product of
+            component i and j units, in the same order as the nominal state.
+        apriori_epoch : float, optional
+            Shared TDB epoch of the prior deviation and covariance. Defaults to
+            the nominal initial state epoch.
 
         Returns
         -------
-        list of (StateArray, np.ndarray)
-            One tuple per requested epoch: (StateArray, P(t)).
+        list of tuple of (StateArray, ndarray)
+            One pair per target in request order, retaining duplicates. Each
+            covariance has shape (state.size, state.size) and uses its state's
+            component ordering, frames and units.
+
+        Raises
+        ------
+        ValueError
+            If only one smoothed history is stored, output counts/dimensions
+            differ, or either mapper rejects the input/history.
+        NotImplementedError
+            For cutoffs/reconstruction requiring sequence event transition maps.
+        numpy.linalg.LinAlgError
+            If an STM needed by either mapper is singular.
+
+        Notes
+        -----
+        Both quantities are mapped about the fitted reference. Mapping adds no
+        process noise; reconstruction is not a stochastic backward smoother.
+        See the individual mappers for prior selection and integration fallback.
+
+        Examples
+        --------
+        Return causal state/covariance pairs without later measurements::
+
+            pairs = solution.propagate_state_covariance(
+                epochs, use_smoothed=False, lookback_s=0.0)
+            for state, covariance in pairs:
+                sigma = np.sqrt(np.diag(covariance))
+
+        See Also
+        --------
+        propagate_state, propagate_covariance, state_covariance_to_elements
         """
-        state_list = self.propagate_state(epochs, use_smoothed=use_smoothed)
-        cov_list = self.propagate_covariance(epochs, use_smoothed=use_smoothed)
-        return list(zip(state_list, cov_list))
+        if epochs is None or epochs.size == 0:
+            return []
+        smooth_state = self.deviation_smooth is not None and len(self.deviation_smooth) > 0
+        smooth_cov = self.covariance_smooth is not None and len(self.covariance_smooth) > 0
+        if use_smoothed and smooth_state != smooth_cov:
+            raise ValueError("Both smoothed deviations and covariance are required for a paired mapping.")
+        common = dict(use_smoothed=use_smoothed, lookback_s=lookback_s,
+                      use_all_data=use_all_data, apriori_epoch=apriori_epoch)
+        states = self.propagate_state(epochs, apriori_deviation=apriori_deviation, **common)
+        covariances = self.propagate_covariance(
+            epochs, include_consider=include_consider,
+            apriori_covariance=apriori_covariance, **common)
+        if len(states) != len(covariances) or len(states) != epochs.size:
+            raise ValueError("State and covariance mappings returned different epoch counts.")
+        for state, covariance in zip(states, covariances):
+            if covariance.shape != (state.size, state.size):
+                raise ValueError("Mapped state and covariance dimensions differ.")
+        return list(zip(states, covariances))
+
+    def state_covariance_to_elements(
+        self,
+        epochs: Optional[EpochArray] = None,
+        body=None,
+        grav_param=None,
+        use_smoothed: bool = True,
+    ) -> Tuple[np.ndarray, np.ndarray, List[np.ndarray]]:
+        """
+        Express the estimate and its covariance in Keplerian elements.
+
+        Pairs the estimated state and covariance with
+        :meth:`~scarabaeus.OrbitalElements.covariance_to_elements`, so the
+        result is the same solution read in ``(a, e, i, RAAN, argp, M)``
+        instead of Cartesian components. The state and covariance are taken
+        from :meth:`propagate_state_covariance`, which keeps the two consistent
+        with each other and with ``use_smoothed``.
+
+        Parameters
+        ----------
+        epochs : EpochArray, optional
+            Epochs to report. Defaults to the solution's measurement epochs,
+            which for a long arc means one state and covariance propagation per
+            measurement — pass a coarser set if that is more than you need.
+        body : Body or int, optional
+            Which object in the state vector to convert, as the body itself or
+            its SPICE ID. Only needed when more than one body carries a
+            position, as in a spacecraft-plus-asteroid estimate.
+        grav_param : float, ArrayWUnits or CelestialBody, optional
+            Gravitational parameter of the attracting body. Defaults to that of
+            the state's own origin.
+        use_smoothed : bool, optional
+            Passed through to :meth:`propagate_state_covariance`. Defaults to
+            True.
+
+        Returns
+        -------
+        times : numpy.ndarray
+            Epochs, seconds past J2000 TDB, one per row of ``elements``.
+        elements : numpy.ndarray
+            ``(n_epochs, 6)`` mean elements, ordered by
+            :attr:`~scarabaeus.OrbitalElements.MEAN_ELEMENT_NAMES`, in km and
+            radians.
+        covariances : list of numpy.ndarray
+            One ``(6, 6)`` element covariance per epoch.
+
+        Raises
+        ------
+        ElementConversionError
+            If ``body`` is ambiguous or absent from the state vector, or the
+            gravitational parameter cannot be resolved.
+
+        See Also
+        --------
+        scarabaeus.OrbitalElements.covariance_to_elements : The transformation applied here.
+        SolutionOD.propagate_state_covariance : Supplies the state and covariance.
+
+        Notes
+        -----
+        The mapping is linearised about the estimate, so it holds while the
+        Cartesian uncertainty is small against the curvature of the element
+        map. A near-circular or near-equatorial orbit leaves ``argp`` and
+        ``RAAN`` weakly defined, and their variances inflate accordingly —
+        that is the geometry showing through, not a defect in the transform.
+
+        The elements are only Keplerian in an inertial frame centred on the
+        attracting body; reading them off a state expressed otherwise gives
+        numbers without the usual meaning.
+
+        References
+        ----------
+        .. [1] Montenbruck, O., & Gill, E. (2000). Satellite Orbits: Models, Methods and
+           Applications. Springer. ISBN 978-3-540-67280-7.
+        """
+        from scarabaeus import OrbitalElements
+
+        if epochs is None:
+            epochs = EpochArray(np.asarray(self.timestamps, dtype=float), sys="TDB")
+
+        pairs = self.propagate_state_covariance(epochs, use_smoothed=use_smoothed)
+        if not pairs:
+            return np.zeros(0), np.zeros((0, 6)), []
+
+        mu = self._resolve_grav_param(pairs[0][0], grav_param)
+        km = Units.get_units("km")
+        km_per_sec = km / sec
+
+        times = np.zeros(len(pairs))
+        elements = np.zeros((len(pairs), 6))
+        covariances = []
+        for k, (state, cov) in enumerate(pairs):
+            (position, velocity), indices = self._body_state_entries(state, body)
+            r = position.convert_to(km).values.ravel()
+            v = velocity.convert_to(km_per_sec).values.ravel()
+            # The covariance is ordered like the flat state vector, so the same
+            # indices cut this body's block out of a multi-body matrix.
+            block = np.asarray(cov, dtype=float)[np.ix_(indices, indices)]
+            el, cov_el, _ = OrbitalElements.covariance_to_elements(mu, r, v, block)
+            times[k] = float(np.asarray(state.epoch.times.values).ravel()[0])
+            elements[k] = el
+            covariances.append(cov_el)
+
+        return times, elements, covariances
+
+    @staticmethod
+    def _body_state_entries(state: StateArray, body=None):
+        """
+        Pick one body's position and velocity out of the state vector.
+
+        Walks the state components once, so the values and the rows they occupy
+        in the flat state vector — and therefore in the covariance — come back
+        together.
+
+        Parameters
+        ----------
+        state : StateArray
+            State to search.
+        body : Body or int, optional
+            The body, or its SPICE ID. May be omitted when the state carries a
+            single position.
+
+        Returns
+        -------
+        quantities : tuple of ArrayWUnits
+            Position and velocity, in whatever units the state carries them.
+        indices : numpy.ndarray
+            The six rows those components occupy, position first.
+
+        Raises
+        ------
+        ElementConversionError
+            If the body is absent, or omitted while the state holds several.
+
+        Notes
+        -----
+        The values cannot be read off ``StateArray.values0`` by index: that
+        array carries one unit per component rather than one per element, so
+        indexing it element-wise walks off the end of the units.
+        """
+        spice_id = getattr(body, "spice_id", body)
+        found = {"position": [], "velocity": []}
+        start = 0
+        for entry in state.state:
+            name, size, owner = entry[0], entry[1], entry[4]
+            if name in found:
+                owner_id = getattr(owner, "spice_id", None)
+                if spice_id is None or owner_id == spice_id:
+                    found[name].append(
+                        (entry[5].quantity, np.arange(start, start + size), owner_id)
+                    )
+            start += size
+
+        for name, matches in found.items():
+            if len(matches) == 1:
+                continue
+            if not matches:
+                raise SolutionOD.ElementConversionError(
+                    f"no '{name}' for body {spice_id!r} in the state vector."
+                )
+            raise SolutionOD.ElementConversionError(
+                f"the state vector carries {len(matches)} '{name}' components, "
+                f"owned by {[owner_id for _, _, owner_id in matches]}; name the "
+                "one to convert with the 'body' argument."
+            )
+
+        position, position_rows, _ = found["position"][0]
+        velocity, velocity_rows, _ = found["velocity"][0]
+        return (position, velocity), np.concatenate([position_rows, velocity_rows])
+
+    @staticmethod
+    def _resolve_grav_param(state: StateArray, grav_param=None) -> float:
+        """
+        Gravitational parameter to build elements with, in km^3/s^2.
+
+        Parameters
+        ----------
+        state : StateArray
+            State whose ``origin`` supplies the default.
+        grav_param : float, ArrayWUnits or CelestialBody, optional
+            An explicit value, or a body to read it from. A bare number is
+            interpreted as km^3/s^2; a unit-bearing value is converted. Defaults
+            to the state's origin.
+
+        Returns
+        -------
+        float
+            The gravitational parameter in km^3/s^2.
+
+        Raises
+        ------
+        ElementConversionError
+            If the selected body/value has no gravitational parameter.
+        TypeError or ValueError
+            If the resolved value cannot be converted to a floating-point scalar.
+
+        Notes
+        -----
+        Unit-conversion errors propagate to the caller. For an ArrayWUnits
+        value, only the first flattened entry is read; this helper does not
+        check positivity or finiteness of the resulting gravitational parameter.
+        """
+        if grav_param is None:
+            grav_param = state.origin
+        # A body was handed in rather than a number.
+        grav_param = getattr(grav_param, "grav_param", grav_param)
+        if grav_param is None:
+            raise SolutionOD.ElementConversionError(
+                f"no gravitational parameter for origin {state.origin!r}; pass one "
+                "with the 'grav_param' argument."
+            )
+        if isinstance(grav_param, ArrayWUnits):
+            grav_param = grav_param.convert_to(Units.get_units("km") ** 3 / sec**2)
+            return float(np.asarray(grav_param.values).ravel()[0])
+        return float(grav_param)
 
     def create_JSON(
         self,
         filepath: Union[str, Path],
+        fmt: str = None,
     ) -> None:
         """
-        Export solution results to JSON file.
+        Export solution results to a JSON or pickle file.
 
         Parameters
         ----------
         filepath : str or Path
-            Path to output JSON file.
-        """
-        filepath = Path(filepath)
-        filepath.parent.mkdir(parents=True, exist_ok=True)
+            Path to the output file.
+        fmt : {"json", "pickle"}, optional
+            On-disk format. When ``None`` (default) it is inferred from the file
+            extension (``.pkl`` gives pickle, otherwise JSON); when given explicitly,
+            the file extension is normalised to match.
 
-        def _residuals_to_list(res_dict):
-            if res_dict is None:
-                return None
-            out = {}
-            for name, entries in res_dict.items():
-                out[name] = [[float(r), float(s)] for r, s in entries]
-            return out
+        Notes
+        -----
+        Holds the same fields as the ``final`` block of :meth:`save`, with
+        the metadata of :meth:`save` plus ``n_epochs`` at the top level, but
+        no iteration history.
+        """
+        filepath = with_format_suffix(filepath, fmt)
+        filepath.parent.mkdir(parents=True, exist_ok=True)
 
         output_dict = {
             "metadata": {
                 "n_epochs": self.n_epochs,
                 "n_states": self.n_states,
                 "is_covariance_analysis": self.is_covariance_analysis,
-                **self.output_settings.metadata,
+                **self._output_metadata(
+                    "full" if self._full_covariance_output(True) else "diagonals"
+                ),
             },
-            "timestamps": self.timestamps.tolist(),
+            **self._solution_to_dict(final=True),
+            "epoch_solution": self._guarded_epoch_solution(),
         }
 
-        if self.deviation_est is not None:
-            output_dict["deviation_estimated"] = self.deviation_est.tolist()
-        if self.deviation_cumulative is not None:
-            output_dict["deviation_cumulative"] = self.deviation_cumulative.tolist()
-        if self.state_est is not None:
-            output_dict["state_estimated"] = self.state_est.tolist()
-        if self.deviation_smooth is not None:
-            output_dict["deviation_smoothed"] = self.deviation_smooth.tolist()
-        if self.covariance_est is not None:
-            output_dict["covariance_diagonals"] = [
-                np.diag(P).tolist() for P in self.covariance_est
-            ]
-        if self.covariance_smooth is not None:
-            output_dict["covariance_smooth_diagonals"] = [
-                np.diag(P).tolist() for P in self.covariance_smooth
-            ]
-        if self.covariance_consider is not None:
-            output_dict["covariance_consider_diagonals"] = [
-                np.diag(P).tolist() if P is not None else None
-                for P in self.covariance_consider
-            ]
-        if self.prefits is not None:
-            output_dict["prefits"] = _residuals_to_list(self.prefits)
-        if self.postfits is not None:
-            output_dict["postfits"] = _residuals_to_list(self.postfits)
-        if self.postfits_smoother is not None:
-            output_dict["postfits_smoother"] = _residuals_to_list(
-                self.postfits_smoother
-            )
-        if self.debug is not None and "nis_statistics" in self.debug:
-            output_dict["nis_statistics"] = self.debug["nis_statistics"].tolist()
-
-        with open(filepath, "w") as f:
-            json.dump(output_dict, f, indent=2)
+        dump(output_dict, filepath, fmt=fmt)
         print(f"[SolutionOD] Saved → {filepath}")
 
     def UQ_compute(
         self,
         particle_states: Optional[np.ndarray] = None,
-        confidence_levels: List[float] = [0.68, 0.95, 0.997],
+        confidence_levels: Optional[List[float]] = None,
     ) -> Dict:
         """
-        Compute UQ metrics for particle-based filters.
+        Compute and store weighted uncertainty metrics for particle filters.
 
         Computes mean, std, covariances, high-order statistical moments (skewness, kurtosis),
         weighted percentiles, and effective sample size from particle distributions.
@@ -1340,21 +2361,40 @@ class SolutionOD:
         Parameters
         ----------
         particle_states : np.ndarray, optional
-            Particle states [n_particles x n_states x n_epochs].
-            If None, attempts to extract from filter.
+            Finite states with nonempty shape (n_particles, n_states, n_epochs).
+            If None, read ``filter.particles``. Values use each state component's
+            native units.
         confidence_levels : list of float, optional
-            Confidence levels for uncertainty bounds.
+            Central interval probabilities strictly between 0 and 1. Defaults
+            to [0.68, 0.95, 0.997]. Bounds use weighted empirical quantiles.
 
         Returns
         -------
         dict
-            UQ metrics including mean, std, covariances, skewness, kurtosis,
-            percentiles, and effective sample size.
+            Mean, standard deviation, skewness and excess kurtosis arrays of
+            shape (n_epochs, n_states); a list of (n_states, n_states)
+            population covariances; ``percentiles[level]`` arrays of shape
+            (n_epochs, n_states, 2), lower bound first; and an
+            ``effective_sample_size`` array of shape (n_epochs,). Mean, standard
+            deviation and bounds use component units; covariance uses their
+            pairwise products. The same dictionary is saved as ``uq_metrics``.
 
         Raises
         ------
         ValueError
-            If particle data is unavailable.
+            If particle data is missing/nonfinite or its shape is invalid;
+            weights are invalid or have zero mass; or levels are outside (0,1).
+
+        Notes
+        -----
+        ``filter.weights`` may have shape (n_particles,) for static weights or
+        (n_particles, n_epochs) for time-dependent weights. Missing weights
+        imply a uniform distribution. Weights must be finite and nonnegative;
+        they are normalized separately at each epoch without changing the
+        filter. Covariance uses the weighted population moment (no N-1 sample
+        correction), so its diagonal agrees with the squared returned standard
+        deviations. Effective sample size is 1 / sum(w**2) using normalized w.
+        Zero-variance components have zero skewness and excess kurtosis.
         """
         if particle_states is None:
             if hasattr(self.filter, "particles"):
@@ -1362,6 +2402,13 @@ class SolutionOD:
             else:
                 raise ValueError("No particle data available for UQ computation")
 
+        particle_states = np.asarray(particle_states, dtype=float)
+        if (particle_states.ndim != 3 or min(particle_states.shape) == 0
+                or not np.isfinite(particle_states).all()):
+            raise ValueError("Particles must be finite with nonempty shape (particles, states, epochs).")
+        confidence_levels = list([0.68, 0.95, 0.997] if confidence_levels is None else confidence_levels)
+        if any(not np.isfinite(level) or not 0 < level < 1 for level in confidence_levels):
+            raise ValueError("Confidence levels must be finite and strictly between zero and one.")
         n_particles, n_states, n_epochs = particle_states.shape
 
         uq_results = {
@@ -1384,17 +2431,23 @@ class SolutionOD:
         weights = None
         if hasattr(self.filter, "weights"):
             weights = self.filter.weights
+        if weights is None:
+            weights = np.ones((n_particles, n_epochs))
+        else:
+            weights = np.asarray(weights, float)
+            if weights.shape == (n_particles,):
+                weights = np.broadcast_to(weights[:, None], (n_particles, n_epochs))
+        if (weights.shape != (n_particles, n_epochs) or not np.isfinite(weights).all()
+                or (weights < 0).any() or (weights.max(axis=0) <= 0).any()):
+            raise ValueError("Weights must be finite, nonnegative and have positive mass at each epoch.")
+        # Scale first to avoid overflow when unnormalized weights are large.
+        weights = weights / weights.max(axis=0)
+        weights = weights / weights.sum(axis=0)
 
         for k in range(n_epochs):
             particles_k = particle_states[:, :, k]
 
-            # Weights for this epoch
-            w_k = (
-                weights[:, k]
-                if weights is not None
-                else np.ones(n_particles) / n_particles
-            )
-            w_k = w_k / np.sum(w_k)
+            w_k = weights[:, k]
 
             # Mean, std, covariance
             mean_k = np.average(particles_k, weights=w_k, axis=0)
@@ -1402,7 +2455,10 @@ class SolutionOD:
             std_k = np.sqrt(var_k)
             means[k] = mean_k
             stds[k] = std_k
-            covariances.append(np.cov(particles_k.T))
+            centered = particles_k - mean_k
+            # Population covariance of the weighted empirical distribution,
+            # consistent with the returned standard deviations (also for N=1).
+            covariances.append((centered.T * w_k) @ centered)
 
             # High-order moments
             for i in range(n_states):
@@ -1438,12 +2494,8 @@ class SolutionOD:
         uq_results["percentiles"] = percentiles
 
         # Effective sample size
-        if weights is not None:
-            ess = np.zeros(n_epochs)
-            for k in range(n_epochs):
-                ess[k] = 1.0 / np.sum(weights[:, k] ** 2)
-            uq_results["effective_sample_size"] = ess
-
+        uq_results["effective_sample_size"] = 1.0 / np.sum(weights**2, axis=0)
+        self.uq_metrics = uq_results
         return uq_results
 
     def print_stats(
@@ -1467,24 +2519,34 @@ class SolutionOD:
         print(f"  Number of states:        {self.n_states}")
         print(f"  Covariance analysis:     {self.is_covariance_analysis}")
 
-        # UQ Metrics
+        # Particle statistics, as written by UQ_compute
         if self.uq_metrics is not None:
-            print(f"\nResidual Statistics:")
-            print(f"  RMS:                     {self.uq_metrics['rms']:.6e}")
-            print(f"  Mean:                    {self.uq_metrics['mean']:.6e}")
-            print(f"  Std Dev:                 {self.uq_metrics['std']:.6e}")
-            print(f"  Min:                     {self.uq_metrics['min']:.6e}")
-            print(f"  Max:                     {self.uq_metrics['max']:.6e}")
-            print(f"  Skewness:                {self.uq_metrics['skewness']:.4f}")
-            print(f"  Kurtosis:                {self.uq_metrics['kurtosis']:.4f}")
-            print(f"  Number of residuals:     {self.uq_metrics['n_residuals']}")
+            ess = np.asarray(self.uq_metrics["effective_sample_size"], dtype=float)
+            std_final = np.asarray(self.uq_metrics["std"], dtype=float)[-1]
+            print(f"\nParticle Statistics:")
+            print(f"  Number of particles:     {self.uq_metrics['n_particles']}")
+            print(f"  Number of epochs:        {self.uq_metrics['n_epochs']}")
+            print(f"  Mean effective size:     {float(np.mean(ess)):.1f}")
+            print(f"  Final-epoch max std:     {float(np.max(std_final)):.6e}")
+            print(
+                f"  Final-epoch max |skew|:  "
+                f"{float(np.max(np.abs(self.uq_metrics['skewness'][-1]))):.4f}"
+            )
+            print(
+                f"  Final-epoch max |kurt|:  "
+                f"{float(np.max(np.abs(self.uq_metrics['kurtosis'][-1]))):.4f}"
+            )
 
         # Chi-squared test
-        if self.postfits is not None and verbose:
-            n_measurements = sum(len(r[0]) for r in self.postfits)
-            degrees_of_freedom = n_measurements - self.n_states
-
-            chi_squared = sum(np.sum(r[0] ** 2) for r in self.postfits)
+        # ``postfits`` is the ``{dataset: [[residual, sigma], ...]}`` mapping;
+        # the cost is the sum of the squared normalized residuals.
+        chi_squared, n_measurements = (
+            self.filter._cost_function(self.postfits)
+            if self.postfits is not None
+            else (float("nan"), 0)
+        )
+        degrees_of_freedom = n_measurements - self.n_states
+        if n_measurements > 0 and degrees_of_freedom > 0 and verbose:
             normalized_chi_squared = chi_squared / degrees_of_freedom
 
             print(f"\nChi-Squared Test:")
@@ -1581,9 +2643,24 @@ class SolutionOD:
         Notes
         -----
         The filter object reference is NOT serialized to avoid circular dependencies
-        and large file sizes. Only solution data is preserved.
+        and large file sizes. Stored solution arrays, any already-computed
+        absolute-state cache, residual epochs, full update timeline, frame/units,
+        state components, sequence layout, run metadata (a priori, convergence,
+        provenance), the epoch solution and multi-arc global results are
+        preserved. Serializing does not force the lazy absolute-state cache to
+        be evaluated.
+        Reattach the matching fitted filter on deserialization to use trajectory
+        or STM methods; propagators and SPICE kernels are not embedded.
         """
         filepath = Path(filepath)
+
+        # Run metadata and the epoch solution need the live filter; failing to
+        # build them must not block the pickle.
+        try:
+            run_metadata = self._run_metadata()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[SolutionOD] Run metadata not serialized: {exc}")
+            run_metadata = {}
 
         # Create a copy of the object's state without the filter reference
         state_dict = {
@@ -1603,6 +2680,23 @@ class SolutionOD:
             "debug": self.debug,
             "n_states": self.n_states,
             "is_covariance_analysis": self.is_covariance_analysis,
+            "timeline": self._timeline_epochs(),
+            "state_frame": self._state_frame,
+            "state_units": self._state_units,
+            "state_components": getattr(self, "_state_components", []),
+            "run_metadata": run_metadata,
+            "epoch_solution": self._guarded_epoch_solution(),
+            "prefit_epochs": self.prefit_epochs,
+            "postfit_epochs": self.postfit_epochs,
+            "postfit_epochs_smooth": self.postfit_epochs_smooth,
+            "multi_arc_global": self.multi_arc_global,
+            "sequence_extras": self._sequence_extras(),
+            "filter_metadata": {
+                name: getattr(self.filter, name, default)
+                for name, default in (("has_consider", False), ("flag_sequence", False),
+                                      ("legs_epochs", None), ("legs_n", None),
+                                      ("events_epochs", None))
+            },
         }
 
         # Serialize to file
@@ -1626,7 +2720,9 @@ class SolutionOD:
         filepath : str or Path
             Path to pickle file.
         filter_obj : FilterOD, optional
-            Filter object to associate with solution. If None, creates placeholder.
+            Matching fitted filter, needed for trajectory queries and STM
+            mappings. If None, create a metadata-only placeholder for inspecting
+            stored results and exporting them again.
 
         Returns
         -------
@@ -1637,6 +2733,15 @@ class SolutionOD:
         ------
         FileNotFoundError
             If file does not exist.
+
+        Notes
+        -----
+        Files written before timeline, residual-epoch and frame/unit metadata
+        were saved remain readable: absent metadata defaults to None and the
+        measurement timestamps serve as the fallback timeline. Missing sequence
+        event metadata cannot be reconstructed without the original filter.
+        Loading does not initialize or rerun the supplied filter. Only load
+        pickle files from trusted sources.
         """
         filepath = Path(filepath)
 
@@ -1661,6 +2766,8 @@ class SolutionOD:
             filter_obj = PlaceholderFilter(
                 state_dict["n_states"], state_dict["is_covariance_analysis"]
             )
+            for name, value in state_dict.get("filter_metadata", {}).items():
+                setattr(filter_obj, name, value)
 
         # Create solution object
         solution = cls.__new__(cls)
@@ -1679,6 +2786,19 @@ class SolutionOD:
         solution.postfits_smoother = state_dict["postfits_smoother"]
         solution.uq_metrics = state_dict["uq_metrics"]
         solution.debug = state_dict["debug"]
+        solution.timeline = state_dict.get("timeline")
+        solution._state_frame = state_dict.get("state_frame")
+        solution._state_units = state_dict.get("state_units")
+        solution._state_components = state_dict.get("state_components", [])
+        solution._saved_run_metadata = state_dict.get("run_metadata", {})
+        solution._created_utc = solution._saved_run_metadata.get(
+            "provenance", {}).get("created_utc")
+        solution._saved_epoch_solution = state_dict.get("epoch_solution")
+        solution.prefit_epochs = state_dict.get("prefit_epochs")
+        solution.postfit_epochs = state_dict.get("postfit_epochs")
+        solution.postfit_epochs_smooth = state_dict.get("postfit_epochs_smooth")
+        solution.multi_arc_global = state_dict.get("multi_arc_global")
+        solution._saved_sequence_extras = state_dict.get("sequence_extras", {})
 
         print(f"Solution deserialized from {filepath}")
         return solution
@@ -1697,7 +2817,8 @@ class SolutionOD:
         ----------
         epochs : EpochArray
             The measurement epochs at which to evaluate the estimated trajectory.
-            Every epoch must match an entry in ``solution.timestamps`` to within 1 s.
+            Every epoch must match an entry in ``solution.timestamps`` to within
+            one microsecond. Queries snap to the matched stored epoch.
         use_smoothed : bool, optional
             If True and a smoothed solution is available, use the smoothed deviations;
             otherwise use the filtered deviations.  Defaults to True.
@@ -1709,7 +2830,9 @@ class SolutionOD:
         estimated_vel : numpy.ndarray, shape (n, 3)
             Estimated velocity at each epoch [km/s].
         estimated_params : numpy.ndarray or list or None
-            Estimated parameters at each epoch, or ``None`` if no parameters exist.
+            Estimated parameters at each requested epoch, or ``None`` if absent.
+            For sequences, a list per leg containing only the requested rows
+            for that leg, in request order (empty for unrequested legs).
 
         Raises
         ------
@@ -1717,385 +2840,895 @@ class SolutionOD:
             If any requested epoch does not correspond to a filter measurement epoch.
             Use :meth:`propagate_state` for arbitrary epochs.
         """
-        # ------------------------------------------------------------------
-        # 1. Validate: every requested epoch must match a measurement epoch.
-        # ------------------------------------------------------------------
-        t_hist = np.asarray(self.timestamps, dtype=float)
-        n = epochs.size
-        _TOL_SEC = 1.0  # 1-second tolerance — tighter than any realistic cadence
-
-        idx_devs = []
-        bad_indices = []
-        for k in range(n):
-            t_k = float(epochs[k].times.values)
-            nearest = int(np.argmin(np.abs(t_hist - t_k)))
-            if abs(t_hist[nearest] - t_k) > _TOL_SEC:
-                bad_indices.append(k)
-            else:
-                idx_devs.append(nearest)
-
-        if bad_indices:
+        t_req = np.asarray(epochs.et, float).ravel()
+        if len(t_req) == 0:
+            return np.empty((0, 3)), np.empty((0, 3)), None
+        t_meas = np.asarray(self.timestamps, float).ravel()
+        if not np.isfinite(t_req).all():
+            raise ValueError("Estimated trajectory epochs must be finite.")
+        try:
+            matched = [float(t_meas[self._matching_epoch_index(t_meas, t)]) for t in t_req]
+        except ValueError as error:
             raise ValueError(
-                f"estimated_trajectory() received {len(bad_indices)} epoch(s) that do "
-                f"not match any filter measurement epoch (input indices: {bad_indices}). "
-                "This method only works at the epochs where the filter processed "
-                "measurements. For arbitrary epochs — including propagation to tf — "
-                "use solution.propagate_state(epochs) instead."
-            )
-
-        # ------------------------------------------------------------------
-        # 2. Select deviation source.
-        # ------------------------------------------------------------------
-        if use_smoothed and self.deviation_smooth is not None:
-            deviation_source = self.deviation_smooth
-        else:
-            deviation_source = self.deviation_est
-
-        # ------------------------------------------------------------------
-        # 3. Allocate output arrays.
-        # ------------------------------------------------------------------
-        estimated_position = np.zeros(shape=(n, 3))
-        estimated_velocity = np.zeros(shape=(n, 3))
-        if self.filter.trajectory.parameters is not None:
-            if not self.filter.flag_sequence:
-                shape = (
-                    (n, 1)
-                    if len(self.filter.trajectory.parameters.values.shape) == 1
-                    else (n, self.filter.trajectory.parameters.values.shape[1])
-                )
-                estimated_parameters = np.zeros(shape=shape)
+                "estimated_trajectory() requires filter measurement epochs; "
+                "use solution.propagate_state(epochs) for arbitrary epochs."
+            ) from error
+        timeline, deviations, _ = self._deviation_history(use_smoothed)
+        trajectory = getattr(self.filter, "trajectory", None)
+        if trajectory is None:
+            raise ValueError("Filter has no trajectory attached.")
+        sequence = getattr(self.filter, "flag_sequence", False)
+        positions, velocities, parameters = [], [], []
+        leg_parameters = [[] for _ in self.filter.legs_epochs] if sequence else None
+        for t in matched:
+            index = self._matching_epoch_index(timeline, t)
+            leg = self._leg_index_for_epoch(t) if sequence else None
+            nominal = trajectory.get_state(
+                epoch_input=EpochArray(t, sys="TDB"), idx_leg_input=leg)
+            dx = deviations[index]
+            positions.append(np.asarray(nominal["position"].values).ravel() + dx[:3])
+            velocities.append(np.asarray(nominal["velocity"].values).ravel() + dx[3:6])
+            p = nominal.get("parameters")
+            if p is None:
+                values = np.empty(0)
             else:
-                estimated_parameters = [
-                    [
-                        np.zeros(shape=(self.filter.legs_n[i] - 6))
-                        for _ in range(len(self.filter.legs_epochs[i]))
-                    ]
-                    for i in range(len(self.filter.trajectory.parameters))
-                ]
+                values = np.asarray(p.values).ravel()
+                par_dev = self._parameter_deviation(dx, *self._parameter_layout(leg, t))
+                if par_dev.size < values.size:
+                    raise ValueError("Nominal parameters and deviation dimensions differ.")
+                values = values + par_dev[: values.size]
+            parameters.append(values)
+            if sequence:
+                if leg is None:
+                    raise ValueError(f"Measurement epoch {t} does not belong to a sequence leg.")
+                leg_parameters[leg].append(values)
+        if not any(len(p) for p in parameters):
+            output_parameters = None
+        elif sequence:
+            output_parameters = leg_parameters
         else:
-            estimated_parameters = None
-
-        # ------------------------------------------------------------------
-        # 4. Compute estimated state at each epoch.
-        # ------------------------------------------------------------------
-        for k in range(n):
-            idx_dev = idx_devs[k]  # index into deviation_source
-
-            if self.filter.flag_sequence is True:
-                idx_leg = next(
-                    (
-                        (
-                            i + 1
-                            if epochs[k].times.values == leg[-1]
-                            and i != len(self.filter.legs_epochs) - 1
-                            else i
-                        )
-                        for i, leg in enumerate(self.filter.legs_epochs)
-                        if (
-                            (epochs[k].times.values in leg)
-                            if isinstance(leg, np.ndarray)
-                            else (epochs[k].times.values == leg)
-                        )
-                    ),
-                    None,
-                )
-            else:
-                idx_leg = None
-
-            # Nominal state from SPICE
-            state_nominal = self.filter.trajectory.get_state(
-                epoch_input=epochs[k], idx_leg_input=idx_leg
-            )
-
-            estimated_position[k] = (
-                state_nominal["position"].values
-                + deviation_source[idx_dev][0:3].flatten()
-            )
-            estimated_velocity[k] = (
-                state_nominal["velocity"].values
-                + deviation_source[idx_dev][3:6].flatten()
-            )
-
-            if state_nominal["parameters"] is not None:
-                parameters_nominal = state_nominal["parameters"].values
-                parameters_deviation = deviation_source[idx_dev][6:].flatten()
-
-                if self.filter.flag_sequence is True:
-                    if idx_leg is not None:
-                        # k_offset = total measurement epochs in all previous legs;
-                        # idx_dev - k_offset gives the within-leg measurement index.
-                        k_offset = (
-                            sum(
-                                len(stm)
-                                for stm in self.filter.trajectory._STMs[:idx_leg]
-                            )
-                            - idx_leg
-                        )
-                        estimated_parameters[idx_leg][idx_dev - k_offset] = (
-                            parameters_nominal + parameters_deviation
-                        )
-                else:
-                    estimated_parameters[k] = parameters_nominal + parameters_deviation
-
-        return estimated_position, estimated_velocity, estimated_parameters
+            output_parameters = np.stack(parameters)
+        return np.asarray(positions), np.asarray(velocities), output_parameters
 
     def map_state_deviation_to_epoch(
         self, map_back_sequence: bool = False, use_smoothed: bool = True
     ):
-        """
-        Maps the state deviation to the initial epoch using the state transition matrix.
-
-        If smoothed solution is available, simply returns the first smoothed deviation
-        (which is already at the initial epoch). Otherwise, maps the filtered deviation
-        backward through the STMs.
+        r"""Map corrections to their nominal initial epochs using STM ratios.
 
         Parameters
         ----------
         map_back_sequence : bool, optional
-            If True, maps deviations back through the entire sequence;
-            otherwise, maps only the last leg. Only used when smoothed solution
-            is not available. Defaults to True.
+            For sequences, False (default) maps each leg's own correction to
+            its start. True starts with the final leg's correction and maps
+            backward through earlier legs using the filter's definition-node
+            maps. Both modes return a list in forward leg order. Ignored for
+            continuous arcs.
         use_smoothed : bool, optional
-            If True and smoothed solution is available, uses the first smoothed deviation.
-            Otherwise maps filtered deviations backward. Defaults to True.
+            Use the first smoothed epoch in each selected arc/leg if a nonempty
+            smoothed history is stored. Otherwise use its last filtered epoch.
+            Defaults to True. The last update wins at simultaneous epochs.
 
         Returns
         -------
-        mapped : numpy.ndarray or list of numpy.ndarray
-            The mapped state deviation(s) at the initial epoch.
-            For sequences, returns a list with one deviation per leg if not mapping back.
-            Otherwise returns a single deviation vector.
+        ndarray or list of ndarray
+            Correction at the nominal initial epoch for a continuous arc, or
+            one correction per sequence leg start. Each vector uses its model's
+            component order, units and frames, with storage padding removed.
+            If no deviation history exists, return a zero vector sized from
+            ``filter.n`` (falling back to ``filter.n_states`` or 6 for minimal
+            filter objects).
+
+        Raises
+        ------
+        ValueError
+            If the timeline is invalid, the trajectory is unavailable, or a
+            sequence leg contains no deviation rows.
+        numpy.linalg.LinAlgError
+            If a reference STM is singular.
+
+        Notes
+        -----
+        A correction at stored epoch r is mapped to initial epoch s as
+
+        .. math::
+
+            \delta x(s) = \Phi(s,t_0)\Phi(r,t_0)^{-1}\delta x(r).
+
+        The first measurement may follow the initial epoch, and the stored
+        initial STM need not be identity. Both are handled explicitly. Shared
+        sequence nodes belong to the later leg. Mapping through nodes uses
+        the filter's existing definition transformations; it does not run a
+        smoother or add new observations. States a later leg drops (e.g. the
+        parameters of a burn followed by a coast) are recovered from the
+        forward solution at the node when the filter stored one (LKF, SRIF,
+        SRIFB, LSB), see :meth:`FilterOD._map_back_across_node`.
+
+        See Also
+        --------
+        propagate_state : Map and combine corrections with nominal states.
         """
-        # If smoothed solution is available and requested, use the first smoothed
-        # deviation. It lives at the first measurement epoch, which may be later
-        # than t0, so map it back via Phi(t_first_meas, t0)^-1 (identity when they
-        # coincide).
-        if use_smoothed and self.deviation_smooth is not None:
-            if not self.filter.flag_sequence:
-                STM_t1_t0 = self.filter.trajectory.get_STM(
-                    epoch=float(self.timestamps[0]), idx=None
-                )
-                return self.filter._safe_inv(STM_t1_t0) @ self.deviation_smooth[0]
-            return self.deviation_smooth[0]
+        smooth = (use_smoothed and self.deviation_smooth is not None
+                  and len(self.deviation_smooth) > 0)
+        source = self.deviation_smooth if smooth else self.deviation_est
+        if source is None or len(source) == 0:
+            n = getattr(self.filter, "n", getattr(self.filter, "n_states", 6))
+            return np.zeros(n)
+        timeline, deviations, _ = self._deviation_history(use_smoothed)
+        trajectory = getattr(self.filter, "trajectory", None)
+        if trajectory is None:
+            raise ValueError("Filter has no trajectory attached.")
 
-        deviation_source = self.deviation_est
+        def map_to_start(t, dx, leg=None):
+            r"""Map a deviation from a stored epoch to the initial epoch.
 
-        # Guard: if all measurements were rejected (e.g. chi2 editing), deviation is empty
-        if deviation_source is None or deviation_source.size == 0:
-            n_states = getattr(self.filter, "n_states", 6)
-            return np.zeros(n_states)
+            Parameters
+            ----------
+            t : float
+                Stored epoch of ``dx``, TDB seconds past J2000.
+            dx : numpy.ndarray
+                Deviation at ``t``, in state order.
+            leg : int, optional
+                Sequence leg ``t`` belongs to; the deviation is then trimmed
+                to that leg's states and mapped to the leg's first epoch.
+                Defaults to ``None``, a single arc mapped to the epoch of
+                ``propagator.full_state_vector``.
 
-        # -------------------------
-        # Non-sequence: unchanged
-        # -------------------------
-        if not self.filter.flag_sequence:
-            # deviation_source[-1] lives at the last measurement epoch, which may
-            # precede the trajectory end when the reference is propagated with
-            # padding, so take the STM at that epoch (not STMs_timestamp[-1]).
-            STM_tend_t0 = self.filter.trajectory.get_STM(
-                epoch=float(self.timestamps[-1]), idx=None
-            )
-            return self.filter._safe_inv(STM_tend_t0) @ deviation_source[-1]
+            Returns
+            -------
+            numpy.ndarray
+                :math:`\Phi(s,t_0)\Phi(t,t_0)^{-1}\delta x(t)`.
 
-        # -------------------------
-        # Sequence mode
-        # -------------------------
-        nlegs = len(self.filter.legs_epochs)
+            Raises
+            ------
+            numpy.linalg.LinAlgError
+                If the STM at ``t`` is singular.
+            """
+            if leg is None:
+                initial = getattr(getattr(self.filter, "propagator", None), "full_state_vector", None)
+                start = None if initial is None else float(np.asarray(initial.epoch.et).ravel()[0])
+                phi = np.asarray(trajectory.get_STM(epoch=t), float)
+                phi0 = np.eye(phi.shape[0]) if start is None else np.asarray(trajectory.get_STM(epoch=start), float)
+            else:
+                start = float(np.asarray(self.filter.legs_epochs[leg]).ravel()[0])
+                phi = np.asarray(trajectory.get_STM_sequence(epoch=t, idx_leg=leg), float)
+                phi0 = np.asarray(trajectory.get_STM_sequence(epoch=start, idx_leg=leg), float)
+                dx = dx[:self.filter.legs_n[leg]]
+            return phi0 @ np.linalg.solve(phi, dx)
 
-        # 1) Leg-end STM for each leg, Phi_leg(leg_end, leg_start), using idx_leg (no
-        #    direct _STMs access). Only valid for deviations that live at the leg-end
-        #    (node) epoch; deviations at a leg's last measurement epoch use stm_at_dev.
-        last_STMs_legs = [
-            self.filter.trajectory.get_STM_sequence(
-                epoch=float(self.filter.legs_epochs[i][-1]),
-                idx_leg=i,  # crucial
-            )
-            for i in range(nlegs)
-        ]
+        if not getattr(self.filter, "flag_sequence", False):
+            index = self._matching_epoch_index(timeline, timeline[0]) if smooth else len(timeline) - 1
+            return map_to_start(float(timeline[index]), deviations[index])
 
-        # 2) Build the same "time axis" the filter iterated over.
-        #    The SRIFB second pass iterates over timeline_times = unique(meas_times ∪ event_times).
-        #    deviation_source[k] therefore corresponds to timeline_times[k], NOT to a
-        #    measurement-only grid.  We must reconstruct the same timeline here so that
-        #    idx_leg_end[i] correctly addresses deviation_source.
-        t2_to_blocks = self.filter.measurement_data.indices_by_t2
-        t2_sorted = np.asarray(sorted(t2_to_blocks.keys()), dtype=float)
-
-        if (
-            self.filter.flag_sequence
-            and hasattr(self.filter, "events_epochs")
-            and len(self.filter.events_epochs) > 0
-        ):
-            event_times_arr = np.asarray(self.filter.events_epochs, dtype=float)
-            timeline_sorted = np.unique(np.concatenate((t2_sorted, event_times_arr)))
-        else:
-            timeline_sorted = t2_sorted
-
-        # Helper: index into deviation_source of the last timeline epoch belonging to
-        # leg i. An entry recorded exactly at an event-node epoch belongs to the next
-        # leg (the filter increments its leg counter at the node), so skip it.
-        def _last_dev_idx_for_leg(i: int) -> int:
-            le = float(self.filter.legs_epochs[i][-1])
-            j = int(np.searchsorted(timeline_sorted, le, side="right") - 1)
-            if j >= 0 and i < nlegs - 1 and np.isclose(timeline_sorted[j], le):
-                j -= 1  # skip the node entry (it belongs to leg i+1)
-            if j < 0:
-                raise ValueError(
-                    f"No timeline time within leg {i} (leg end {le}, first time "
-                    f"{timeline_sorted[0]})."
-                )
-            return j
-
-        def _trim(dev, n):
-            dev = np.asarray(dev, float).ravel()
-            return dev[:n]
-
-        def _map_back(Phi, dev, n):
-            # Phi: (n,n), dev possibly padded
-            dev_n = _trim(dev, n)
-            return np.linalg.solve(Phi, dev_n)
-
-        # 3) For each leg, the deviation-history index that belongs to it (its last
-        #    measurement epoch) and the STM evaluated at that same epoch (a leg may be
-        #    propagated past its last measurement).
-        idx_leg_end = [_last_dev_idx_for_leg(i) for i in range(nlegs)]
-        stm_at_dev = [
-            self.filter.trajectory.get_STM_sequence(
-                epoch=float(timeline_sorted[idx_leg_end[i]]), idx_leg=i
-            )
-            for i in range(nlegs)
-        ]
-
-        # -------------------------
-        # Case A: per-leg mapping only (return list)
-        # -------------------------
+        indices = []
+        for leg, times in enumerate(self.filter.legs_epochs):
+            rows = [i for i, t in enumerate(timeline) if self._leg_index_for_epoch(t) == leg]
+            # Do not treat rows after the final leg span as belonging to it.
+            end = float(np.asarray(times).ravel()[-1])
+            rows = [i for i in rows if timeline[i] <= end]
+            if not rows:
+                raise ValueError(f"No state deviation history within sequence leg {leg}.")
+            index = (self._matching_epoch_index(timeline, timeline[rows[0]])
+                     if smooth else rows[-1])
+            indices.append(index)
         if not map_back_sequence:
-            # deviation at leg end, mapped to leg start, one per leg
-            dev_end_list = [deviation_source[idx_leg_end[i]] for i in range(nlegs)]
+            return [map_to_start(float(timeline[index]), deviations[index], leg)
+                    for leg, index in enumerate(indices)]
 
-            # Map each leg independently: last-measurement epoch -> leg start.
-            # NOTE: this returns deviations at each leg start in that leg's own definition.
-            new_prior_deviation = [
-                _map_back(stm_at_dev[i], dev_end_list[i], self.filter.legs_n[i])
-                for i in range(nlegs)
-            ]
-            return new_prior_deviation
+        last = len(indices) - 1
+        index = indices[last]
+        result = [map_to_start(float(timeline[index]), deviations[index], last)]
+        node_deviations = getattr(self, "_node_deviations", None) or []
+        node_covariances = getattr(self, "_node_covariances", None) or []
+        for leg in range(last, 0, -1):
+            if leg - 1 < min(len(node_deviations), len(node_covariances)):
+                # States the previous leg drops at the node are recovered from
+                # its forward solution there, conditioned on the mapped estimate
+                at_node, _ = self.filter._map_back_across_node(
+                    leg, result[0], None,
+                    node_deviations[leg - 1], node_covariances[leg - 1])
+            else:
+                at_node = self.filter._map_deviation_definition_node(
+                    leg, result[0], flag_forward=False)
+            end = float(np.asarray(self.filter.legs_epochs[leg - 1]).ravel()[-1])
+            result.insert(0, map_to_start(end, np.asarray(at_node).ravel(), leg - 1))
+        return result
 
-        # -------------------------
-        # Case B: map back through entire sequence (return list, one per leg start)
-        # -------------------------
-        # Start from the last leg's deviation at its last-measurement epoch, mapped
-        # to the leg start with the STM at that same epoch.
-        dev_end = deviation_source[idx_leg_end[-1]]
-        n_last = self.filter.legs_n[-1]
-        dev_start = _map_back(stm_at_dev[-1], dev_end, n_last)
+    def _reference_state_values(self) -> Optional[np.ndarray]:
+        """Current reference initial state as one flat vector, in state order.
 
-        new_prior_deviation = [dev_start]
+        Returns
+        -------
+        ndarray or None
+            ``propagator._x_ref0`` (a sequence's global layout) when present,
+            otherwise the values of ``propagator.full_state_vector`` at its
+            epoch. None if the filter has neither.
 
-        for k in range(nlegs - 1, 0, -1):
-            # 1) ensure dev_start is in leg-k true space before mapping definition
-            dev_start = _trim(dev_start, self.filter.legs_n[k])
-
-            # 2) map definition across node: leg k -> leg k-1 (reduction)
-            dev_in_prev_def_at_node = self.filter._map_deviation_definition_node(
-                k, dev_start, flag_forward=False
-            )
-
-            # 3) ensure it matches leg k-1 true size before STM mapping
-            dev_in_prev_def_at_node = _trim(
-                dev_in_prev_def_at_node, self.filter.legs_n[k - 1]
-            )
-
-            # 4) map within previous leg: node(end) -> start (after the definition
-            #    reduction the deviation lives at the node epoch, so the leg-end STM
-            #    applies here).
-            dev_start = _map_back(
-                last_STMs_legs[k - 1],
-                dev_in_prev_def_at_node,
-                self.filter.legs_n[k - 1],
-            )
-
-            new_prior_deviation = [dev_start] + new_prior_deviation
-
-        return new_prior_deviation
-
-    def save(self, filepath: Union[str, Path] = None) -> None:
+        Notes
+        -----
+        :meth:`FilterOD.fit` moves this reference by every correction it
+        applies, so it is the latest pass's reference, not the a priori state.
         """
-        Save all filter iterations to a single JSON file.
+        prop = getattr(self.filter, "propagator", None)
+        x_ref = getattr(prop, "_x_ref0", None)
+        if x_ref is not None:
+            return np.asarray(x_ref, dtype=float).ravel()
+        state = getattr(prop, "full_state_vector", None)
+        if state is None:
+            return None
+        return np.asarray(state.values0.values, dtype=float).ravel()
+
+    def _initial_epoch(self) -> Optional[float]:
+        """Epoch of the filter's initial state.
+
+        Returns
+        -------
+        float or None
+            Epoch of ``propagator.full_state_vector``, TDB seconds past J2000,
+            or None when the filter has no propagator or initial state.
+        """
+        state = getattr(getattr(self.filter, "propagator", None), "full_state_vector", None)
+        if state is None:
+            return None
+        return float(np.asarray(state.epoch.et).ravel()[0])
+
+    def _apriori_metadata(self) -> Optional[Dict]:
+        """Describe the a priori state and covariance the filter started from.
+
+        Returns
+        -------
+        dict or None
+            ``epoch`` (TDB seconds); ``state``, the first reference (current
+            reference minus the corrections :meth:`FilterOD.fit` applied);
+            ``reference_state_current``; ``initial_deviation`` from the filter
+            settings (None if not given); ``covariance`` (P0) and its
+            ``sigmas``; ``covariance_layout``; and ``extra_apriori_sigmas``
+            with their units. None if the filter has neither a propagator nor
+            an initial covariance.
+
+        Notes
+        -----
+        States and P0 use the units and frames of ``state_components``. For a
+        sequence, states use the global layout while P0 is the first leg's
+        (``covariance_layout`` is ``"legs[0]"``, see ``legs[0].components``).
+        """
+        initial_covariance = getattr(self.filter, "initial_covariance", None)
+        reference = self._reference_state_values()
+        if reference is None and initial_covariance is None:
+            return None
+
+        apriori: Dict = {"epoch": self._initial_epoch()}
+        if reference is not None:
+            applied = getattr(self.filter, "_delta0_total", None)
+            applied = (np.zeros_like(reference) if applied is None
+                       else np.asarray(applied, dtype=float).ravel())
+            apriori["state"] = ((reference - applied).tolist()
+                                if applied.size == reference.size else None)
+            apriori["reference_state_current"] = reference.tolist()
+        initial_deviation = getattr(self.filter, "initial_deviation", None)
+        apriori["initial_deviation"] = (
+            None if initial_deviation is None
+            else np.asarray(initial_deviation, dtype=float).ravel().tolist()
+        )
+        if initial_covariance is not None:
+            P0 = np.asarray(initial_covariance.matrix_without_units(), dtype=float)
+            apriori["covariance"] = P0.tolist()
+            apriori["sigmas"] = np.sqrt(np.clip(np.diag(P0), 0.0, None)).tolist()
+            apriori["covariance_layout"] = (
+                "legs[0]" if getattr(self.filter, "flag_sequence", False)
+                else "state_components"
+            )
+            extra = getattr(initial_covariance, "extra_apriori_sigmas", None) or {}
+            apriori["extra_apriori_sigmas"] = {}
+            for name, sigma in extra.items():
+                try:
+                    apriori["extra_apriori_sigmas"][name] = awu_to_dict(sigma)
+                except Exception:  # noqa: BLE001 - units without a dict form
+                    apriori["extra_apriori_sigmas"][name] = {
+                        "values": np.asarray(getattr(sigma, "values", sigma)).tolist(),
+                        "units": None,
+                    }
+        return apriori
+
+    def _run_metadata(self) -> Dict:
+        """Describe the run that produced this solution, for saved metadata.
+
+        Returns
+        -------
+        dict
+            Available fields among ``state_components`` and ``state_labels``
+            (:meth:`_components_metadata`, :meth:`_state_labels`), ``apriori``
+            (:meth:`_apriori_metadata`), ``convergence`` (the filter's
+            ``convergence_info``) and ``provenance`` (filter class, package
+            version, UTC time the solution was created), as JSON-native types.
+
+        Notes
+        -----
+        Starts from the metadata :meth:`serialize` stored, so a solution loaded
+        without its filter keeps it; an attached filter refreshes each field.
+        """
+        meta: Dict = dict(getattr(self, "_saved_run_metadata", {}))
+
+        components = getattr(self, "_state_components", None)
+        if components:
+            meta["state_components"] = components
+            meta["state_labels"] = self._state_labels(components)
+        apriori = self._apriori_metadata()
+        if apriori is not None:
+            meta["apriori"] = apriori
+        convergence = getattr(self.filter, "convergence_info", None)
+        if convergence is not None:
+            meta["convergence"] = to_jsonable(convergence)
+            # a single pass has no previous cost: null, not Infinity
+            change = meta["convergence"].get("cost_relative_change")
+            if change is not None and not np.isfinite(change):
+                meta["convergence"]["cost_relative_change"] = None
+        if getattr(self.filter, "propagator", None) is not None or "provenance" not in meta:
+            meta["provenance"] = {
+                "filter": type(self.filter).__name__,
+                "scarabaeus_version": getattr(scarabaeus, "__version__", None),
+                "created_utc": getattr(self, "_created_utc", None),
+            }
+        return to_jsonable(meta)
+
+    def _epoch_solution(self) -> Optional[Dict]:
+        r"""Estimate at the nominal initial epoch, as :meth:`FilterOD.fit` applies it.
+
+        Returns
+        -------
+        dict or None
+            ``epoch`` (TDB seconds); ``deviation``, the correction to the
+            current reference; ``deviation_cumulative``, the correction to the
+            first (a priori) reference; ``state``, the corrected initial state;
+            and ``covariance`` and ``covariance_consider`` at that epoch. Fields
+            that cannot be formed are None. Without an attached propagator,
+            the epoch solution :meth:`serialize` stored, or None.
+
+        Raises
+        ------
+        ValueError
+            If the deviation history, timeline or trajectory is unusable, see
+            :meth:`map_state_deviation_to_epoch`.
+        numpy.linalg.LinAlgError
+            If a reference STM is singular.
+
+        Notes
+        -----
+        The deviation is the one :meth:`FilterOD.fit` tests for convergence
+        (:meth:`map_state_deviation_to_epoch`, mapped to the global layout for
+        a sequence). The reference and the corrections already applied are
+        read from the filter, so this describes the filter's latest solution.
+
+        The covariance comes from the same row r as the deviation (first
+        smoothed, else last filtered) and is mapped as :math:`A P A^T` with
+        :math:`A = \Phi(t_0)\Phi(r)^{-1}`, then symmetrized. The consider
+        covariance is mapped from a filtered row only. A covariance whose size
+        differs from the STM's, and any sequence covariance (the legs' layouts
+        differ), is left None. A covariance analysis has no deviation fields.
+        """
+        prop = getattr(self.filter, "propagator", None)
+        t0 = self._initial_epoch()
+        if t0 is None:
+            return getattr(self, "_saved_epoch_solution", None)
+        out: Dict = {
+            "epoch": t0,
+            "deviation": None,
+            "deviation_cumulative": None,
+            "state": None,
+            "covariance": None,
+            "covariance_consider": None,
+        }
+        sequence = getattr(self.filter, "flag_sequence", False)
+
+        if not self.is_covariance_analysis and self.deviation_est is not None:
+            if sequence:
+                dx = self.map_state_deviation_to_epoch(
+                    map_back_sequence=not self.filter._maps_back_sequence)
+                dx = prop._deviation_history_to_global_dx(dx)
+            else:
+                dx = self.map_state_deviation_to_epoch()
+            dx = np.asarray(dx, dtype=float).ravel()
+            applied = getattr(self.filter, "_delta0_total", None)
+            applied = (np.zeros_like(dx) if applied is None
+                       else np.asarray(applied, dtype=float).ravel())
+            reference = self._reference_state_values()
+            out["deviation"] = dx.tolist()
+            if applied.size == dx.size:
+                out["deviation_cumulative"] = (applied + dx).tolist()
+            if reference is not None and reference.size == dx.size:
+                out["state"] = (reference + dx).tolist()
+
+        smooth = (not self.is_covariance_analysis
+                  and self.deviation_smooth is not None and len(self.deviation_smooth) > 0
+                  and self.covariance_smooth is not None and len(self.covariance_smooth) > 0)
+        rows = self.covariance_smooth if smooth else self.covariance_est
+        timeline = self._timeline_epochs()
+        if (sequence or rows is None or len(rows) == 0 or timeline is None
+                or len(timeline) != len(rows)):
+            return out
+
+        order = np.argsort(timeline, kind="stable")
+        ordered = timeline[order]
+        k = self._matching_epoch_index(ordered, ordered[0]) if smooth else len(ordered) - 1
+        r = int(order[k])
+        trajectory = self.filter.trajectory
+        phi = np.asarray(trajectory.get_STM(epoch=float(timeline[r])), dtype=float)
+        phi0 = np.asarray(trajectory.get_STM(epoch=t0), dtype=float)
+        A = phi0 @ np.linalg.solve(phi, np.eye(phi.shape[0]))
+
+        def _map(P):
+            r"""Map a covariance from the stored epoch to the initial epoch.
+
+            Parameters
+            ----------
+            P : array_like
+                Covariance at the stored epoch, (n, n).
+
+            Returns
+            -------
+            list of list of float or None
+                :math:`A P A^T` with :math:`A = \Phi(t_0)\Phi(t_r)^{-1}`,
+                symmetrized, or None when ``P`` does not match the STM size.
+            """
+            P = np.asarray(P, dtype=float)
+            if P.shape != A.shape:
+                return None
+            P = A @ P @ A.T
+            return (0.5 * (P + P.T)).tolist()
+
+        out["covariance"] = _map(rows[r])
+        consider = self.covariance_consider
+        if (not smooth and consider is not None and len(consider) == len(rows)
+                and consider[r] is not None):
+            out["covariance_consider"] = _map(consider[r])
+        return out
+
+    @staticmethod
+    def _residuals_to_list(res_dict, epoch_dict):
+        """Serialize residuals with their epochs as ``[residual, sigma, epoch]`` rows.
+
+        Parameters
+        ----------
+        res_dict : dict or None
+            ``{dataset: [[residual, sigma], ...]}``.
+        epoch_dict : dict or None
+            Parallel ``{dataset: [t2, ...]}`` reception epochs in TDB seconds.
+
+        Returns
+        -------
+        dict or None
+            ``{dataset: [[residual, sigma, epoch], ...]}``, a missing epoch
+            written as None. None if ``res_dict`` is None.
+        """
+        if res_dict is None:
+            return None
+        epoch_dict = epoch_dict or {}
+        out = {}
+        for name, entries in res_dict.items():
+            eps = epoch_dict.get(name, [])
+            out[name] = [
+                [
+                    float(r),
+                    float(s),
+                    float(eps[j]) if j < len(eps) else None,
+                ]
+                for j, (r, s) in enumerate(entries)
+            ]
+        return out
+
+    def _full_covariance_output(self, final: bool) -> bool:
+        """Whether a solution block stores full covariances, not diagonals.
+
+        Parameters
+        ----------
+        final : bool
+            Whether the block is the final solution.
+
+        Returns
+        -------
+        bool
+            True only for the final block with
+            ``output_settings.save_full_covariance`` set.
+        """
+        return final and bool(getattr(self.output_settings, "save_full_covariance", False))
+
+    def _solution_to_dict(self, final: bool = False) -> Dict:
+        """Collect this solution's histories for :meth:`save` and :meth:`create_JSON`.
+
+        Parameters
+        ----------
+        final : bool, optional
+            Whether this is the final solution, whose covariances are written
+            in full when ``output_settings.save_full_covariance`` is set.
+            Defaults to False.
+
+        Returns
+        -------
+        dict
+            ``timestamps``, the fields of :meth:`_sequence_extras`, the available
+            deviation, state and covariance histories, ``prefits``/``postfits``
+            (plus ``postfits_smoother``), ``nis_statistics`` when computed, and
+            ``timestamps_alignment``.
+
+        Notes
+        -----
+        Covariances are written either as full matrices (``covariance_full``,
+        ``covariance_smooth_full``, ``covariance_consider_full``) or as their
+        diagonals (``*_diagonals``), never both: the diagonals of a full matrix
+        are redundant. Consider rows of epochs without consider states are None.
+        """
+        d = {
+            "timestamps": self.timestamps.tolist(),
+            **self._sequence_extras(),
+        }
+        if self.deviation_est is not None:
+            d["deviation_estimated"] = self.deviation_est.tolist()
+        if self.deviation_cumulative is not None:
+            d["deviation_cumulative"] = self.deviation_cumulative.tolist()
+        if self.state_est is not None:
+            d["state_estimated"] = self.state_est.tolist()
+        if self.deviation_smooth is not None:
+            d["deviation_smoothed"] = self.deviation_smooth.tolist()
+
+        full = self._full_covariance_output(final)
+        for name, rows in (
+            ("covariance", self.covariance_est),
+            ("covariance_smooth", self.covariance_smooth),
+            ("covariance_consider", self.covariance_consider),
+        ):
+            if rows is None:
+                continue
+            d[f"{name}_full" if full else f"{name}_diagonals"] = [
+                None if P is None
+                else (np.asarray(P).tolist() if full else np.diag(P).tolist())
+                for P in rows
+            ]
+
+        d["prefits"] = self._residuals_to_list(self.prefits, self.prefit_epochs)
+        d["postfits"] = self._residuals_to_list(self.postfits, self.postfit_epochs)
+        if self.postfits_smoother is not None:
+            d["postfits_smoother"] = self._residuals_to_list(
+                self.postfits_smoother, self.postfit_epochs_smooth
+            )
+        nis = (self.debug or {}).get("nis_statistics")
+        if nis is not None:
+            d["nis_statistics"] = np.asarray(nis).tolist()
+        # Self-verifying map: which timestamp axis indexes each per-epoch array.
+        d["timestamps_alignment"] = self._series_alignment(d)
+        return d
+
+    def _guarded_epoch_solution(self) -> Optional[Dict]:
+        """:meth:`_epoch_solution`, or None with a printed reason if it fails.
+
+        Returns
+        -------
+        dict or None
+            The epoch solution, or None when building it raised; the error is
+            printed rather than propagated so the rest of the file is saved.
+        """
+        try:
+            return self._epoch_solution()
+        except Exception as exc:  # noqa: BLE001
+            print(f"[SolutionOD] Epoch solution not saved: {exc}")
+            return None
+
+    def _output_metadata(self, covariance_storage) -> Dict:
+        """Metadata fields shared by :meth:`save` and :meth:`create_JSON`.
+
+        Parameters
+        ----------
+        covariance_storage : str or dict
+            How the covariances are written: ``"full"`` or ``"diagonals"``, or
+            a dict giving that per solution block.
+
+        Returns
+        -------
+        dict
+            ``frame`` and ``units`` of the state, the residual and epoch
+            conventions, ``covariance_storage``, the fields of
+            :meth:`_run_metadata`, then ``output_settings.metadata``, which
+            overrides any of them.
+        """
+        return {
+            # Frame/units of the estimated state and covariances, captured at
+            # construction so the solution is self-describing on disk.
+            "frame": self._state_frame,
+            "units": self._state_units,
+            # Schema notes: each residual entry is [residual, sigma, epoch];
+            # deviation/covariance rows are tagged by ``timeline_epochs`` and,
+            # for sequences, ``leg_index`` (+ per-leg layout in ``legs``).
+            "residual_columns": ["residual", "sigma", "epoch_tdb_sec"],
+            "epoch_system": "TDB",
+            "epoch_units": "s",
+            "covariance_storage": covariance_storage,
+            **self._run_metadata(),
+            **self.output_settings.metadata,
+        }
+
+    def save(self, filepath: Union[str, Path] = None, fmt: str = None) -> None:
+        """
+        Save all filter iterations to a single JSON or pickle file.
 
         If filepath is None, uses output_settings.output_dir /
-        output_settings.solution_json_filename + '.json'.
+        output_settings.solution_json_filename + the format extension.
 
         Each iteration is a key 'iter_1', 'iter_2', etc.
         The current (final) solution is also stored under 'final'.
+
+        Parameters
+        ----------
+        filepath : str or Path, optional
+            Destination file. When None, derived from the output settings.
+        fmt : {"json", "pickle"}, optional
+            On-disk format. When ``None`` (default) it is inferred from the file
+            extension (``.pkl`` gives pickle, otherwise JSON); when given explicitly,
+            the file extension is normalised to match.
+
+        Notes
+        -----
+        ``metadata`` describes the state (``frame``, ``units``,
+        ``state_components``, ``state_labels``), the a priori state and
+        covariance (``apriori``), the last convergence test
+        (``convergence``), ``provenance`` and ``covariance_storage``. Each
+        block holds the fields of :meth:`_solution_to_dict`.
+
+        Iteration blocks store covariance diagonals. ``final`` stores full
+        covariances when ``output_settings.save_full_covariance`` is set and
+        diagonals otherwise, never both. Each ``iter_<k>`` block adds that
+        pass's ``convergence`` test and its ``epoch_solution`` (the deviation
+        from the a priori state at the initial epoch). ``final`` adds the full
+        ``epoch_solution`` of :meth:`_epoch_solution`, or None if it cannot be
+        formed.
         """
         # Resolve path
         if filepath is None:
             out_dir = (
-                getattr(self.output_settings, "solution_output_path ", None) or "."
+                getattr(self.output_settings, "solution_output_path", None) or "."
             )
             basename = (
                 getattr(self.output_settings, "solution_output_name", None)
                 or "solution"
             )
-            filepath = Path(out_dir) / f"{basename}.json"
-        filepath = Path(filepath)
+            filepath = Path(out_dir) / f"{basename}{format_suffix(fmt)}"
+        filepath = with_format_suffix(filepath, fmt)
         filepath.parent.mkdir(parents=True, exist_ok=True)
-
-        def _solution_to_dict(sol):
-            def _res(r):
-                if r is None:
-                    return None
-                return {k: [[float(a), float(b)] for a, b in v] for k, v in r.items()}
-
-            d = {
-                "timestamps": sol.timestamps.tolist(),
-            }
-            if sol.deviation_est is not None:
-                d["deviation_estimated"] = sol.deviation_est.tolist()
-            if sol.deviation_cumulative is not None:
-                d["deviation_cumulative"] = sol.deviation_cumulative.tolist()
-            if sol.state_est is not None:
-                d["state_estimated"] = sol.state_est.tolist()
-            if sol.deviation_smooth is not None:
-                d["deviation_smoothed"] = sol.deviation_smooth.tolist()
-            if sol.covariance_est is not None:
-                d["covariance_diagonals"] = [
-                    np.diag(P).tolist() for P in sol.covariance_est
-                ]
-            if sol.covariance_smooth is not None:
-                d["covariance_smooth_diagonals"] = [
-                    np.diag(P).tolist() for P in sol.covariance_smooth
-                ]
-            if sol.covariance_consider is not None:
-                d["covariance_consider_diagonals"] = [
-                    np.diag(P).tolist() if P is not None else None
-                    for P in sol.covariance_consider
-                ]
-            d["prefits"] = _res(sol.prefits)
-            d["postfits"] = _res(sol.postfits)
-            if sol.postfits_smoother is not None:
-                d["postfits_smoother"] = _res(sol.postfits_smoother)
-            return d
 
         # Collect all iterations from filter history
         history = getattr(self._filter, "_solution_history", [])
+        convergence = getattr(self._filter, "_convergence_hist", [])
+        totals = getattr(self._filter, "_delta0_hist", [])
+        t0 = self._initial_epoch()
 
         output = {
             "metadata": {
                 "n_states": self.n_states,
                 "is_covariance_analysis": self.is_covariance_analysis,
                 "n_iterations": len(history),
-                **self.output_settings.metadata,
+                **self._output_metadata({
+                    "iterations": "diagonals",
+                    "final": "full" if self._full_covariance_output(True) else "diagonals",
+                }),
             }
         }
 
-        for i, sol in enumerate(history, start=1):
-            output[f"iter_{i}"] = _solution_to_dict(sol)
+        for i, sol in enumerate(history):
+            block = sol._solution_to_dict()
+            # Per-pass convergence test and correction w.r.t. the a priori state;
+            # skipped when the histories do not run parallel to the solutions
+            # (covariance analysis, or a filter without fit()).
+            if len(convergence) == len(history):
+                block["convergence"] = to_jsonable(convergence[i])
+            if len(totals) == len(history):
+                block["epoch_solution"] = {
+                    "epoch": t0,
+                    "deviation_cumulative": np.asarray(totals[i]).ravel().tolist(),
+                }
+            output[f"iter_{i + 1}"] = block
 
         # Final solution (this object itself, same as last iter but explicit)
-        output["final"] = _solution_to_dict(self)
+        output["final"] = self._solution_to_dict(final=True)
+        output["final"]["epoch_solution"] = self._guarded_epoch_solution()
 
-        with open(filepath, "w") as f:
-            json.dump(output, f, indent=2)
+        dump(output, filepath, fmt=fmt)
         print(f"[SolutionOD] All iterations saved → {filepath}")
+
+        # ------------------------------------------------------------------
+        # Companion artifacts (reference trajectory + estimated trajectory).
+        # Written next to the solution JSON; each is independently guarded so a
+        # failure never blocks the primary solution output.
+        # ------------------------------------------------------------------
+        base = str(filepath.with_suffix(""))
+        if getattr(self.output_settings, "save_reference_trajectory", True):
+            try:
+                ref_bsp = self._save_reference_trajectory(base)
+                print(f"[SolutionOD] Reference trajectory saved → {ref_bsp}")
+            except Exception as exc:  # noqa: BLE001
+                print(f"[SolutionOD] Reference trajectory not saved: {exc}")
+        if getattr(self.output_settings, "save_estimated_trajectory", True):
+            try:
+                est_json = self._save_estimated_trajectory(base)
+                if est_json is not None:
+                    print(f"[SolutionOD] Estimated trajectory saved → {est_json}")
+                else:
+                    print(
+                        "[SolutionOD] Estimated trajectory not saved: "
+                        "no estimated parameters in the state."
+                    )
+            except Exception as exc:  # noqa: BLE001
+                print(f"[SolutionOD] Estimated trajectory not saved: {exc}")
+
+    def _capture_initial_frame_units(self):
+        """
+        Read frame and unit labels from the filter's initial state vector.
+
+        Returns
+        -------
+        frame_name : str or None
+            Name of the first non-None component frame, or None if absent.
+        units : dict
+            Component name to serialized units from ``Units.to_dict()``. An
+            unavailable serialization is recorded as None.
+        components : list of dict
+            Per-component layout from :meth:`_components_metadata`. The triple
+            is ``(None, {}, [])`` if ``propagator.full_state_vector`` is absent.
+
+        Notes
+        -----
+        Called at construction to label saved results. It does not convert
+        values or modify the state. ``full_state_vector`` is the state the
+        filter estimates: the working frames of a single arc, or the global
+        layout of a sequence. Units are keyed only by component name, so later
+        components overwrite earlier entries with the same name; ``components``
+        is the complete description of mixed-frame or multiple-body layouts.
+        """
+        prop = getattr(self._filter, "propagator", None)
+        state = getattr(prop, "full_state_vector", None)
+        try:
+            components = self._components_metadata(state.state)
+        except Exception:
+            return None, {}, []
+
+        frame_name = next(
+            (c["frame"] for c in components if c["frame"] is not None), None
+        )
+        units = {c["name"]: c["units"] for c in components}
+        return frame_name, units, components
+
+    def _save_reference_trajectory(self, base: str) -> str:
+        """
+        Write the filter's propagated nominal reference as an SPK and sidecars.
+
+        Parameters
+        ----------
+        base : str
+            Output path prefix without the ``_reference.bsp`` suffix.
+
+        Returns
+        -------
+        str
+            Path ``<base>_reference.bsp`` returned after a successful write.
+
+        Raises
+        ------
+        ValueError
+            If the filter has no propagator or propagated state array.
+        OSError
+            If the existing SPK cannot be removed or an output cannot be written.
+            Trajectory/SPICE serialization errors also propagate to the caller.
+
+        Notes
+        -----
+        Uses the nominal states and STMs currently held by the propagator;
+        estimated corrections are not applied. An existing SPK at this path is
+        removed before writing. Sidecar formats and STM inclusion follow
+        :meth:`_trajectory_write_formats`. If propagator settings cannot be
+        serialized with ``to_dict()``, the trajectory is written without them.
+        """
+        from scarabaeus import Trajectory
+
+        prop = getattr(self._filter, "propagator", None)
+        if prop is None or getattr(prop, "propagated_state_array", None) is None:
+            raise ValueError("Filter has no propagated reference trajectory.")
+
+        states = prop.propagated_state_array
+        try:
+            settings = prop.to_dict()
+        except Exception:
+            settings = None
+
+        ref = Trajectory(
+            state_array=states,
+            STMs=getattr(prop, "STM", None),
+            STMs_timestamp=list(np.atleast_1d(states.epoch.et)),
+            propagator_settings_dict=settings,
+        )
+        bsp = f"{base}_reference.bsp"
+        if Path(bsp).exists():
+            Path(bsp).unlink()
+        ref.write_to_spk(bsp, **self._trajectory_write_formats())
+        return bsp
+
+    def _trajectory_write_formats(self) -> dict:
+        """
+        Build sidecar-writing options from the solution's output settings.
+
+        Returns
+        -------
+        dict
+            Keyword arguments ``stm_format``, ``sidecar_format`` and
+            ``write_stms`` for :meth:`~scarabaeus.Trajectory.write_to_spk`.
+            Both formats use ``trajectory_output_format``, falling back to
+            ``"json"`` when missing or false-valued. ``write_stms`` is the
+            boolean value of ``save_trajectory_stms``, defaulting to True.
+
+        Notes
+        -----
+        This helper selects options without validating formats or writing files.
+        Choosing a binary sidecar format can reduce storage for large STM
+        histories. The underlying trajectory writer handles format validation.
+        """
+        fmt = getattr(self.output_settings, "trajectory_output_format", "json")
+        return {
+            "stm_format": fmt or "json",
+            "sidecar_format": fmt or "json",
+            "write_stms": bool(
+                getattr(self.output_settings, "save_trajectory_stms", True)
+            ),
+        }
+
+    def _save_estimated_trajectory(self, base: str) -> Optional[str]:
+        """
+        Write estimated Cartesian and parameter samples at measurement epochs.
+
+        Parameters
+        ----------
+        base : str
+            Output path prefix without the ``_estimated.json`` suffix.
+
+        Returns
+        -------
+        str or None
+            Path ``<base>_estimated.json`` after writing, or None when
+            ``n_states <= 6``; that guard skips the file without querying states.
+
+        Raises
+        ------
+        ValueError
+            If :meth:`estimated_trajectory` rejects the stored epochs/history,
+            or unequal sequence parameter layouts cannot form a NumPy array.
+        OSError
+            If the output file cannot be written. Trajectory query and JSON
+            serialization errors also propagate to the caller.
+
+        Notes
+        -----
+        Calls :meth:`estimated_trajectory` with its default smoothing selection.
+        The JSON contains frame/unit metadata, measurement timestamps in TDB
+        seconds, position in km, velocity in km/s, and native-unit parameters
+        (or None). Existing output is replaced by the JSON writer.
+
+        The size guard assumes a single body's six Cartesian components; it
+        does not inspect component names to establish whether parameters exist.
+        Sequence parameter lists are converted to an ndarray, so ragged leg
+        layouts are not supported by this writer. These errors propagate here
+        and are handled by the enclosing :meth:`save` method.
+        """
+        # No estimated parameters (position + velocity = 6) -> nothing to save.
+        if self.n_states <= 6:
+            return None
+
+        epochs = EpochArray(np.asarray(self.timestamps, dtype=float), sys="TDB")
+        est_pos, est_vel, est_params = self.estimated_trajectory(epochs)
+
+        payload = {
+            "frame": self._state_frame,
+            "units": self._state_units,
+            "timestamps": np.asarray(self.timestamps),
+            "position": np.asarray(est_pos),
+            "velocity": np.asarray(est_vel),
+            "parameters": (
+                np.asarray(est_params) if est_params is not None else None
+            ),
+        }
+        path = f"{base}_estimated.json"
+        dump_json(payload, path)
+        return path

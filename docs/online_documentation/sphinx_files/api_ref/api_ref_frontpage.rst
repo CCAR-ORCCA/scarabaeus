@@ -1,5 +1,6 @@
 .. SPDX-FileCopyrightText: 2026 Orbital Research Cluster for Celestial Applications (ORCCA) Lab, University of Colorado at Boulder
 .. SPDX-License-Identifier: ISC
+
 .. _api:
 
 .. create a gold color role
@@ -9,9 +10,9 @@
 
 .. role:: gold
 
-=====================
+======================
 :gold:`Scarabaeus API`
-=====================
+======================
 This reference manual details the modules, classes, and methods included in Scarabaeus. Each module 
 contains classes relevant to itself. For more in-depth descriptions of each, 
 see its respective section below.
@@ -20,8 +21,9 @@ see its respective section below.
 
 Body
 ----
-The Body module defines objects in the orbit determination process. 
-This includes planets, ground stations, and spacecraft.
+The Body module defines objects in the orbit determination process.
+This includes planets, ground stations, and spacecraft, along with the solid-tide,
+pole-tide, and ocean-loading displacements of a station on a deforming body.
 
 .. sidebar toctree
 .. toctree::
@@ -39,11 +41,13 @@ This includes planets, ground stations, and spacecraft.
    body/body_index
 
 Dynamics
-----
+--------
 The Dynamics module provides functionality for modeling the dynamic environment
 acting on a spacecraft. This includes modeling of Keplerian accelerations, 3rd body perturbations,
-solar radiation pressure, higher-order fidelity gravitational modeling (spherical harmonics, polyhedral),
-and finite burn modeling.
+higher-order fidelity gravitational modeling (spherical harmonics, polyhedral), solar radiation
+pressure, thermal and antenna radiation recoil, empirical accelerations (Gauss-Markov, piecewise
+polynomial, Fourier series) in inertial, RTN, or body-fixed frames, impulsive, smoothed impulsive
+and finite burn modeling, and user-defined force models with their own estimated parameters.
 
 .. sidebar toctree
 .. toctree::
@@ -62,7 +66,7 @@ and finite burn modeling.
 
 
 Environment
-----
+-----------
 The Environment module provides high-level representations used to define the
 environment of an orbit-determination scenario. This includes state vector definitions,
 trajectory containers, numerical propagators, and multi-leg mission sequences.
@@ -83,7 +87,7 @@ trajectory containers, numerical propagators, and multi-leg mission sequences.
    environment/environment_index
 
 Finite Burn
-----
+-----------
 The Finite Burn module provides functionality for modeling finite burn maneuvers,
 including maneuver sequencing and parsing of maneuver definitions for use in trajectory
 propagation and orbit determination.
@@ -104,7 +108,7 @@ propagation and orbit determination.
    fb/fb_index
 
 Guidance
-----
+--------
 The Guidance module provides functionality for guidance tasks such as
 B-Plane targeting and maneuver planning.
 
@@ -124,10 +128,11 @@ B-Plane targeting and maneuver planning.
    guidance/guidance_index
 
 Measurements
-----
+------------
 The Measurements module provides functionality for both computed and observed
 measurement modeling, multi-type measurement datasets, and computation of partial derivatives.
-Supported observables include radiometric (range, range-rate, Doppler) and optical measurements.
+Supported observables include radiometric (range, range-rate, Doppler, sequential ranging),
+optical (angles and centroids) and user-defined measurements, along with tools to schedule, configure, and register measurement streams.
 
 .. sidebar toctree
 .. toctree::
@@ -145,10 +150,11 @@ Supported observables include radiometric (range, range-rate, Doppler) and optic
    measurements/measurement_index
 
 Orbit Determination
-----
+-------------------
 The Orbit Determination (OD) module implements OD and filtering algorithms,
 including batch least-squares, linearized Kalman filter, square-root information filter,
-and smoother variants. Also includes filter management, iteration control, and solution containers.
+and smoother variants, as well as user-defined estimators. Also includes process noise models,
+multi-arc estimation, filter management, iteration control, and solution containers.
 
 .. sidebar toctree
 .. toctree::
@@ -166,7 +172,7 @@ and smoother variants. Also includes filter management, iteration control, and s
    orbit_det/orbit_det_index
 
 Spacecraft
-----
+----------
 The Spacecraft module provides functionalities that define various properties
 of a spacecraft body, including sensors (imagers, antennas), actuators (thrusters), structural
 elements, n-plate models, and power-generation models.
@@ -187,7 +193,7 @@ elements, n-plate models, and power-generation models.
    spacecraft/sc_index
 
 Time & Frame
-----
+------------
 The Time and Frame module provides tools for handling reference frame and time
 referencing systems. A dedicated set of classes manages reference frame definition,
 transformation, and storage, as well as epoch representation and SPICE integration.
@@ -208,7 +214,7 @@ transformation, and storage, as well as epoch representation and SPICE integrati
    time_n_frame/time_n_frame_index
 
 Units
-----
+-----
 The Units module provides tools to manage both physical dimensions and
 units across Scarabaeus, ensuring correct operations, clear interfaces, and continuity when
 performing calculations using physical properties.
@@ -229,7 +235,7 @@ performing calculations using physical properties.
    units/units_index
 
 Uncertainty Quantification
-----
+--------------------------
 The Uncertainty Quantification module provides tools for uncertainty quantification in the
 orbit determination process, including covariance matrix construction, propagation, and analysis.
 
@@ -249,10 +255,12 @@ orbit determination process, including covariance matrix construction, propagati
    uq/uq_index
 
 Utilities
-----
+---------
 The Utilities module provides utility tools leveraged across the entirety
 of Scarabaeus, including constants definitions, noise generation, orbital element conversion,
-polynomial representations, and plotting utilities.
+polynomial representations, plotting utilities, serialization helpers, spherical harmonics of
+polyhedral shape models, a statistical distance between OD solutions, and the wrapper for
+user-supplied functions.
 
 .. sidebar toctree
 .. toctree::
@@ -270,10 +278,11 @@ polynomial representations, and plotting utilities.
    utils/utils_index
 
 Scarabaeus Rust
-----
-The Scarabaeus Rust contains computationaly expensive algorithms written 
-in Rust instead of Python and exposes them as classes and functions to 
-the rest of Scarabaeus.
+---------------
+The Scarabaeus Rust module contains computationally expensive algorithms written
+in Rust instead of Python and exposes them as classes and functions to
+the rest of Scarabaeus: the IAS15 integrator, the Chebyshev ephemeris cache, and the
+spherical-harmonics, n-plate SRP, and polyhedron gravity kernels behind the Python models.
 
 .. sidebar toctree
 .. toctree::
@@ -281,11 +290,11 @@ the rest of Scarabaeus.
    :caption: Scarabaeus Rust
    :maxdepth: 1
 
-   scb_rust/scb_rust_index
+   rust/rust_index
 
 .. display toctree
 .. toctree::
    :maxdepth: 1
    :class: two-column-toc
 
-   scb_rust/scb_rust_index
+   rust/rust_index

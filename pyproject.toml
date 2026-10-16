@@ -9,11 +9,12 @@ name = "scarabaeus"
 version = "2026.0.0"
 description = "Open-source Python framework for spacecraft navigation and orbit determination"
 license = { file = "LICENSE" }
-requires-python = "==3.11.9"
+requires-python = ">=3.11.9"
 dependencies = [
     "numpy",
     "scikit-learn",
     "spiceypy",
+    "pyerfa>=2.0",
     "matplotlib",
     "scipy",
     "pymongo", "ssh_pymongo", "paramiko==3.5.1",
@@ -22,6 +23,7 @@ dependencies = [
     "mpld3",
     "tqdm",
     "autograd",
+    "emcee", "corner",
     "py-cpuinfo",
     "setuptools", "wheel",
     "ipykernel", "pyproject-local-kernel", "ipympl",
@@ -44,12 +46,12 @@ Homepage = "https://ccar-orcca.github.io/scarabaeus-docs/index.html"
 [tool.maturin]
 python-source = "src"
 manifest-path = "src/scarabaeus_rust/Cargo.toml"
-module-name = "scarabaeus.scarabaeus_rust"
+module-name = "scarabaeus.rust"
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = ["-s", "-ra", "-v", "--cov", "--cov-report=xml:tests/reports/coverage.xml", "--junit-xml=tests/reports/junit.xml"]
-timeout = 999
+addopts = ["-s", "-ra", "-v", "--cov", "--cov-report=term-missing", "--cov-report=xml:tests/python_tests/reports/coverage.xml", "--cov-report=html:tests/python_tests/reports/coverage", "--junit-xml=tests/python_tests/reports/junit.xml"]
+timeout = 30
 
 [tool.coverage.run]
 source_pkgs = ["scarabaeus"]
@@ -57,6 +59,7 @@ omit = [
     "src/scarabaeus_rust/*",
     "tests/*",
     "src/scarabaeus/**/__init__.py",
+    "src/scarabaeus/utils/*",
 ]
 
 [tool.coverage.report]
