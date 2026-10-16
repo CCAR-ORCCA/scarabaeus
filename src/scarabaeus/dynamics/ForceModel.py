@@ -49,24 +49,25 @@ class ForceModel(ABC):
     ----------
     None
 
+    See Also
+    --------
+    scarabaeus.ForceModelTranslation : Translational force model aggregator.
+    scarabaeus.DynamicModel : Base class for individual force model components.
+
     Notes
     -----
     Concrete sub-classes must override :meth:`_initialize_force_models` and
     :meth:`_compute_total_acceleration`.  Call :meth:`initialize_force_models`
     before invoking any compute methods to bind the model to a concrete
     :class:`~scarabaeus.StateArray`, reference frame, and epoch.
-
-    See Also
-    --------
-    scarabaeus.ForceModelTranslation : Translational force model aggregator.
-    scarabaeus.DynamicModel : Base class for individual force model components.
     """
 
     def __init__(self) -> None:
         # Set by initialize_force_models
         self._state_vector: StateArray | None = None
         self._base_frame: Frame = J2000
-        self._t0: EpochArray | None = None
+        self._t0: EpochArray | float | None = None,
+        self._tf: EpochArray | float | None = None,
         self._force_models: dict = {}
 
     # Init wiring
@@ -74,6 +75,8 @@ class ForceModel(ABC):
         self,
         state_vector: StateArray,
         base_frame: Frame | None = None,
+        t0: float | None = None,
+        tf: float | None = None,
     ) -> None:
         """
         Bind this ForceModel to a concrete state and frame, then build internal models.
@@ -86,11 +89,20 @@ class ForceModel(ABC):
             Initial state vector that internal force models will be constructed
             from.
         base_frame : Frame, optional
-            Reference frame for all dynamics computations. Defaults to J2000
-            if ``None``.
+            Reference frame for all dynamics computations. Defaults to ``None``,
+            which uses J2000.
+        t0 : float, optional
+            Start of the propagation span, in TDB seconds past J2000. Sub-models
+            use it to bound their ephemeris caches. Defaults to ``None``.
+        tf : float, optional
+            End of the propagation span, in TDB seconds past J2000. Defaults to
+            ``None``.
         """
         self._state_vector = state_vector
         self._base_frame = base_frame if base_frame is not None else J2000
+
+        self._t0 = t0
+        self._tf = tf
 
         self._force_models = self._initialize_force_models()
 
@@ -141,7 +153,7 @@ class ForceModel(ABC):
         return self._base_frame
 
     @property
-    def t0(self) -> EpochArray:
+    def t0(self) -> EpochArray | float:
         """
         Initial epoch for this force model.
 
@@ -151,8 +163,15 @@ class ForceModel(ABC):
             If ``initialize_force_models`` has not been called.
         """
         if self._t0 is None:
-            raise RuntimeError("t0 not set. Call initialize_force_models().")
+            raise ValueError("t0 not set. Call initialize_force_models().")
         return self._t0
+    
+    @property
+    def tf(self) -> EpochArray | float:
+        """ Final epohc for the force model. """
+        if self._tf is None:
+            raise ValueError("tf not set. Call initialize_force_models().")
+        return self._tf
 
     @property
     def force_models(self) -> dict:
@@ -166,3 +185,22 @@ class ForceModel(ABC):
         """
         self._assert_initialized()
         return self._force_models
+
+    def list_forces(self) -> list[str]:
+        """
+        Readable labels of the forces this model applies to its body.
+
+        The base form is the sub-model names, in ``force_models`` order, and
+        is empty before initialization. Sub-classes refine it with the details
+        that tell one configuration of a sub-model from another.
+
+        Returns
+        -------
+        list of str
+
+        See Also
+        --------
+        scarabaeus.ForceModelTranslation.list_forces : The translational labels.
+        scarabaeus.Propagator.list_forces : The labels of every integrated object.
+        """
+        return list(self._force_models)

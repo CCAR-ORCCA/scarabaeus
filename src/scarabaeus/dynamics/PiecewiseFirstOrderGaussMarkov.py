@@ -7,6 +7,7 @@ from scarabaeus import (
     Spacecraft,
     Frame,
     DynamicModel,
+    DynamicalUtils,
 )
 import scarabaeus.utils.NumpyWrapper as np
 
@@ -25,7 +26,10 @@ class PiecewiseFirstOrderGaussMarkov(DynamicModel):
 
     Only the active batch :math:`k^*` at the current epoch contributes to the
     translational dynamics:
-    :math:`\\ddot{\\mathbf{r}} = \\mathbf{a}_{\\mathrm{other}} + \\mathbf{a}^{(k^*)}`.
+    :math:`\\ddot{\\mathbf{r}} = \\mathbf{a}_{\\mathrm{other}} +
+    \\mathbf T\\,\\mathbf{a}^{(k^*)}`, where :math:`\\mathbf T` rotates the
+    frame the components are expressed in (``frame``) into the propagation
+    frame.
     The inverse correlation times :math:`\\beta_i^{(k)}` can be estimated as static
     parameters via ``("beta_pfogm", spice_id)`` state entries.
 
@@ -63,7 +67,7 @@ class PiecewiseFirstOrderGaussMarkov(DynamicModel):
 
     .. math::
 
-        \\dot{\\mathbf v} = \\mathbf a^{(k^*)}
+        \\dot{\\mathbf v} = \\mathbf T\\,\\mathbf a^{(k^*)}
 
     where :math:`k^*` is the active batch index at the current epoch.
 
@@ -88,27 +92,57 @@ class PiecewiseFirstOrderGaussMarkov(DynamicModel):
 
     Parameters
     ----------
-    state_array : StateArray
-        State definition containing ``a_pfogm`` and optionally ``beta_pfogm``.
+    origin : Body
+        Propagation origin. ``a_pfogm`` and ``beta_pfogm`` are read from the
+        propagated state at evaluation time.
     spacecraft : Spacecraft
         Spacecraft object associated with the propagated body.
     base_frame : Frame
         Reference frame of the propagator.
-    t0 : float
-        Reference epoch at which batch 0 starts.
+    t0 : EpochArray or float
+        Reference epoch at which batch 0 starts, as an ``EpochArray`` or as raw
+        ephemeris seconds (TDB). It is the origin of the batch grid, not the
+        start of the current propagation: in a multi-leg
+        :class:`~scarabaeus.MissionSequence` every leg must be given the same
+        ``t0`` so the batches tile the whole arc and a batch index means the
+        same thing in every leg.
     batch_length : float
-        Duration of each time batch (same units as ``t0``).
+        Duration of each time batch, in seconds.
     n_batches : int
         Number of piecewise time batches.
     default_beta : np.ndarray, optional
         Default 3-vector of inverse correlation coefficients
         ``[beta_x, beta_y, beta_z]`` used for every batch when ``beta_pfogm``
         is not provided in the state array.
+    frame : str, optional
+        Frame the components of every batch (and of their
+        :math:`\\boldsymbol\\beta`) are expressed in: ``"inertial"`` (the
+        propagation frame, the default), ``"RTN"`` (radial / along-track /
+        cross-track, the RTN triad) or ``"body_fixed"``.
+    body_fixed_frame : str or Frame, optional
+        Frame the components are expressed in, for ``frame="body_fixed"``
+        (for example ``'IAU_BENNU'``).
+    relative_body : str or Body, optional
+        Body the RTN triad is built about, when that is not the propagation
+        origin. Defaults to the propagation origin.
 
     Raises
     ------
     ValueError
         If ``batch_length <= 0`` or ``n_batches < 1``.
+    InvalidEpochError
+        If ``t0`` is neither an ``EpochArray`` nor a real number.
+    DynamicalUtils.InvalidFrameError
+        If ``frame`` is not one of the supported frames.
+    DynamicalUtils.MissingBodyFixedFrameError
+        If ``frame="body_fixed"`` is requested without ``body_fixed_frame``.
+
+    See Also
+    --------
+    scarabaeus.FirstOrderGaussMarkov : Single-arc variant of this model.
+    scarabaeus.StateArray : State vector used to initialize the model.
+    scarabaeus.Propagator : Propagator that integrates the augmented state.
+    scarabaeus.DynamicModel : Abstract base class for all force model components.
 
     Notes
     -----
@@ -126,35 +160,47 @@ class PiecewiseFirstOrderGaussMarkov(DynamicModel):
     batch states evolve according to their own drift, giving block-diagonal Jacobians
     and a simple selection matrix.
 
-    See Also
-    --------
-    scarabaeus.FirstOrderGaussMarkov : Single-arc variant of this model.
-    scarabaeus.StateArray : State vector used to initialize the model.
-    scarabaeus.Propagator : Propagator that integrates the augmented state.
-    scarabaeus.DynamicModel : Abstract base class for all force model components.
+    Every batch lives in the chosen frame: in ``"RTN"`` its components are
+    radial, along-track and cross-track, and the drift acts on those
+    components. Only the applied acceleration is rotated, so the selection
+    matrix becomes :math:`\\mathbf T` at the active batch. The RTN triad is
+    built from the state, which adds the position and velocity partials
+    :meth:`~scarabaeus.DynamicalUtils.frame_partials` returns; the inertial and
+    body-fixed rotations depend on the epoch alone.
     """
+
+    class InvalidEpochError(TypeError):
+        """Raised when ``t0`` is neither an ``EpochArray`` nor a real number."""
 
     def __init__(
         self,
-        state_array: StateArray,
+        origin: Body,
         spacecraft: Spacecraft,
         base_frame: Frame,
-        t0: float,
+        t0: EpochArray | float,
         batch_length: float,
         n_batches: int,
         default_beta: np.ndarray | None = None,
+        frame: str = "inertial",
+        body_fixed_frame=None,
+        relative_body=None,
     ):
         if batch_length <= 0.0:
             raise ValueError("batch_length must be > 0.")
         if n_batches < 1:
             raise ValueError("n_batches must be >= 1.")
 
-        self._origin = state_array.origin
+        self._origin = origin
         self._origin_name = self._origin.name
         self._spacecraft = spacecraft
         self._ref_frame = base_frame
+        self._frame, self._body_fixed_frame, self._relative_body = (
+            DynamicalUtils.resolve_frame(frame, body_fixed_frame, relative_body)
+        )
+        # Per-epoch SPICE lookups of the frame, kept by DynamicalUtils.
+        self._frame_memo = {}
 
-        self._t0 = float(t0.times.values)
+        self._t0 = self._epoch_to_et(t0)
         self._batch_length = float(batch_length)
         self._n_batches = int(n_batches)
 
@@ -168,7 +214,46 @@ class PiecewiseFirstOrderGaussMarkov(DynamicModel):
         self._a0_map: dict[int, np.ndarray] = {}
         self._beta_map: dict[int, np.ndarray] = {}
 
-        self._initialize_maps(state_array)
+        # Batch pinned for the integration arc in progress; see
+        # :meth:`pin_batch_window`.
+        self._pinned_batch: int | None = None
+
+
+    @staticmethod
+    def _epoch_to_et(t0: EpochArray | float) -> float:
+        """
+        Normalise ``t0`` to raw ephemeris seconds (TDB).
+
+        Both forms are accepted because the two callers disagree: a script
+        configures the model with an ``EpochArray``, while
+        :class:`~scarabaeus.Propagator` binds its force models with the raw ET
+        float it hands the integrator. Batch windows are compared against that
+        same raw ET, so an ``EpochArray`` is read through ``.et`` rather than
+        ``.times``, which follows the array's display system.
+
+        Parameters
+        ----------
+        t0 : EpochArray or float
+            Reference epoch of batch 0.
+
+        Returns
+        -------
+        float
+            Epoch in ephemeris seconds past J2000 (TDB).
+
+        Raises
+        ------
+        InvalidEpochError
+            If ``t0`` is neither an ``EpochArray`` nor a real number.
+        """
+        if isinstance(t0, EpochArray):
+            return float(np.asarray(t0.et).ravel()[0])
+        if isinstance(t0, (int, float, np.floating, np.integer)):
+            return float(t0)
+        raise PiecewiseFirstOrderGaussMarkov.InvalidEpochError(
+            "t0 must be an EpochArray or ephemeris seconds (TDB) as a float; "
+            f"received {type(t0).__name__}."
+        )
 
     @property
     def origin(self) -> Body:
@@ -184,6 +269,32 @@ class PiecewiseFirstOrderGaussMarkov(DynamicModel):
     def ref_frame(self) -> str:
         """Reference frame used by the model."""
         return self._ref_frame
+
+    @property
+    def frame(self) -> str:
+        """Frame the batch components are expressed in."""
+        return self._frame
+
+    @property
+    def body_fixed_frame(self) -> str | None:
+        """Body-fixed frame the components are expressed in, if any."""
+        return self._body_fixed_frame
+
+    @property
+    def relative_body(self) -> str | None:
+        """Body the RTN triad is referred to, if any."""
+        return self._relative_body
+
+    @property
+    def depends_on_velocity(self) -> bool:
+        """
+        Whether the applied acceleration is a function of velocity.
+
+        True for the RTN frame, whose triad is built from the velocity. The
+        force model reads this to decide whether a
+        :math:`\\partial \\mathbf a / \\partial \\mathbf v` block is needed.
+        """
+        return self._frame == "RTN"
 
     @property
     def t0(self) -> float:
@@ -210,60 +321,104 @@ class PiecewiseFirstOrderGaussMarkov(DynamicModel):
         """Set the default inverse correlation coefficients."""
         self._default_beta = input_val
 
-    def _initialize_maps(self, state_array: StateArray) -> None:
+    def pin_batch_window(self, t_start: float, t_end: float) -> int | None:
         """
-        Scan the StateArray and cache the initial stacked acceleration and beta
-        vectors for each body.
+        Pin the batch that owns an integration arc, so the dynamics stay
+        continuous across it.
 
-        Recognized names:
-        - a_pfogm
-        - beta_pfogm
+        Batch membership is right-continuous, so the epoch closing an arc that
+        ends on a batch boundary belongs to the *next* batch. An integrator
+        evaluating its final stage there sees the acceleration and Jacobian jump
+        at the very point it has to land on, shrinks its step to resolve a
+        discontinuity that never moves, and gives up once the step falls below
+        the spacing of the epoch — which at ephemeris-second magnitudes is large
+        enough to hit in practice. Pinning the batch for the arc removes the
+        jump from the arc's interior and endpoint alike.
+
+        Only arcs that lie within a single batch are pinned; the propagator
+        already splits arcs at interior batch boundaries, so that is the normal
+        case. Anything else clears the pin and leaves the per-epoch lookup in
+        charge.
+
+        Parameters
+        ----------
+        t_start, t_end : float
+            Arc bounds in ephemeris seconds (TDB); order does not matter.
+
+        Returns
+        -------
+        int or None
+            The pinned batch index, or ``None`` if the arc was not pinned.
         """
-        expected_len = 3 * self._n_batches
+        self._pinned_batch = None
 
-        for entry in state_array.state:
-            if len(entry) < 6:
-                continue
+        t_lo, t_hi = min(t_start, t_end), max(t_start, t_end)
+        try:
+            k = self._get_active_batch_index(0.5 * (t_lo + t_hi))
+        except ValueError:
+            return None
 
-            name, _, _, _, owner, raw_val = entry
-            spice_id = getattr(owner, "spice_id", None)
-            if spice_id is None:
-                continue
+        # Only pin when the whole arc really is inside that batch.
+        batch_start = self._t0 + k * self._batch_length
+        batch_end = batch_start + self._batch_length
+        tol = max(1e-12, 10 * np.finfo(float).eps * max(1.0, abs(batch_end)))
+        if t_lo < batch_start - tol or t_hi > batch_end + tol:
+            return None
 
-            if hasattr(raw_val, "quantity"):
-                vals = raw_val.quantity.values
-            elif hasattr(raw_val, "values"):
-                vals = raw_val.values
-            else:
-                vals = raw_val
+        self._pinned_batch = k
+        return k
 
-            vals = np.atleast_1d(vals).astype(float)
+    def clear_batch_window(self) -> None:
+        """Drop any pinned batch, restoring the per-epoch lookup."""
+        self._pinned_batch = None
 
-            if name == "a_pfogm":
-                if vals.size != expected_len:
-                    raise ValueError(
-                        f"'a_pfogm' must have length {expected_len}, got {vals.size}."
-                    )
-                self._a0_map[spice_id] = vals.copy()
-
-            elif name == "beta_pfogm":
-                if vals.size != expected_len:
-                    raise ValueError(
-                        f"'beta_pfogm' must have length {expected_len}, got {vals.size}."
-                    )
-                self._beta_map[spice_id] = vals.copy()
-
-    def _get_active_batch_index(self, epoch: float) -> int | None:
+    def _get_active_batch_index(self, epoch: float) -> int:
         """
-        Return the active batch index, or None if epoch is outside all batch windows.
+        Return the index of the batch active at ``epoch``.
+
+        Batches tile ``[t0, t0 + n_batches * batch_length]``. Interior
+        boundaries belong to the batch that starts there; the closing endpoint
+        belongs to the last batch, so an arc sized as
+        ``n_batches = arc_length / batch_length`` integrates to its final epoch
+        instead of falling off the grid on the last step.
+
+        While an arc is pinned by :meth:`pin_batch_window`, that batch is
+        returned regardless of ``epoch``.
+
+        Parameters
+        ----------
+        epoch : float
+            Evaluation epoch in ephemeris seconds (TDB).
+
+        Returns
+        -------
+        int
+            Active batch index in ``[0, n_batches - 1]``.
+
+        Raises
+        ------
+        ValueError
+            If ``epoch`` falls outside the batch grid.
         """
+        if self._pinned_batch is not None:
+            return self._pinned_batch
+
         t = float(epoch)
         k = int(np.floor((t - self._t0) / self._batch_length))
+
+        # Closing endpoint: the grid is otherwise half-open, so the last epoch
+        # of a grid-length arc would index one batch past the end. The tolerance
+        # covers rounding only — a few ULP at the magnitude of an ephemeris
+        # second, so an epoch genuinely past the grid still raises.
+        t_end = self._t0 + self._n_batches * self._batch_length
+        endpoint_tol = max(1e-12, 10 * np.finfo(float).eps * max(1.0, abs(t_end)))
+        if k == self._n_batches and abs(t - t_end) <= endpoint_tol:
+            k = self._n_batches - 1
 
         if k < 0 or k >= self._n_batches:
             raise ValueError(
                 f"Epoch {t} is outside the batch window "
-                f"[{self._t0}, {self._t0 + self._n_batches * self._batch_length})."
+                f"[{self._t0}, {t_end}]."
                 f" Got batch index {k}, valid range [0, {self._n_batches - 1}]."
             )
 
@@ -361,7 +516,7 @@ class PiecewiseFirstOrderGaussMarkov(DynamicModel):
         Parameters
         ----------
         position : np.ndarray
-            Spacecraft position vector, unused here but retained for API consistency.
+            Spacecraft position vector, used by the RTN triad.
 
         current_state : dict
             Dictionary containing the propagated state.
@@ -375,7 +530,35 @@ class PiecewiseFirstOrderGaussMarkov(DynamicModel):
         Returns
         -------
         np.ndarray
-            Active batch acceleration vector of shape (3,).
+            Active batch acceleration :math:`\\mathbf T\\,\\mathbf a^{(k^*)}`
+            in the propagation frame, shape (3,).
+        """
+        return DynamicalUtils.from_frame(
+            self,
+            self._active_batch(current_state, epoch, body),
+            position,
+            current_state,
+            epoch,
+            body,
+        )
+
+    def _active_batch(self, current_state: dict, epoch: float, body: Body):
+        """
+        Frame-local acceleration of the batch active at ``epoch``.
+
+        Parameters
+        ----------
+        current_state : dict
+            Dictionary containing the propagated state.
+        epoch : float
+            Current propagation epoch.
+        body : Body
+            Body for which the acceleration is evaluated.
+
+        Returns
+        -------
+        np.ndarray
+            :math:`\\mathbf a^{(k^*)}`, shape (3,).
         """
         k = self._get_active_batch_index(epoch)
         a_mat = self._reshape_stacked(self._get_a_pfogm(current_state, body))
@@ -391,18 +574,30 @@ class PiecewiseFirstOrderGaussMarkov(DynamicModel):
         """
         Partial derivative of applied acceleration with respect to position.
 
-        Since the empirical GM acceleration is an independent augmented state,
+        The empirical GM acceleration is an independent augmented state, so
+        only the frame it is expressed in can depend on position:
 
         .. math::
 
-            \\frac{\\partial \\mathbf a}{\\partial \\mathbf r} = \\mathbf 0
+            \\frac{\\partial \\mathbf a}{\\partial \\mathbf r}
+            = \\sum_j a^{(k^*)}_j\\,
+              \\frac{\\partial \\hat{\\mathbf e}_j}{\\partial \\mathbf r},
+
+        which is zero outside the RTN frame.
 
         Returns
         -------
         np.ndarray
-            3x3 zero matrix.
+            3x3 matrix.
         """
-        return np.zeros((3, 3))
+        return DynamicalUtils.frame_partials(
+            self,
+            self._active_batch(current_state, epoch, body),
+            position,
+            current_state,
+            epoch,
+            body,
+        )[0]
 
     def _compute_partial_by_velocity(
         self,
@@ -416,14 +611,25 @@ class PiecewiseFirstOrderGaussMarkov(DynamicModel):
 
         .. math::
 
-            \\frac{\\partial \\mathbf a}{\\partial \\mathbf v} = \\mathbf 0
+            \\frac{\\partial \\mathbf a}{\\partial \\mathbf v}
+            = \\sum_j a^{(k^*)}_j\\,
+              \\frac{\\partial \\hat{\\mathbf e}_j}{\\partial \\mathbf v},
+
+        which is zero outside the RTN frame.
 
         Returns
         -------
         np.ndarray
-            3x3 zero matrix.
+            3x3 matrix.
         """
-        return np.zeros((3, 3))
+        return DynamicalUtils.frame_partials(
+            self,
+            self._active_batch(current_state, epoch, body),
+            position,
+            current_state,
+            epoch,
+            body,
+        )[1]
 
     def _compute_partial_by_acceleration_state(
         self,
@@ -443,10 +649,11 @@ class PiecewiseFirstOrderGaussMarkov(DynamicModel):
             \\frac{\\partial \\mathbf a}{\\partial \\mathbf a_{pfogm}}
             =
             \\begin{bmatrix}
-            \\mathbf 0 & \\cdots & \\mathbf I_3 & \\cdots & \\mathbf 0
+            \\mathbf 0 & \\cdots & \\mathbf T & \\cdots & \\mathbf 0
             \\end{bmatrix}
 
-        where the identity block appears at the active batch.
+        where the frame rotation :math:`\\mathbf T` (the identity in the
+        inertial frame) appears at the active batch.
 
         Returns
         -------
@@ -455,7 +662,9 @@ class PiecewiseFirstOrderGaussMarkov(DynamicModel):
         """
         k = self._get_active_batch_index(epoch)
         H = np.zeros((3, 3 * self._n_batches))
-        H[:, 3 * k : 3 * (k + 1)] = np.eye(3)
+        H[:, 3 * k : 3 * (k + 1)] = DynamicalUtils.from_frame(
+            self, np.eye(3), position, current_state, epoch, body
+        )
         return H
 
     def _compute_acceleration_state_derivative(

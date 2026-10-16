@@ -81,13 +81,10 @@ class CovarianceMatrix(UncertaintyQuantification):
 
     **Construction paths**
 
-    +---------------------------+--------------------------------------------------+
-    | ``from_list=False``       | Provide a full :math:`n \\times n` matrix directly. |
-    +---------------------------+--------------------------------------------------+
-    | ``from_list=True``        | Provide a flat list of :math:`n` standard         |
-    | (diagonal build)          | deviations :math:`\\sigma_i`; optionally supply   |
-    |                           | ``corr_factors`` for off-diagonal terms.          |
-    +---------------------------+--------------------------------------------------+
+    - ``from_list=False``: provide a full :math:`n \\times n` matrix directly.
+    - ``from_list=True`` (diagonal build): provide a flat list of :math:`n`
+      standard deviations :math:`\\sigma_i`; optionally supply
+      ``corr_factors`` for off-diagonal terms.
 
     Parameters
     ----------
@@ -112,6 +109,10 @@ class CovarianceMatrix(UncertaintyQuantification):
         Additional a-priori standard deviations for parameters that enter
         in multi-arc / sequence scenarios but are not part of the current
         arc state.  Keys are parameter names.  Defaults to ``None``.
+        Each value's units are honoured: the filter converts it to the units
+        the corresponding state element is declared with before squaring it
+        onto the covariance diagonal, so a pointing sigma may be supplied in
+        degrees for a state declared in radians.
     definition : optional
         State or sequence definition object.  Defaults to ``None``.
 
@@ -159,7 +160,8 @@ class CovarianceMatrix(UncertaintyQuantification):
             is ``True``.
         extra_apriori_sigmas : dict[str, ArrayWUnits], optional
             Additional standard deviations for sequence-estimation scenarios;
-            keys are parameter names.
+            keys are parameter names. Converted to the units of the matching
+            state element when the filter augments the covariance.
         definition : optional
             State or sequence definition object.
 

@@ -33,10 +33,10 @@ class Noise:
 
     References
     ----------
-    Grimmett, G.; Stirzaker, D. (2001).
-    *Probability and Random Processes* (3rd ed.).
-    Oxford University Press.
-    ISBN 978-0198572220.
+    .. [1] Grimmett, G.; Stirzaker, D. (2001).
+       *Probability and Random Processes* (3rd ed.).
+       Oxford University Press.
+       ISBN 978-0198572220.
     """
 
     def __init__(self) -> None:

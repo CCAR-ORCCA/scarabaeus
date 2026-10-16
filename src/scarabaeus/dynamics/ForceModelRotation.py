@@ -88,7 +88,7 @@ class ForceModelRotation(ForceModel):
               \\times \\mathbf{I}\\,\\boldsymbol{\\omega}\\bigr)
 
         where :math:`\\mathbf{I}` is the inertia tensor,
-        :math:`\\boldsymbol{\\tau}` the total torque (N·m), and
+        :math:`\\boldsymbol{\\tau}` the total torque (N m), and
         :math:`\\boldsymbol{\\omega}` the angular velocity (rad/s).
 
         Parameters
@@ -106,7 +106,7 @@ class ForceModelRotation(ForceModel):
         Returns
         -------
         np.ndarray
-            3-element angular acceleration vector (rad/s²).
+            3-element angular acceleration vector, in rad/s^2.
 
         Raises
         ------

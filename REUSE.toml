@@ -1,0 +1,87 @@
+# SPDX-FileCopyrightText: 2026 Orbital Research Cluster for Celestial Applications (ORCCA) Lab, University of Colorado at Boulder
+# SPDX-License-Identifier: ISC
+#
+# Licensing for files that cannot carry an SPDX comment header (images,
+# JSON, kernels, generated files). Every other file states its own license
+# in its first lines. Check with `reuse lint` from the repository root.
+version = 1
+
+# Notebooks: the header lives in the first markdown cell, which REUSE cannot
+# parse inside the JSON, so this entry replaces whatever the file says.
+[[annotations]]
+path = "tutorials/*.ipynb"
+precedence = "override"
+SPDX-FileCopyrightText = "2026 Orbital Research Cluster for Celestial Applications (ORCCA) Lab, University of Colorado at Boulder"
+SPDX-License-Identifier = "ISC"
+
+# Scarabaeus images, data and generated files.
+[[annotations]]
+path = [
+    "docs/images/OD_cartwheel.png",
+    "docs/images/data_flow.png",
+    "docs/images/mass_prop_flow.png",
+    "docs/images/units_dataflow_dark.png",
+    "docs/images/units_dataflow_light.png",
+    "docs/images/scarabaeus_logo.png",
+    "docs/images/scarabaeus_logo_dark.png",
+    "docs/images/readme_images/*.png",
+    "docs/images/external _resource_images/*.png",
+    # Written by release_notes/release_gen.py and conf.py at build time.
+    "docs/online_documentation/sphinx_files/release_notes/release_frontpage.rst",
+    "docs/online_documentation/sphinx_files/release_notes/versions/*.rst",
+    "docs/online_documentation/sphinx_files/api_ref/utils/planetary_constants_table.rst.inc",
+    "docs/online_documentation/sphinx_files/user_guide/quickstart/quickstart_mk.tm",
+    "src/scarabaeus/.vscode/launch.json",
+    "tests/python_tests/reports/*.xml",
+    "internal_dev/VnV_covariance/tests/reports/*.xml",
+    "internal_dev/*.csv",
+    "internal_dev/analyses/issue5_figures/*.pkl",
+    "tutorials/supplementary/supp_data/dynamic_setup/sph_coefficients/Earth_100.json",
+    "tutorials/supplementary/supp_data/dynamic_setup/thruster_coefficients/example.mission_maneuver_spec",
+]
+SPDX-FileCopyrightText = "2026 Orbital Research Cluster for Celestial Applications (ORCCA) Lab, University of Colorado at Boulder"
+SPDX-License-Identifier = "ISC"
+
+# Vendored numpydoc Sphinx extension.
+[[annotations]]
+path = "docs/online_documentation/sphinx_files/sphinxext/*.py"
+SPDX-FileCopyrightText = "2008-2023 Stefan van der Walt <stefan@mentat.za.net>, Pauli Virtanen <pav@iki.fi>"
+SPDX-License-Identifier = "BSD-2-Clause"
+
+# Third-party data, redistributed for the tutorials and tests.
+[[annotations]]
+path = "docs/online_documentation/sphinx_files/user_guide/quickstart/naif0012.tls"
+SPDX-FileCopyrightText = "NASA/JPL Navigation and Ancillary Information Facility (NAIF)"
+SPDX-License-Identifier = "LicenseRef-ThirdParty"
+
+[[annotations]]
+path = "tutorials/supplementary/supp_data/measurements/radiometric/orex_beno_*.json"
+SPDX-FileCopyrightText = "NASA/JPL Deep Space Network, OSIRIS-REx radiometric tracking data"
+SPDX-License-Identifier = "LicenseRef-ThirdParty"
+
+[[annotations]]
+path = [
+    "tutorials/supplementary/supp_data/measurements/media_correction/*.json",
+    "tutorials/supplementary/data/measurements/media_correction/*.json",
+]
+SPDX-FileCopyrightText = "NASA/JPL Deep Space Network, media calibration data"
+SPDX-License-Identifier = "LicenseRef-ThirdParty"
+
+[[annotations]]
+path = "internal_dev/VnV_covariance/c2/earth_ggm03c_4x4.json"
+SPDX-FileCopyrightText = "Center for Space Research, The University of Texas at Austin, GGM03C gravity field model"
+SPDX-License-Identifier = "LicenseRef-ThirdParty"
+
+# University of Colorado Boulder logos.
+[[annotations]]
+path = [
+    "docs/images/ORCCA_logo.png",
+    "docs/images/ORCCA_Logo_Reverse.png",
+    "docs/images/ORCCA_logo.ico",
+    "docs/images/orcca_logo_w_name_transparent.png",
+    "docs/images/ccar_logo_w_name_transparent.png",
+    "docs/images/smead_transparent.png",
+    "docs/online_documentation/sphinx_files/_static/favicon.ico",
+]
+SPDX-FileCopyrightText = "University of Colorado Boulder"
+SPDX-License-Identifier = "LicenseRef-ThirdParty"

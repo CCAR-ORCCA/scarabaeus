@@ -12,8 +12,6 @@ import sys
 
 if sys.version_info >= (3, 11):
     from typing import Self
-else:
-    from typing_extensions import Self
 
 import re
 
@@ -28,7 +26,7 @@ class EpochArray:
 
     Parameters
     ----------
-    values : str or float or array_like
+    times : str or float or array_like
         The time or times contained within the EpochArray. Valid input types are:
 
         * :obj:`str` - single epoch input. Numerical strings are cast as floats
@@ -40,12 +38,14 @@ class EpochArray:
           types follow the same conventions as their single epoch counterparts, see
           above bullets.
 
-    system : TimeSystem, optional
+    sys : TimeSystem, optional
         The uniform time system in which EpochArray is defined. Defaults to ``'TDB'``.
         Supported systems are:
 
         * ``'TDB'`` or ``'ET'`` - Barycentric Dynamical Time (TDB), also known as Ephemeris
           Time (ET).
+        * ``'UTC'`` - Coordinated Universal Time (UTC). A leapsecond kernel (LSK) must be
+          loaded.
         * ``'TT'`` or ``'TDT'`` - Terrestrial Time (TT), formerly referred to as Terrestrial
           Dynamical Time (TDT). Both refer to the same time system.
         * ``'TAI'`` - International Atomic Time (TAI).
@@ -57,7 +57,7 @@ class EpochArray:
         The representation in which the EpochArray displays and returns :attr:`times`. The type
         of the returned time value or values depends on the selected representation, noted
         as "r_type" in the following bullets along with an example, "ex_ret", of the return.
-        Defaults to ``'NUM'``. Supported representations, their resepective return types, and
+        Defaults to ``'AWU'``. Supported representations, their resepective return types, and
         example returns are:
 
         * ``'NUM'`` - numerical representation in the EpochArray's time system. Only valid
@@ -75,10 +75,11 @@ class EpochArray:
           calendar, r_type = ``str``, ex_ret = ``'2026-06-01T12:00:00.000'``.
         * ``'ISOD'`` - International Organization for Standardization (ISO) 8601,
           day of year, r_type = ``str``, ex_ret = ``'2026-152T12:00:00.000'``.
-        * ``'JDTDB'`` or ``'JED'`` - Julian Date relative to TDB (JDTB), also known
+        * ``'JDTDB'`` or ``'JED'`` - Julian Date relative to TDB (JDTDB), also known
           as Julian Ephemeris Date (JED).
         * ``'JDTDT'`` - Julian Date relative to TDT (JDTDT).
-        * ``'JDUTC'`` - DESC, r_type = ``str``, ex_ret = ``'JD '``.
+        * ``'JDUTC'`` - Julian Date relative to UTC (JDUTC), r_type = ``str``,
+          ex_ret = ``'JD 2461193.0'``.
 
     prec : int, optional
         Digits of precision in fractional seconds or days. Defaults to ``16``.
@@ -94,21 +95,17 @@ class EpochArray:
     MissingLSKError
         Raised if a time or times are defined in a non-TDB system and
         there is no recognized leapsecond kernel (LSK) furnished in
-        the kernel pool. See the `SPICE LSK time system reading`_ for more.
-
-    .. _SPICE LSK time system reading: https://naif.jpl.nasa.gov/pub/naif/toolkit_docs/C/req/time.html#The%20Leapseconds%20Kernel%20LSK
+        the kernel pool. See the `SPICE LSK time system reading <https://naif.jpl.nasa.gov/pub/naif/toolkit_docs/C/req/time.html#The%20Leapseconds%20Kernel%20LSK>`__ for more.
 
     SCLKError
         Raised if:
 
         * a time or times are given in an SCLK representation when
           there is no recognized spacecraft clock time kernel (SCLK) furnished
-          in the kernel pool. See the `SPICE SCLK time system reading`_ for more.
+          in the kernel pool. See the `SPICE SCLK time system reading <https://naif.jpl.nasa.gov/pub/naif/toolkit_docs/C/req/time.html#Spacecraft%20Clock%20SCLK>`__ for more.
         * an epoch is requested with a time representation other than ``'NUM'`` or
           ``'AWU'`` as there is no conversion between spacecraft clock ticks and
           any of the other representations.
-
-    .. _SPICE SCLK time system reading: https://naif.jpl.nasa.gov/pub/naif/toolkit_docs/C/req/time.html#Spacecraft%20Clock%20SCLK
 
     SCIDError
         Raised if:
@@ -117,9 +114,7 @@ class EpochArray:
         * a time or times are given in SCLK but the given spacecraft ID could not
           be located in the kernel pool.
 
-        See the `SPICE SCLK conversions reading`_ for more.
-
-    .. _SPICE SCLK conversions reading: https://naif.jpl.nasa.gov/pub/naif/toolkit_docs/C/req/sclk.html#Converting%20between%20SCLK%20strings%20and%20ET%20or%20UTC
+        See the `SPICE SCLK conversions reading <https://naif.jpl.nasa.gov/pub/naif/toolkit_docs/C/req/sclk.html#Converting%20between%20SCLK%20strings%20and%20ET%20or%20UTC>`__ for more.
 
     BadTimeError
         Raised if:
@@ -198,6 +193,18 @@ class EpochArray:
         self._system = input_val
 
     @property
+    def et(self) -> numpy.ndarray:
+        """Raw ephemeris time — TDB seconds past J2000.
+
+        The internal numeric value(s) of the epochs, independent of the
+        EpochArray's display :attr:`system` and :attr:`representation`.
+        Unlike :attr:`times`, the return type does not change with the
+        representation, so this is the safe accessor when raw floats are
+        needed (e.g. to hand epochs to an integrator or SPICE call).
+        """
+        return self._times
+
+    @property
     def times(self) -> numpy.ndarray[float] | numpy.ndarray[str] | ArrayWUnits:
         """
         The numerical values of each epoch contained within the EpochArray,
@@ -213,17 +220,15 @@ class EpochArray:
         # return based on format
         match self._representation:
             case "NUM":
-                # no numerical representation for UTC
+                # no numerical representation for UTC -> return in TDB
                 if self._system == "UTC":
-                    err_str = f"Cannot represent {self._system} epoch " "in JDTDB."
-                    raise type("BadRepError", (Exception,), {})(err_str)
+                    return self._times
                 # convert from internal TDB to defined system
                 return self._times_in_sys(self._system)
             case "AWU":
-                # no numerical representation for UTC
+                # no numerical representation for UTC -> return in TDB sec
                 if self._system == "UTC":
-                    err_str = f"Cannot represent {self._system} epoch " "in JDTDB."
-                    raise type("BadRepError", (Exception,), {})(err_str)
+                    return ArrayWUnits(self._times, sec)
                 ## convert from internal TDB to defined system and cast to AWU
                 if self._system in {"TDB", "ET", "TT", "TDT", "TAI", "GPS"}:
                     # defined in seconds -> return as seconds
@@ -306,27 +311,6 @@ class EpochArray:
                 return self._times_in_rep("J")  # 'J' for et2utc = JDUTC
 
     def _validate_and_set_to_et(self, times):
-        # if isinstance(times, (list, np.ndarray, tuple, str, float, int)):
-        #     ## valid input -> check and condition
-        #     if isinstance(times, (str, float, int)):
-        #         # scalar input -> check and make np array for consistency
-        #         self._times = np.array(self._condition_and_validate_time(times))
-        #     else:
-        #         # vector or matrix input -> force numpy and flatten
-        #         times = np.asarray(times)
-        #         to_check  = times.flatten()
-
-        #         # check each element
-        #         cond = np.array([self._condition_and_validate_time(t, i) for
-        #                          i, t in enumerate(to_check)])
-
-        #         # save with same input shape
-        #         self._times = cond.reshape(times.shape)
-        # else:
-        #     # invalid input -> raise error
-        #     raise TypeError('Received unsupported time input of type: '
-        #                     f'{type(times)}.')
-
         scalar = isinstance(times, (str, float, int))
         items = [times] if scalar else numpy.asarray(times).flatten().tolist()
 
@@ -339,11 +323,6 @@ class EpochArray:
                             # append TDB so spice knows its TDB
                             et_vals.append(spice.str2et(f"{t} TDB"))
                         case "UTC":
-                            if self.representation == "NUM":
-                                raise ValueError(
-                                    "No numerical representation of UTC exists. "
-                                    "Provide a different representation for UTC times."
-                                )
                             # str2et already assumes UTC
                             et_vals.append(spice.str2et(t))
                         case _:
@@ -385,8 +364,33 @@ class EpochArray:
                 for i, t in enumerate(et.flatten()):
                     converted[i] = spice.unitim(float(t), "TDB", rep_str)
                 return converted.reshape(et.shape)
+        elif rep_str != "J" and self._system in {"TDB", "ET", "TT", "TDT"}:
+            # Calendar-type strings (CAL/DOY/ISOC/ISOD) must be rendered in the
+            # epoch's own time system. et2utc always renders the UTC calendar,
+            # which silently shifted TDB/TT epochs by the TDB->UTC offset, so
+            # use timout with the matching system token instead.
+            frac = f".{'#' * self._prec}" if self._prec > 0 else ""
+            picture = {
+                "C": f"YYYY MON DD HR:MN:SC{frac}",
+                "D": f"YYYY-DOY // HR:MN:SC{frac}",
+                "ISOC": f"YYYY-MM-DDTHR:MN:SC{frac}",
+                "ISOD": f"YYYY-DOYTHR:MN:SC{frac}",
+            }[rep_str]
+            sys_token = "TDB" if self._system in {"TDB", "ET"} else "TDT"
+            picture = f"{picture} ::{sys_token} ::RND"
+            if is_scalar:
+                return spice.timout(float(et), picture, self._disp_len)
+            else:
+                flat = [
+                    spice.timout(float(t), picture, self._disp_len)
+                    for t in et.flatten()
+                ]
+                return numpy.array(flat).reshape(et.shape)
         else:
-            # et2utc handles lists
+            # UTC calendar-type strings and JDUTC ('J') — et2utc renders UTC
+            # directly and handles lists. (TAI/GPS calendar strings also fall
+            # through here and keep their legacy UTC-rendered form, as SPICE
+            # has no native TAI/GPS calendar output.)
             if is_scalar:
                 return spice.et2utc([float(et)], rep_str, self._prec, self._disp_len)[0]
             else:
@@ -421,134 +425,137 @@ class EpochArray:
                 # given scalar input
                 return spice.sce2c(self.sc_id, self._times.tolist())
             else:
-                # given non scalar input -> need to loop since unitim only takes scalars
+                # given non scalar input -> need to loop since sce2c only takes scalars
                 converted = np.zeros(self.shape).flatten()
                 for i, t in enumerate(self._times.flatten()):
-                    converted[i] = spice.unitim(t, "TDB", system)
+                    converted[i] = spice.sce2c(self.sc_id, float(t))
 
                 return converted.reshape(self.shape)
 
-    def _condition_and_validate_time(self, time, ind=None):
-        """
-        Internal method for validating and conditioning a time input.
-        Ensures valid formatting of input and converts to TDB if
-        necessary for internal tracking.
-        """
-        # convert to internal format of ET
-        match time:
-            case str():
-                ## validate string and convert to et if good
-                err = None  # save to raise SCB wrapped error if str2et fails
-                try:
-                    match self._system:
-                        case "TDB" | "ET":
-                            # append TDB/ET to string so str2et knows its TDB not UTC
-                            et = spice.str2et(f"{time} TDB")
-                        case "TT" | "TDT" | "TAI":
-                            # these work with str2et directly
-                            et = spice.str2et(time)
-                        case "GPS":
-                            # # parse as TDB and convert from GPS to TDB
-                            # et = spice.unitim(spice.str2et(f'{time} TDB'),
-                            #                   'GPS', 'TDB')
-                            in_gps = spice.unitim(spice.str2et(time), "ET", "GPS")
-                            et = spice.unitim(in_gps, "GPS", "TDB")
-                        case "SCLK":
-                            raise TypeError(
-                                "Cannot parse time value string for "
-                                "system SCLK. Please provide a float "
-                                "or int."
-                            )
-                except Exception as e:
-                    match str(e):
-                        case s if "SPICE(NOLEAPSECONDS)" in s:
-                            ## requested time needs a leap second kernel
-                            err_str = (
-                                "Requested time or times cannot be defined. "
-                                "The necessary leapsecond kernel (LSK) could not "
-                                "be located in the kernel pool. -- SPICE(NOLEAPSECONDS)"
-                            )
-                            err = type("MissingLSKError", (Exception,), {})(err_str)
-
-                        case s if "SPICE(UNPARSEDTIME)" in s:
-                            ## requested time is unrecognized
-                            # get line from SPICE error that says why it failed
-                            spice_line = [
-                                line.strip() for line in s.split("\n") if line.strip()
-                            ][3]
-
-                            # get first character of bad string and bad substring
-                            strs = re.search(r'<(.*?)>.*?"(.*?)"', spice_line)
-                            if strs:
-                                first, substr = strs.group(1), strs.group(2)
-                                err_str = (
-                                    "Requested time or times cannot be parsed. "
-                                    f"Substring beginning at <{first}> is not recognized in: "
-                                    f'"{substr}" -- SPICE(UNPARSEDTIME)'
-                                )
-                                err = type("BadTimeError", (Exception,), {})(err_str)
-                            else:
-                                # different UNPARSEDTIME error -> just raise it directly
-                                raise e
-
-                        case s if "SPICE(BADTIMESTRING)" in s:
-                            ## requested time doesn't make sense
-                            # get line from SPICE error that says why it failed
-                            spice_line = [
-                                line.strip() for line in s.split("\n") if line.strip()
-                            ][3]
-
-                            # get requested month
-                            mnth = re.search(r"month of (\w+)", spice_line).group(1)
-
-                            ## get requested day and the month's day bounds
-                            # isolate all numbers in the line
-                            p = r"[-+]?\d*\.\d+([eEdD][-+]?\d+)?"
-
-                            # convert from scientific notation to integers
-                            nums = [
-                                int(float(m.group(0).replace("D", "E")))
-                                for m in re.finditer(p, spice_line)
-                            ]
-
-                            # requested day is first, min is second, max is third
-                            err_str = (
-                                f"Provided date {nums[0]} {mnth} does not exist within "
-                                f"the specified month's interval of [{nums[1]} {mnth}, "
-                                f"{nums[2]} {mnth}]. -- SPICE(BADTIMESTRING)"
-                            )
-                            err = type("BadTimeError", (Exception,), {})(err_str)
-
-                # raise if failed, return if passed
-                if err:
-                    raise err
-                else:
-                    return et
-
-            case float():
-                match self._system:
-                    case "TDB" | "ET":
-                        # already TDB -> good to return
-                        return time
-                    case "SCLK":
-                        # convert from SCLK to TDB and return
-                        return spice.sct2e(self._sc_id, time)
-                    case _:
-                        # convert from anything else to TDB
-                        return spice.unitim(time, self._system, "TDB")
-
-            case _:
-                if ind:
-                    # given index -> element of time vector, note index as well
-                    raise TypeError(
-                        "Received unsupported time input of type: "
-                        f"{type(time)} at index {ind}."
-                    )
-                else:
-                    # no index -> scalar time, don't note location
-                    raise TypeError(
-                        "Received unsupported time input of type: " f"{type(time)}."
-                    )
+    # NOTE: dead code -- not called anywhere in the live code path (only from a
+    # stale commented-out block above); _validate_and_set_to_et reimplements
+    # this logic inline instead. Kept for reference, commented out.
+    # def _condition_and_validate_time(self, time, ind=None):
+    #     """
+    #     Internal method for validating and conditioning a time input.
+    #     Ensures valid formatting of input and converts to TDB if
+    #     necessary for internal tracking.
+    #     """
+    #     # convert to internal format of ET
+    #     match time:
+    #         case str():
+    #             ## validate string and convert to et if good
+    #             err = None  # save to raise SCB wrapped error if str2et fails
+    #             try:
+    #                 match self._system:
+    #                     case "TDB" | "ET":
+    #                         # append TDB/ET to string so str2et knows its TDB not UTC
+    #                         et = spice.str2et(f"{time} TDB")
+    #                     case "TT" | "TDT" | "TAI":
+    #                         # these work with str2et directly
+    #                         et = spice.str2et(time)
+    #                     case "GPS":
+    #                         # # parse as TDB and convert from GPS to TDB
+    #                         # et = spice.unitim(spice.str2et(f'{time} TDB'),
+    #                         #                   'GPS', 'TDB')
+    #                         in_gps = spice.unitim(spice.str2et(time), "ET", "GPS")
+    #                         et = spice.unitim(in_gps, "GPS", "TDB")
+    #                     case "SCLK":
+    #                         raise TypeError(
+    #                             "Cannot parse time value string for "
+    #                             "system SCLK. Please provide a float "
+    #                             "or int."
+    #                         )
+    #             except Exception as e:
+    #                 match str(e):
+    #                     case s if "SPICE(NOLEAPSECONDS)" in s:
+    #                         ## requested time needs a leap second kernel
+    #                         err_str = (
+    #                             "Requested time or times cannot be defined. "
+    #                             "The necessary leapsecond kernel (LSK) could not "
+    #                             "be located in the kernel pool. -- SPICE(NOLEAPSECONDS)"
+    #                         )
+    #                         err = type("MissingLSKError", (Exception,), {})(err_str)
+    #
+    #                     case s if "SPICE(UNPARSEDTIME)" in s:
+    #                         ## requested time is unrecognized
+    #                         # get line from SPICE error that says why it failed
+    #                         spice_line = [
+    #                             line.strip() for line in s.split("\n") if line.strip()
+    #                         ][3]
+    #
+    #                         # get first character of bad string and bad substring
+    #                         strs = re.search(r'<(.*?)>.*?"(.*?)"', spice_line)
+    #                         if strs:
+    #                             first, substr = strs.group(1), strs.group(2)
+    #                             err_str = (
+    #                                 "Requested time or times cannot be parsed. "
+    #                                 f"Substring beginning at <{first}> is not recognized in: "
+    #                                 f'"{substr}" -- SPICE(UNPARSEDTIME)'
+    #                             )
+    #                             err = type("BadTimeError", (Exception,), {})(err_str)
+    #                         else:
+    #                             # different UNPARSEDTIME error -> just raise it directly
+    #                             raise e
+    #
+    #                     case s if "SPICE(BADTIMESTRING)" in s:
+    #                         ## requested time doesn't make sense
+    #                         # get line from SPICE error that says why it failed
+    #                         spice_line = [
+    #                             line.strip() for line in s.split("\n") if line.strip()
+    #                         ][3]
+    #
+    #                         # get requested month
+    #                         mnth = re.search(r"month of (\w+)", spice_line).group(1)
+    #
+    #                         ## get requested day and the month's day bounds
+    #                         # isolate all numbers in the line
+    #                         p = r"[-+]?\d*\.\d+([eEdD][-+]?\d+)?"
+    #
+    #                         # convert from scientific notation to integers
+    #                         nums = [
+    #                             int(float(m.group(0).replace("D", "E")))
+    #                             for m in re.finditer(p, spice_line)
+    #                         ]
+    #
+    #                         # requested day is first, min is second, max is third
+    #                         err_str = (
+    #                             f"Provided date {nums[0]} {mnth} does not exist within "
+    #                             f"the specified month's interval of [{nums[1]} {mnth}, "
+    #                             f"{nums[2]} {mnth}]. -- SPICE(BADTIMESTRING)"
+    #                         )
+    #                         err = type("BadTimeError", (Exception,), {})(err_str)
+    #
+    #             # raise if failed, return if passed
+    #             if err:
+    #                 raise err
+    #             else:
+    #                 return et
+    #
+    #         case float():
+    #             match self._system:
+    #                 case "TDB" | "ET":
+    #                     # already TDB -> good to return
+    #                     return time
+    #                 case "SCLK":
+    #                     # convert from SCLK to TDB and return
+    #                     return spice.sct2e(self._sc_id, time)
+    #                 case _:
+    #                     # convert from anything else to TDB
+    #                     return spice.unitim(time, self._system, "TDB")
+    #
+    #         case _:
+    #             if ind:
+    #                 # given index -> element of time vector, note index as well
+    #                 raise TypeError(
+    #                     "Received unsupported time input of type: "
+    #                     f"{type(time)} at index {ind}."
+    #                 )
+    #             else:
+    #                 # no index -> scalar time, don't note location
+    #                 raise TypeError(
+    #                     "Received unsupported time input of type: " f"{type(time)}."
+    #                 )
 
     @property
     def representation(self) -> str:
@@ -598,21 +605,24 @@ class EpochArray:
     @property
     def prec(self) -> int:
         """
-        DESC
+        Digits of precision in fractional seconds (or days for Julian Date
+        representations) used when formatting string representations.
         """
         return self._prec
 
     @property
     def disp_len(self) -> int:
         """
-        DESC
+        Maximum number of characters in formatted time strings; longer
+        strings are truncated to this length.
         """
         return self._disp_len
 
     @property
     def sc_id(self) -> int:
         """
-        DESC
+        SPICE ID of the associated onboard spacecraft clock, required for
+        SCLK-system epochs. ``None`` when no clock is associated.
         """
         return self._sc_id
 
@@ -629,6 +639,17 @@ class EpochArray:
         The size of the EpochArray.
         """
         return self._size
+
+    @property
+    def ndim(self) -> int:
+        """
+        The number of dimensions of the EpochArray.
+
+        ``0`` for the scalar epoch that indexing an array returns (and that
+        :attr:`StateArray.epoch` holds), which is the case that cannot be
+        indexed further.
+        """
+        return self._ndim
 
     # endregion Properties
 
@@ -658,7 +679,7 @@ class EpochArray:
             self._sc_id,
         )
 
-    def __setitem__(self, key) -> None:
+    def __setitem__(self, key, value) -> None:
         """
         Set a sub-array in the EpochArray object.
         """
@@ -882,14 +903,37 @@ class EpochArray:
 
     # region Methods
     def to(self, sys: TimeSystem = None, rep: TimeRepresentation = None) -> Self:
-        """Convert to the given time system and representation.
+        """Convert to the given time system and/or representation.
+
+        Returns a new EpochArray pointing at the same physical instant(s);
+        the instant itself is never changed. Internally epochs are always
+        stored as TDB (ET) seconds past J2000, so converting the system does
+        not modify the stored value — it changes the system the epoch is
+        expressed in when displayed or returned via :attr:`times`. For
+        example, an epoch built as ``21:00:00 UTC`` converted with
+        ``.to('TDB')`` renders as ``21:01:09.18x`` in the TDB calendar
+        (the same instant, expressed in a different system).
 
         Parameters
         ----------
         sys : TimeSystem, optional
-            {sys_desc}
+            The time system to express the epochs in. See the class docstring
+            for all valid systems. If omitted, the current system is kept.
         rep : TimeRepresentation, optional
-            DESC
+            The representation to display/return the epochs in. See the class
+            docstring for all valid representations. If omitted, the current
+            representation is kept.
+
+        Returns
+        -------
+        EpochArray
+            A new EpochArray for the same instant(s) in the requested system
+            and representation.
+
+        Raises
+        ------
+        ValueError
+            If neither ``sys`` nor ``rep`` is provided.
         """
         # ## input handling
         # # can't convert if not given anything
@@ -930,6 +974,48 @@ class EpochArray:
         return EpochArray._from_et(
             self._times, sys, rep, self._prec, self._disp_len, self._sc_id
         )
+
+    def to_dict(self) -> dict:
+        """
+        Serialize to a JSON-friendly dict.
+
+        Stores the underlying ET (TDB seconds past J2000) values, the original
+        array shape, and the display system so the EpochArray can be exactly
+        reconstructed by :meth:`from_dict`.
+        """
+        et = np.asarray(self._times, dtype=float)
+        return {
+            "et": et.ravel().tolist(),
+            "shape": list(et.shape),
+            "system": self._system,
+            "representation": self._representation,
+            "sc_id": self._sc_id,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "EpochArray":
+        """Reconstruct an EpochArray from a dict produced by :meth:`to_dict`."""
+        et = np.array(data["et"], dtype=float)
+        shape = data.get("shape")
+        if shape is not None:
+            # a scalar's shape is [] (empty list), which is falsy but still
+            # meaningful -- must reshape to () to restore true scalar semantics
+            et = et.reshape(tuple(shape))
+        # ET values are stored directly; rebuild in ET then restore the
+        # original display system (numeric ET == TDB seconds past J2000).
+        ea = cls(et, sys="ET", sc_id=data.get("sc_id"))
+        system = data.get("system", "ET")
+        if system not in ("ET",):
+            # NOTE: previously wrapped in try/except to fall back to ET if
+            # re-applying the system failed, but .to() performs no validation
+            # of its own and can't actually raise here, so the except branch
+            # was dead code.
+            # try:
+            #     ea = ea.to(sys=system)
+            # except Exception:
+            #     pass  # keep ET if the original system can't be re-applied
+            ea = ea.to(sys=system)
+        return ea
 
     def duration(self, units: Units | str = "sec"):
         """Find the length of time spanned by the EpochArray.
@@ -1003,25 +1089,23 @@ class EpochArray:
         """
         Return a high-precision string representation of this epoch.
 
-        Formats the internal time value as a fixed-length decimal string with
-        *precision* digits after the decimal point, padding or truncating as
-        needed. Useful when interfacing with SPICE routines that require
-        precise numeric strings.
+        Formats the internal ET (TDB seconds past J2000) value as a
+        fixed-length decimal string with *precision* digits after the
+        decimal point, padding or truncating as needed. Useful when
+        interfacing with SPICE routines that require precise numeric
+        strings. Only defined for scalar EpochArray instances.
 
         Parameters
         ----------
         precision : int, optional
         """
-        # need to convert to double to count places before and after decimal point
-        if isinstance(self.times, str):
-            # string input, convert to longdouble
-            time_double = np.longdouble(self.times)
-        elif isinstance(self.times, np.float128):
-            # good data type, assign and keep moving
-            time_double = self.times
-        else:
+        # use the raw internal ET value (always numeric) rather than the
+        # representation-dependent .times property, which can return a
+        # calendar-formatted string that isn't parseable as a number
+        time_double = self._times
+        if not isinstance(time_double, (float, np.floating)):
             raise ValueError(
-                "Time must be string or long double type in order to enforce high precision."
+                "enforce_precision is only defined for scalar EpochArray instances."
             )
 
         string_time = str(time_double)
@@ -1050,7 +1134,8 @@ class EpochArray:
         dt: ArrayWUnits = None,
         n_epochs: int = None,
         sys: TimeSystem = None,
-        rep: TimeRepresentation = "AWU",
+        rep: TimeRepresentation = 'AWU',
+        sc_id: int = None,
     ):
         """Create epochs across an interval with given time step and time system.
 
@@ -1131,6 +1216,7 @@ class EpochArray:
         Create interval using ``str`` and ``float`` type interval bounds:
 
         .. code-block:: python
+
             import scarabaeus as scb
             hr = scb.Units.get_units('hr')
             epochs = scb.EpochArray.interval(start = '2026 JUN 01 00:00:00.000',
@@ -1141,6 +1227,7 @@ class EpochArray:
         type interval bounds:
 
         .. code-block:: python
+
             import scarabaeus as scb
             hr = scb.Units.get_units('hr')
 
@@ -1160,28 +1247,35 @@ class EpochArray:
             )
 
         # can't use both dt and n_epochs
-        if dt and n_epochs:
+        if dt is not None and n_epochs is not None:
             raise ValueError(
                 "Cannot define interval in terms of both dt and n_epochs. "
                 "Provide only dt or n_epochs."
             )
 
         # can't use negative or 0 dt
-        if dt and dt.values <= 0.0:
+        if dt is not None and dt.values <= 0.0:
             raise ValueError("Cannot define interval with time step <= 0.")
 
         # can't use negative or 0 n_epochs
-        if n_epochs and n_epochs <= 0:
+        # (n_epochs is checked with `is not None` rather than truthiness since
+        # 0 is falsy but still an invalid value that must raise here)
+        if n_epochs is not None and n_epochs <= 0:
             raise ValueError("Cannot define interval with 0 or less epochs.")
 
         ## figure out system
-        found_sys = False
+        # an explicitly given sys always takes priority over one inferred
+        # from an EpochArray bound (per the docstring: "unless a different
+        # system is provided")
+        found_sys = sys is not None
+
         # first check if start has a system defined
         match start:
             case EpochArray():
                 # start has a system -> use that one
-                sys = start.system
-                found_sys = True
+                if not found_sys:
+                    sys = start.system
+                    found_sys = True
             case float():
                 pass  # <- valid
             case str():
@@ -1201,7 +1295,7 @@ class EpochArray:
             case str():
                 pass  # <- valid
             case _:
-                raise TypeError(f"Received invalid end value of type {type(start)}.")
+                raise TypeError(f"Received invalid end value of type {type(end)}.")
 
         # finally, use the given system if it exists
         if not sys:
@@ -1211,23 +1305,30 @@ class EpochArray:
                 "one of the interval bounds as an EpochArray."
             )
 
-        ## convert start and end if neccessary and get in TDB
+        ## convert start and end if neccessary and get in TDB floats
         if not isinstance(start, EpochArray):
-            start = EpochArray(start, sys="TDB", rep="NUM")
+            start = EpochArray(start, sys = sys)
 
         if not isinstance(end, EpochArray):
-            end = EpochArray(end, sys="TDB", rep="NUM")
+            end = EpochArray(end, sys = sys)
+        
+        start = start.to(sys = 'TDB', rep = 'NUM')
+        end   = end.to(sys = 'TDB', rep = 'NUM')
 
         ## create interval depending on construction type
         if dt:
             # step definiton
-            interval = np.arange(start.times, end.times, dt.convert_to(sec).values)
+            # use the raw internal ET value rather than the representation-
+            # dependent .times property, which can return an ArrayWUnits or a
+            # string depending on how each bound was constructed, breaking
+            # the numeric arange/linspace calculation below
+            interval = np.arange(start._times, end._times, dt.convert_to(sec).values)
         else:
             # count definition
-            interval = np.linspace(start.times, end.times, n_epochs)
+            interval = np.linspace(start._times, end._times, n_epochs)
 
         ## convert to requested system and representation and return
-        return EpochArray(interval, sys=sys, rep=rep)
+        return EpochArray._from_et(interval, sys, rep, 16, 25, sc_id)
 
 
     @staticmethod
@@ -1235,7 +1336,6 @@ class EpochArray:
         """
         Function that split a float value into integer and fractional components.
         If time XXXX.YYYY is given as input, this function returns XXXX and YYYY.
-        Used for precise ephemeris retrivial with ad hoc interpolation.
 
         Parameters
         ----------
@@ -1252,10 +1352,64 @@ class EpochArray:
 
         Notes
         -----
-        See also the method SpiceManager.get_state_precise() which needs integer and fractional time for precise
-        ephemeris retrivial
+        The split is exact, so it carries no more information than ``t`` itself. To keep
+        sub-ULP time, build a (high, low) pair with :meth:`_add_duration` instead.
         """
         # Split between integer (t_i) and fractional (t_f) parts
         t_i = np.floor(t)
         t_f = t - t_i
         return t_i, t_f
+
+    @staticmethod
+    def _two_sum(a: float, b: float):
+        """
+        Error-free sum of two floats (Knuth's TwoSum).
+
+        Parameters
+        ----------
+        a, b : float
+            Addends.
+
+        Returns
+        -------
+        s : float
+            Rounded sum ``fl(a + b)``.
+
+        e : float
+            Rounding error, so that ``s + e == a + b`` exactly.
+        """
+        s = a + b
+        bb = s - a
+        e = (a - (s - bb)) + (b - bb)
+        return s, e
+
+    @staticmethod
+    def _add_duration(t_h: float, t_l: float, dt: float):
+        """
+        Add a duration to a two-part epoch without losing the rounding error.
+
+        The epoch is ``t_h + t_l`` with ``|t_l|`` at most half an ULP of ``t_h``. Near
+        J2000 + 26 yr one ULP of a float epoch is ~119 ns, so a plain ``t + dt`` drops up to
+        ~60 ns each time it is evaluated; carrying the pair keeps the epoch to ~1e-20 s.
+
+        Parameters
+        ----------
+        t_h : float
+            High part of the epoch [s].
+
+        t_l : float
+            Low part of the epoch [s].
+
+        dt : float
+            Duration to add [s].
+
+        Returns
+        -------
+        s_h : float
+            High part of ``t_h + t_l + dt``, the nearest float to the full sum.
+
+        s_l : float
+            Low part of ``t_h + t_l + dt``.
+        """
+        s, e = EpochArray._two_sum(t_h, dt)
+        return EpochArray._two_sum(s, e + t_l)

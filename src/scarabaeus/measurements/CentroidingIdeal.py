@@ -2,6 +2,7 @@
 # SPDX-License-Identifier: ISC
 from scarabaeus import (
     Measurement,
+    MissionSequence,
     Units,
     Frame,
     ArrayWUnits,
@@ -9,12 +10,12 @@ from scarabaeus import (
     EpochArray,
     Body,
     Spacecraft,
-    StateArray,
     Camera,
     Noise,
     SpiceManager,
     StateDefinition,
 )
+from scarabaeus.measurements.OpNavManager import OpNavManager
 
 import scarabaeus.utils.NumpyWrapper as np
 
@@ -59,14 +60,15 @@ class CentroidingIdeal(Measurement):
         Defaults to ``None``.
     state_definition : list, optional
         StateVector definition list. Defaults to ``None``.
-    sequence_definition : list, optional
-        Sequence definition list. Defaults to ``None``.
+    sequence_definition : MissionSequence, optional
+        Mission sequence whose per-leg state definitions replace
+        *state_definition*. Defaults to ``None``.
 
     Raises
     ------
     RuntimeError
         If the units extracted from the measurements are not consistent.
-    RuntimeError
+    ValueError
         If neither an EpochArray nor start/end Epochs are provided.
 
     See Also
@@ -75,9 +77,27 @@ class CentroidingIdeal(Measurement):
 
     References
     ----------
-    "A Tutorial on Horizon-Based Optical Navigation and Attitude Determination with Space Imaging Systems", John A. Christian, IEEE-Access, Vol. 9, 19819-19853, 2021.
+    .. [1] "A Tutorial on Horizon-Based Optical Navigation and Attitude Determination with Space Imaging Systems", John A. Christian, IEEE-Access, Vol. 9, 19819-19853, 2021.
 
     """
+
+    # ------------------#
+    # region   Errors  #
+    # ------------------#
+    # Custom exceptions: named on the model and raised on the
+    # line that detects the failure, so tracebacks point at the real cause
+    # rather than a generic Exception/RuntimeError.
+    class MissingImageIndexError(Exception):
+        """A stacked per-image centroid bias has no epoch-to-image mapping.
+
+        Raised by the forward model and the partials when the state carries
+        a ``centroid_bias`` of dimension ``2 * n_images`` but
+        :meth:`set_image_epochs` was never called, so there is no way to know
+        which image slot an epoch belongs to.
+        """
+
+    # endregion Errors #
+    # ------------------#
 
     # --------------------#
     # region Constructor #
@@ -88,7 +108,7 @@ class CentroidingIdeal(Measurement):
         camera: Camera,
         sigma: ArrayWUnits = None,
         state_definition: list = None,
-        sequence_definition: list = None,
+        sequence_definition: MissionSequence = None,
     ):
         super().__init__(name, camera)
 
@@ -99,7 +119,7 @@ class CentroidingIdeal(Measurement):
         self._state_definition = state_definition
         self._sequence_definition = sequence_definition
         self._measurement_type = "CentroidingIdeal"
-        self._reference_state_vector: StateArray | None = None
+        self._component_labels = ("sample", "line")
         self._epoch_to_image_index: dict | None = None
 
     # ----------------------#
@@ -120,21 +140,14 @@ class CentroidingIdeal(Measurement):
         return self._camera
 
     @property
-    def sigma(self) -> float:
-        """
-        The standard deviation of the measurements.
-        """
-        return self._sigma
-
-    @property
-    def state_definition(self) -> dict:
+    def state_definition(self) -> list:
         """
         The state vector definition.
         """
         return self._state_definition
 
     @property
-    def sequence_definition(self) -> dict:
+    def sequence_definition(self) -> MissionSequence:
         """
         The sequence definition
         """
@@ -168,39 +181,38 @@ class CentroidingIdeal(Measurement):
             }
 
     def set_image_index(self, mapping: dict | None):
-        """Directly assign a pre-built ``{epoch_value: image_index}`` mapping (or None to disable)."""
+        """Set the epoch-to-image mapping directly.
+
+        Parameters
+        ----------
+        mapping : dict or None
+            ``{epoch_value: image_index}`` mapping used to pick the per-image slot
+            of a stacked ``centroid_bias``, or ``None`` to clear it. Use
+            :meth:`set_image_epochs` to build it from an ordered list of epochs.
+        """
         self._epoch_to_image_index = mapping
-
-    def _extract_centroid_bias(self) -> ArrayWUnits | None:
-        """
-        Return centroid pixel bias [bu, bv] for this camera (global mode — first match).
-        """
-        if self._reference_state_vector is None:
-            return None
-
-        state_allowed = StateDefinition._generate_allowed_state_dictionary()
-        if "centroid_bias" not in state_allowed:
-            return None
-
-        cam_sid = getattr(self._camera, "spice_id", None)
-        for state_entry in self._reference_state_vector.state:
-            component = state_entry[0]
-            body = state_entry[4]
-            value = state_entry[5]  # ArrayWFrame
-
-            if state_allowed["centroid_bias"][2].match(component) is None:
-                continue
-            if getattr(body, "spice_id", None) == cam_sid:
-                return value.quantity  # ArrayWUnits, shape (2,) → [bu, bv]
-
-        return None
 
     def _get_rel_cam_pos(self, target: Body, epoch: EpochArray) -> ArrayWUnits:
         """
-        Return target position relative to camera, expressed in camera frame.
+        Return the target position relative to the camera, in the camera frame.
 
-        Tries the SPICE camera frame first; falls back to rotating the inertial
-        relative position by ``camera.get_rotation_to_camera()``.
+        Parameters
+        ----------
+        target : Body
+            Body being imaged.
+        epoch : EpochArray
+            Single observation epoch.
+
+        Returns
+        -------
+        ArrayWUnits
+            Position of the target relative to the camera, shape (3,).
+
+        Notes
+        -----
+        The SPICE camera frame is tried first. When SPICE cannot resolve it, the
+        inertial position relative to the camera's host body is rotated with
+        :meth:`Camera.get_rotation_to_camera`.
         """
         try:
             return SpiceManager.get_state(
@@ -214,58 +226,18 @@ class CentroidingIdeal(Measurement):
                 trgt_bdy=target.name,
                 epoch_time=epoch.times.values,
                 reference_frame="J2000",
-                obsvr_bdy=self.camera.associated_body_spice_id,
+                # spkezr takes the body as a string; a bare int SPICE ID is
+                # passed through as blank and resolves to nothing.
+                obsvr_bdy=str(self.camera.associated_body_spice_id),
             )[0:3]
             R_ci = self.camera.get_rotation_to_camera(epoch.times.values)
             r_cam = R_ci @ rel_inertial.values
             return ArrayWUnits(r_cam, rel_inertial.units)
 
-    def _determine_in_fov(self, target, epoch, sample: float, line: float) -> bool:
-        """
-        Checks whether the generated measurement is in the camera
-        field of view. We check the direction of the z-component of the delta
-        vector between observer and target in the camera frame. We then check
-        the line and sample measurements against the max possible line and
-        sample determined by the FOV.
-
-        Parameters
-        ----------
-        sample : float
-            The x position of the target in camera frame under gnomonic projection.
-
-        line : float
-            The x position of target in camera frame under gnomonic projection.
-
-        z_camera : float
-            The z-component of the delta vector between observer and target in the camera frame.
-
-        Returns
-        -------
-        in_fov_flag : bool
-            Flag indicating whether the target is in the camera field of view or not. ``True`` when
-            the target is in the field of view, ``False`` when it isn't.
-        """
-        rel_cam_pos = SpiceManager.get_state(
-            trgt_bdy=target.name,
-            epoch_time=epoch.times.values,
-            reference_frame=self.camera.camera_frame,
-            obsvr_bdy=self.camera.name,
-        )[0:3]
-
-        z_cam = rel_cam_pos.values[2]
-        if z_cam < 0:
-            return False
-
-        in_fov = (
-            abs(sample.values) < self.camera.max_sample_line[0].values
-            and abs(line.values) < self.camera.max_sample_line[1].values
-        )
-        return in_fov
-
     def observed_measurements(
         self,
         file_name,
-        meas_name: str = "meas_ideal",
+        meas_name: str = "meas_sim",
         units=None,
         frame: Frame = J2000,
         image_epochs: list | None = None,
@@ -273,10 +245,27 @@ class CentroidingIdeal(Measurement):
         """
         Load centroiding measurements from a .json file.
 
-        image_epochs : list[float], optional
-            Ordered list of observation epoch values, one per image.
-            Must be provided when the state vector contains a stacked
-            ``centroid_bias_<suffix>`` entry (dim > 2).
+        Parameters
+        ----------
+        file_name : str
+            Name of the .json file holding the measurements.
+        meas_name : str, optional
+            Key of the measurement block to read. Defaults to ``'meas_sim'``.
+        units : Units, optional
+            Units to interpret the stored values in. Defaults to ``None``.
+        frame : Frame, optional
+            Reference frame the loaded measurements are expressed in. Defaults
+            to ``J2000``.
+        image_epochs : list of float, optional
+            Ordered list of observation epoch values, one per image. Must be
+            provided when the state vector contains a stacked
+            ``centroid_bias_<suffix>`` entry (dimension > 2). Defaults to ``None``.
+
+        Returns
+        -------
+        ObsData
+            The observation tuple returned by
+            :meth:`Measurement.observed_measurements`.
         """
         result = super().observed_measurements(file_name, meas_name, units, frame)
         if image_epochs is not None:
@@ -295,67 +284,84 @@ class CentroidingIdeal(Measurement):
         image_epochs: list | None = None,
     ) -> ArrayWFrame:
         """
-        Computes the optical navigation measurement for a given target at a specific epoch.
+        Compute the pixel centroid of a target at each epoch.
 
         Parameters
         ----------
         target : Body
             The target body to image.
-
         epoch_array : EpochArray, optional
-            Array of epochs at which to compute the measurement. Defaults to ``None``.
-
+            Array of epochs at which to compute the measurement. Defaults to
+            ``None``.
         epoch_start : EpochArray, optional
             Start epoch when building the array internally. Defaults to ``None``.
-
         epoch_end : EpochArray, optional
             End epoch when building the array internally. Defaults to ``None``.
-
         tstep : float, optional
             Time step [s] when building the array internally. Defaults to ``1``.
-
         frame : Frame, optional
-            Reference frame for the computation. Defaults to J2000.
-
+            Reference frame for the computation. Defaults to ``J2000``.
         noisy : bool, optional
-            When ``True``, adds Gaussian noise scaled by *sigma*. Defaults to ``False``.
-
+            When ``True``, adds Gaussian noise scaled by ``sigma``. Defaults to
+            ``False``.
+        image_epochs : list of float, optional
+            Ordered list of observation epoch values, one per image, passed to
+            :meth:`set_image_epochs` first. Needed when the state holds a stacked
+            ``centroid_bias``. Defaults to ``None``.
 
         Returns
         -------
-        comp_meas : ArrayWUnits
-            The computed measurement as an array with units of inverse radians.
+        t1, t2, t3, meas : tuple
+            Four values, per the contract in
+            :meth:`~scarabaeus.Measurement.computed_measurements`.
+
+            This observable is **single-epoch** -- unlike a two-way radiometric
+            measurement it is not spread across a light-time path with distinct
+            transmit, reflect and receive times -- so ``t1``, ``t2`` and ``t3``
+            are all the observation epoch. They are returned, rather than a bare
+            measurement, because the estimator reads ``t1`` when detrending
+            residuals and matches measurements on ``t2``; collapsing them here
+            is a correct statement about this observable, not padding.
+
+            ``meas`` is the computed observable as an ``ArrayWFrame``.
+
+        Raises
+        ------
+        MissingImageIndexError
+            If the state holds one ``(bu, bv)`` bias per image (more than
+            two elements) and no epoch-to-image mapping is set.
         """
         if image_epochs is not None:
             self.set_image_epochs(image_epochs)
 
         ## Input check
-        if epoch_array is None:
-            if epoch_start is None or epoch_end is None:
-                raise RuntimeError(
-                    "Please provide an EpochArray or provide start and end Epochs."
-                )
-            _units = epoch_start.times.units
-            epoch_array = [
-                EpochArray(
-                    ArrayWUnits(t, _units),
-                    timeFrame=epoch_start.system,
-                )
-                for t in np.arange(
-                    epoch_start.times.values,
-                    epoch_end.times.values + tstep,
-                    tstep,
-                )
-            ]
+        epoch_array = Measurement._resolve_epoch_array(
+            epoch_array, epoch_start, epoch_end, tstep
+        )
 
         # Extract full bias vector once (dim=2 global, dim=2*n_images stacked per-image).
-        _bias_full = self._extract_centroid_bias()
+        _bias_full = self._extract_bias("centroid_bias", None)
+        if (
+            _bias_full is not None
+            and _bias_full.values.size > 2
+            and self._epoch_to_image_index is None
+        ):
+            raise CentroidingIdeal.MissingImageIndexError(
+                f"The centroid bias has {_bias_full.values.size} elements, so it "
+                "holds one (bu, bv) bias per image, but no epoch-to-image "
+                "mapping is set and the bias of each epoch is undefined. Call "
+                "set_image_epochs() (or pass image_epochs=) first."
+            )
 
         meas_list = []
-        K = np.asarray(self.camera.calibration_matrix)
 
         for epoch in epoch_array:
-            if self._epoch_to_image_index is not None and _bias_full is not None:
+            # A single (bu, bv) pair is global: it applies to every image.
+            if (
+                self._epoch_to_image_index is not None
+                and _bias_full is not None
+                and _bias_full.values.size > 2
+            ):
                 _iidx = self._epoch_to_image_index.get(float(epoch.times.values))
                 _bvals = _bias_full.values.ravel()
                 if _iidx is not None and 2 * _iidx + 1 < len(_bvals):
@@ -370,13 +376,11 @@ class CentroidingIdeal(Measurement):
             rel_cam_pos = self._get_rel_cam_pos(target, epoch)
 
             r_cam = rel_cam_pos.values  # (3,)
-            z = r_cam[2]
-            if z == 0:
+            if r_cam[2] == 0:
                 u = 0.0
                 v = 0.0
             else:
-                pix = (K @ r_cam) / z  # pinhole projection
-                u, v = pix[0], pix[1]
+                u, v = OpNavManager.project(self.camera, r_cam)[0]
 
             # Apply pixel bias [bu, bv]
             if bias_awu is not None:
@@ -414,10 +418,16 @@ class CentroidingIdeal(Measurement):
             raise RuntimeError("multiple units are extracted from the measurements.")
 
         meas_AWF = ArrayWFrame(
-            np.column_stack((values_u, values_v)), units_u, self.camera.camera_frame
+            np.column_stack((values_u, values_v)),
+            units_u,
+            self.camera.camera_frame_object,
         )
 
-        # For compatibility with other models
+        # Single-epoch observable: there is no light-time path with distinct
+        # transmit / reflect / receive times to distinguish, so all three
+        # collapse to the observation epoch. Returned because the estimator
+        # detrends on t1 and matches measurements on t2 -- see
+        # Measurement.computed_measurements for the contract.
         t1 = epoch_array
         t2 = epoch_array
         t3 = epoch_array
@@ -429,24 +439,24 @@ class CentroidingIdeal(Measurement):
     # -----------------------------#
     def _compute_H_cam(self, rel_cam_pos: ArrayWUnits) -> np.ndarray:
         """
-        d(u,v)/dr_cam  — Jacobian in camera frame (2×3).
+        Partials of the pixel coordinates with respect to the camera-frame
+        position, :math:`\\partial (u, v) / \\partial \\mathbf{r}_{cam}`.
 
-        Uses the pinhole projection: u = K[0,0]*x/z + K[0,2],  v = K[1,1]*y/z + K[1,2].
+        A thin wrapper over :meth:`~scarabaeus.OpNavManager.project_jacobian`, so
+        the projection and its derivative stay in step.
+
+        Parameters
+        ----------
+        rel_cam_pos : ArrayWUnits
+            Target position relative to the camera, in the camera frame, shape
+            (3,).
+
+        Returns
+        -------
+        np.ndarray
+            Shape (2, 3).
         """
-        K = np.asarray(self.camera.calibration_matrix)
-        x, y, z = rel_cam_pos.values
-
-        if z == 0:
-            return np.zeros((2, 3))
-
-        H_cam = np.array(
-            [
-                [K[0, 0] / z, 0.0, -K[0, 0] * x / z**2],
-                [0.0, K[1, 1] / z, -K[1, 1] * y / z**2],
-            ],
-            dtype=float,
-        )
-        return H_cam
+        return OpNavManager.project_jacobian(self.camera, rel_cam_pos.values)
 
     def _compute_H_pos_inertial(
         self,
@@ -454,16 +464,42 @@ class CentroidingIdeal(Measurement):
         R_ci: np.ndarray,
     ) -> np.ndarray:
         """
-        d(u,v)/dr_target_inertial  (2×3) via the chain rule:
-            d(u,v)/dr_inertial = [d(u,v)/dr_cam] @ R_ci
-        where R_ci (3×3) rotates vectors from the inertial frame (J2000) to the
+        Partials of the pixel coordinates with respect to the inertial target
+        position.
+
+        By the chain rule,
+
+        .. math::
+
+            \\frac{\\partial (u, v)}{\\partial \\mathbf{r}_{inertial}} =
+                \\frac{\\partial (u, v)}{\\partial \\mathbf{r}_{cam}}\\, R_{ci}
+
+        where :math:`R_{ci}` rotates vectors from the inertial frame (J2000) to the
         camera frame.
+
+        Parameters
+        ----------
+        rel_cam_pos : ArrayWUnits
+            Target position relative to the camera, in the camera frame, shape
+            (3,).
+        R_ci : np.ndarray
+            Rotation from the inertial frame to the camera frame, shape (3, 3).
+
+        Returns
+        -------
+        np.ndarray
+            Shape (2, 3).
         """
         return self._compute_H_cam(rel_cam_pos) @ R_ci
 
     def _compute_H_vel_target(self) -> np.ndarray:
         """
-        d(u,v)/dv_target — zero for instantaneous geometric centroiding.
+        Partials of the pixel coordinates with respect to the target velocity.
+
+        Returns
+        -------
+        np.ndarray
+            Zeros of shape (2, 3); geometric centroiding is instantaneous.
         """
         return np.zeros((2, 3), dtype=float)
 
@@ -477,24 +513,40 @@ class CentroidingIdeal(Measurement):
         frame: Frame = J2000,
     ) -> list:
         """
-        Groups together the different components of measurement
-        _partials in the global H-tilde. It returns the H-tilde array for the modelled measurement.
+        Assemble the ``u`` and ``v`` rows of the global H-tilde.
 
         Parameters
         ----------
         target : Spacecraft
-            The target spacecraft.
-
+            The body being imaged.
         epoch : EpochArray
-            The epochs.
-
-        frame : Frame
-            The reference frame.
+            Single epoch at which the partials are evaluated.
+        frame : Frame, optional
+            Reference frame of the state. Defaults to ``J2000``.
 
         Returns
         -------
         h_tilde : list
-            The H-tilde array (2×n) as a list of two rows [row_u, row_v].
+            ``[row_u, row_v]``, each a list of floats as long as the state.
+            Without a ``state_definition`` each row holds the target position and
+            velocity partials only.
+
+        Raises
+        ------
+        MissingImageIndexError
+            If the state holds a stacked per-image ``centroid_bias`` (dimension
+            > 2) and no epoch-to-image mapping is set.
+
+        Notes
+        -----
+        The imaged body's position enters with :math:`+H_{pos}` and the camera's
+        host body with :math:`-H_{pos}`, since the camera-frame position is
+        :math:`R_{ci} (\\mathbf{r}_{target} - \\mathbf{r}_{camera})`. Velocity
+        columns are zero. Components of the camera body get the identity for a
+        global ``centroid_bias`` (or ones in the current image's two columns when
+        it is stacked), :math:`x_c / z_c` and :math:`y_c / z_c` for the focal
+        lengths :math:`f_x, f_y`, and ones for the principal-point offsets
+        :math:`c_x, c_y`. Every other component gets zeros.
         """
         # Target position in camera frame (needed for Jacobian)
         rel_cam_pos = self._get_rel_cam_pos(target, epoch)
@@ -520,81 +572,71 @@ class CentroidingIdeal(Measurement):
             row_v = list(H_pos_inertial[1]) + list(H_vel[1])
             return [row_u, row_v]
 
-        # With explicit state_definition: map by component and body
-        row_u = []
-        row_v = []
+        # Column layout of the estimated state, so each component writes into
+        # its own slice instead of the row being assembled by appending.
+        n_state, components = self._state_layout()
+        H = np.zeros((2, n_state))
 
-        for comp_def in self._state_definition:
-            comp_name = comp_def[0]
-            comp_dim = comp_def[1]
-            comp_body = comp_def[4] if len(comp_def) > 4 else None
+        for comp_name, comp_dim, comp_body, start in components:
             comp_body_sid = getattr(comp_body, "spice_id", None)
 
             # Position (inertial frame) ---
-            # r_cam = R_ci @ (r_spacecraft − r_asteroid)
-            # spacecraft (camera body): dmeas/dr_sc   = +H
-            # asteroid   (imaged body): dmeas/dr_ast  = −H
+            # r_cam = R_ci @ (r_target − r_camera_body), and H_pos_inertial is
+            # d(u, v)/d(r_target − r_camera_body), so
+            # imaged body (target):        dmeas/dr_target = +H
+            # spacecraft  (camera body):   dmeas/dr_sc     = −H
+            # Both may be estimated at once, so every position block is visited
+            # rather than resolving a single one.
             if state_allowed["position"][2].match(comp_name):
-                if comp_body_sid == cam_sid:
-                    row_u.extend(H_pos_inertial[0].tolist())
-                    row_v.extend(H_pos_inertial[1].tolist())
-                elif comp_body_sid == target_sid:
-                    row_u.extend((-H_pos_inertial[0]).tolist())
-                    row_v.extend((-H_pos_inertial[1]).tolist())
-                else:
-                    row_u.extend([0.0] * comp_dim)
-                    row_v.extend([0.0] * comp_dim)
+                if comp_body_sid == target_sid:
+                    H[:, start : start + 3] = H_pos_inertial
+                elif comp_body_sid == cam_sid:
+                    H[:, start : start + 3] = -H_pos_inertial
 
-            # Velocity ---
-            # Instantaneous model has no velocity dependence for either body.
+            # Velocity is left at zero: the instantaneous model has no velocity
+            # dependence for either body.
             elif state_allowed["velocity"][2].match(comp_name):
-                row_u.extend([0.0] * comp_dim)
-                row_v.extend([0.0] * comp_dim)
+                continue
+
+            elif comp_body_sid != cam_sid:
+                # The remaining components are all camera intrinsics/biases.
+                continue
 
             # Centroid pixel bias ---
             # Global (dim=2): du/d[bu,bv] = [1,0], dv/d[bu,bv] = [0,1].
             # Stacked per-image (dim=2*N): indicator at slot [2*img, 2*img+1].
-            elif state_allowed["centroid_bias"][2].match(comp_name):
-                if comp_body_sid == cam_sid:
-                    if self._epoch_to_image_index is not None:
-                        _cur = self._epoch_to_image_index.get(float(epoch.times.values))
-                        ind_u = [0.0] * comp_dim
-                        ind_v = [0.0] * comp_dim
-                        if _cur is not None and 2 * _cur + 1 < comp_dim:
-                            ind_u[2 * _cur] = 1.0
-                            ind_v[2 * _cur + 1] = 1.0
-                        row_u.extend(ind_u)
-                        row_v.extend(ind_v)
-                    else:
-                        row_u.extend([1.0, 0.0])  # global mode (dim=2)
-                        row_v.extend([0.0, 1.0])
+            if state_allowed["centroid_bias"][2].match(comp_name):
+                if self._epoch_to_image_index is not None and comp_dim > 2:
+                    _cur = self._epoch_to_image_index.get(float(epoch.times.values))
+                    if _cur is not None and 2 * _cur + 1 < comp_dim:
+                        H[0, start + 2 * _cur] = 1.0
+                        H[1, start + 2 * _cur + 1] = 1.0
+                elif comp_dim > 2:
+                    raise CentroidingIdeal.MissingImageIndexError(
+                        f"State component '{comp_name}' has dimension {comp_dim}, so it "
+                        "holds one (bu, bv) bias per image, but no epoch-to-image "
+                        "mapping is set and the partial for this epoch is undefined. "
+                        "Call set_image_epochs() (or pass image_epochs= to "
+                        "observed_measurements/computed_measurements) before computing "
+                        "partials."
+                    )
                 else:
-                    row_u.extend([0.0] * comp_dim)
-                    row_v.extend([0.0] * comp_dim)
+                    H[0, start] = 1.0  # global mode (dim=2)
+                    H[1, start + 1] = 1.0
 
             # Camera focal length [fx, fy] (K[0,0] and K[1,1])
             # u = fx*x_c/z_c + cx,  v = fy*y_c/z_c + cy
             elif state_allowed["cam_focal_length"][2].match(comp_name):
-                if comp_body_sid == cam_sid and z_c != 0:
-                    row_u.extend([x_c / z_c, 0.0])  # du/d[fx,fy]
-                    row_v.extend([0.0, y_c / z_c])  # dv/d[fx,fy]
-                else:
-                    row_u.extend([0.0] * comp_dim)
-                    row_v.extend([0.0] * comp_dim)
+                if z_c != 0:
+                    H[0, start] = x_c / z_c  # du/dfx
+                    H[1, start + 1] = y_c / z_c  # dv/dfy
 
             # Camera principal point offset [cx, cy] (K[0,2] and K[1,2])
             # u = fx*x_c/z_c + cx → du/dcx = 1, du/dcy = 0
             elif state_allowed["cam_pp_offset"][2].match(comp_name):
-                if comp_body_sid == cam_sid:
-                    row_u.extend([1.0, 0.0])  # du/d[cx,cy]
-                    row_v.extend([0.0, 1.0])  # dv/d[cx,cy]
-                else:
-                    row_u.extend([0.0] * comp_dim)
-                    row_v.extend([0.0] * comp_dim)
+                H[0, start] = 1.0
+                H[1, start + 1] = 1.0
 
-            # Unknown / unhandled components: zeros
-            else:
-                row_u.extend([0.0] * comp_dim)
-                row_v.extend([0.0] * comp_dim)
+            # Any other component leaves its columns at zero.
 
-        return [row_u, row_v]
+        return [H[0].tolist(), H[1].tolist()]

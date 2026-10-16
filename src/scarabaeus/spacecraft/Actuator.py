@@ -16,17 +16,17 @@ class Actuator(Spacecraft):
     spice_id : int or str, optional
         The NAIF ID code of the object. Defaults to ``None``.
 
+    See Also
+    --------
+    scarabaeus.Spacecraft : Parent class providing SPICE registration and mass tracking.
+    scarabaeus.Instrument : Sibling subclass for sensing instruments.
+
     Notes
     -----
     Actuator is a lightweight subclass of :class:`~scarabaeus.Spacecraft`.
     It inherits all spacecraft state and SPICE-registration methods while
     adding no additional properties, leaving specialisation to concrete
     subclasses (e.g. thrusters).
-
-    See Also
-    --------
-    scarabaeus.Spacecraft : Parent class providing SPICE registration and mass tracking.
-    scarabaeus.Instrument : Sibling subclass for sensing instruments.
     """
     #--------------------#
     # region Constructor #

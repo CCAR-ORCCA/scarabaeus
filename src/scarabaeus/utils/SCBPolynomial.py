@@ -35,10 +35,10 @@ class SCBPolynomial:
 
     References
     ----------
-    Press, W. H.; Teukolsky, S. A.; Vetterling, W. T.; Flannery, B. P. (2007).
-    *Numerical Recipes: The Art of Scientific Computing* (3rd ed.).
-    Cambridge University Press.
-    ISBN 978-0521880688.
+    .. [1] Press, W. H.; Teukolsky, S. A.; Vetterling, W. T.; Flannery, B. P. (2007).
+       *Numerical Recipes: The Art of Scientific Computing* (3rd ed.).
+       Cambridge University Press.
+       ISBN 978-0521880688.
     """
 
     def __init__(self, coefficients: np.ndarray, domain: tuple = None):

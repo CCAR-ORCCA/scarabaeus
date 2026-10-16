@@ -2,7 +2,6 @@
 # SPDX-License-Identifier: ISC
 from scarabaeus import (
     FilterOD,
-    CovarianceMatrix,
     SolutionOD,
     Propagator,
     FilterSettings,
@@ -123,6 +122,9 @@ class SRIFB(FilterOD):
         Directory for the trajectory BSP file.
     overwrite_traj : bool, optional
         If ``True``, overwrite any existing trajectory file.
+    verbose : bool, optional
+        If ``False``, silence the printout of the propagation run at
+        construction. Defaults to ``True``.
 
     Raises
     ------
@@ -133,6 +135,12 @@ class SRIFB(FilterOD):
         If ``settings.process_noise`` is not ``None`` (process noise is not
         supported in the batch formulation; use :class:`~scarabaeus.SRIF` or :class:`~scarabaeus.LKF`).
 
+    See Also
+    --------
+    scarabaeus.LSB : Normal-equation batch estimator; same solution, less stable.
+    scarabaeus.SRIF : Sequential square-root information filter; supports process noise.
+    scarabaeus.FilterOD : Base class providing trajectory and measurement handling.
+
     Notes
     -----
     Process noise (SNC/DMC) requires intermediate time updates and is therefore
@@ -141,78 +149,31 @@ class SRIFB(FilterOD):
     sequentially.  For process-noise-free problems, SRIFB is the numerically
     preferred alternative to :class:`~scarabaeus.LSB`.
 
-    See Also
-    --------
-    scarabaeus.LSB : Normal-equation batch estimator; same solution, less stable.
-    scarabaeus.SRIF : Sequential square-root information filter; supports process noise.
-    scarabaeus.FilterOD : Base class providing trajectory and measurement handling.
-
     References
     ----------
     .. [1] Tapley, B. D., Schutz, B. E., & Born, G. H. (2004).
-    Statistical Orbit Determination.
-    Elsevier Academic Press.
-    ISBN 978-0-12-683630-1.
+       Statistical Orbit Determination.
+       Elsevier Academic Press.
+       ISBN 978-0-12-683630-1.
 
     .. [2] Bierman, G. J. (1977).
-    Factorization Methods for Discrete Sequential Estimation.
-    Academic Press.
-    ISBN 978-0-12-097650-8.
+       Factorization Methods for Discrete Sequential Estimation.
+       Academic Press.
+       ISBN 978-0-12-097650-8.
     """
+
+    # Batch estimator: sequential process noise is not applicable.
+    _supports_process_noise = False
+
+    # The solution is mapped back through the sequence nodes in ``_compute``.
+    _maps_back_sequence = True
 
     # ------------------------------------------------------------------
     # Properties
     # ------------------------------------------------------------------
-
-    @property
-    def covariance_history(self) -> list:
-        """Posterior covariance :math:`\\hat{P}_0` propagated to each measurement
-        epoch via the trajectory STMs. Populated after calling :meth:`~FilterOD.fit`."""
-        return self._covariance_history
-
-    @covariance_history.setter
-    def covariance_history(self, value):
-        self._covariance_history = value
-
-    @property
-    def covariance_consider_history(self) -> list:
-        """Consider-parameter covariance block at each epoch.
-        Empty list when no consider parameters are active."""
-        return self._covariance_consider_history
-
-    @covariance_consider_history.setter
-    def covariance_consider_history(self, value):
-        self._covariance_consider_history = value
-
-    @property
-    def state_deviation_history(self) -> list:
-        """State deviation :math:`\\hat{x}_k` propagated to each measurement epoch.
-        Populated after calling :meth:`~FilterOD.fit`."""
-        return self._state_deviation_history
-
-    @state_deviation_history.setter
-    def state_deviation_history(self, value):
-        self._state_deviation_history = value
-
-    @property
-    def prefit_residuals(self) -> dict:
-        """Pre-fit residuals :math:`y_k`, keyed by dataset name.
-        Populated after calling :meth:`~FilterOD.fit`."""
-        return self._prefit_residuals
-
-    @prefit_residuals.setter
-    def prefit_residuals(self, value):
-        self._prefit_residuals = value
-
-    @property
-    def postfit_residuals(self) -> dict:
-        """Post-fit residuals from the batch solution, keyed by dataset name.
-        Populated after calling :meth:`~FilterOD.fit`."""
-        return self._postfit_residuals
-
-    @postfit_residuals.setter
-    def postfit_residuals(self, value):
-        self._postfit_residuals = value
+    # The history/residual properties (covariance_history,
+    # covariance_consider_history, state_deviation_history, prefit_residuals,
+    # postfit_residuals) are inherited from FilterOD.
 
     def __init__(
         self,
@@ -222,18 +183,18 @@ class SRIFB(FilterOD):
         traj_name: Optional[str] = None,
         traj_dir: Optional[str] = None,
         overwrite_traj: bool = True,
+        verbose: bool = True,
     ):
         # parent class initialization
         super().__init__(
-            propagator, measurements, settings, traj_name, traj_dir, overwrite_traj
+            propagator,
+            measurements,
+            settings,
+            traj_name,
+            traj_dir,
+            overwrite_traj,
+            verbose=verbose,
         )
-
-        # Initialize output containers
-        self._covariance_history = []
-        self._covariance_consider_history = []
-        self._state_deviation_history = []
-        self._prefit_residuals = {}
-        self._postfit_residuals = {}
 
         # Raise error if needed
         ## Initial covariance matrix
@@ -244,10 +205,6 @@ class SRIFB(FilterOD):
                 "The SRIF relies on Cholesky decomposition for computing the square root of the information matrix. Consequently, it is necessary for the initial covariance matrix to be positive definite."
             )
 
-        # Initialize process noise from settings if provided
-        if self.settings.process_noise is not None:
-            raise NotImplementedError("Process noise not a feature for SRIFB.")
-
         ## Print
         print("")
         print("=" * 80)
@@ -257,7 +214,7 @@ class SRIFB(FilterOD):
     def _compute(
         self,
         meas_corr: list = None,
-        map_back_sequence: bool = False,
+        map_back_sequence: bool = True,
         printOutput: bool = True,
     ) -> SolutionOD:
         """
@@ -269,6 +226,9 @@ class SRIFB(FilterOD):
 
         In sequence mode, maps the final leg deviation and covariance back through
         previous trajectory legs, ensuring continuity across estimation segments.
+        States a leg drops at a node are recovered from that leg's forward
+        solution (see :meth:`FilterOD._map_back_across_node`), so every leg
+        reflects the solution of the whole data arc.
 
         Parameters
         ----------
@@ -276,7 +236,9 @@ class SRIFB(FilterOD):
             List of correction factors applied to the measurement covariance. Defaults to ``None``.
 
         map_back_sequence : bool, optional
-            If ``True``, maps the final leg deviation and covariance back to previous legs. Defaults to ``True``.
+            If ``True``, maps the final leg deviation and covariance back to previous legs.
+            If ``False``, each leg keeps the solution of the data up to its end,
+            which is not a consistent update of the whole sequence. Defaults to ``True``.
 
         printOutput : bool, optional
             If ``True``, prints progress information during execution. Defaults to ``True``.
@@ -291,9 +253,12 @@ class SRIFB(FilterOD):
         if self.flag_sequence:
             self._validate_sequence_batch()
 
-        # Initialize arrays for storing information
+        # Initialize arrays for storing information. Start from the first leg:
+        # the last pass left its last leg's size, partition and node flag.
         if self.flag_sequence:
             self.n = self.legs_n[0]
+            self.flag_node = False
+            self._init_consider_partition()
 
         # Initialize storage as instance attributes
         self.covariance_history = []
@@ -308,6 +273,9 @@ class SRIFB(FilterOD):
         covariance_0_legs = []
         covariance_consider_0_legs = []
         last_STM_legs = []
+        deviation_node_legs = []
+        covariance_node_legs = []
+        information_node_legs = []
 
         # Create initial square root information matrix and information vector
         P0 = self.initial_covariance.matrix_without_units()
@@ -322,19 +290,12 @@ class SRIFB(FilterOD):
         else:
             Rxx_hat_k = self._sqrt_info_matrix((P0))
             Rxc_hat_k = None
-        # z_x = Rxx_hat_k * dx  (start at zero deviation)
-        zx_hat_k = np.zeros((self.n_est if self.has_consider else self.n, 1))
+        # z_x = Rxx_hat_k * dx, starting from the a-priori deviation
+        dx_bar_0 = self._apriori_deviation(0)
+        zx_hat_k = Rxx_hat_k @ (dx_bar_0[self.idx_est] if self.has_consider else dx_bar_0)
 
         # Extract spacecraft times
-        measurement_times = np.asarray(
-            self.measurement_data.get_spacecraft_times(), dtype=float
-        )
-        if self.flag_sequence:
-            event_times = np.asarray(self.events_epochs, dtype=float)
-            timeline_times = np.unique(np.concatenate((measurement_times, event_times)))
-        else:
-            event_times = np.array([])
-            timeline_times = measurement_times
+        measurement_times, event_times, timeline_times = self._build_timeline()
 
         # Iterate through measurements
         print("")
@@ -363,8 +324,7 @@ class SRIFB(FilterOD):
             #### Extract Measurement Data for Epoch t2 ####
             block = None
             if self.update_flag:
-                block = self.measurement_data.get_combined_for_t2(current_time)
-                block = block[current_time]
+                block = self._epoch_measurement_block(current_time)
                 sigmas = block["sigma"]
                 partials = block["partials"][:, : self.n]
                 residuals = block["residuals"]
@@ -396,13 +356,8 @@ class SRIFB(FilterOD):
                 Hx, Hc = self._split_partials_hx_hc(partials)
 
                 # Measurement Information Whitening
-                measurement_covariance = np.array(
-                    CovarianceMatrix(
-                        sigmas,
-                        current_time,
-                        from_list=True,
-                        corr_factors=meas_corr,
-                    ).matrix
+                measurement_covariance = self._measurement_covariance(
+                    sigmas, current_time, meas_corr
                 )
                 measurement_SRI = self._sqrt_info_matrix((measurement_covariance))
 
@@ -473,7 +428,7 @@ class SRIFB(FilterOD):
                 print(f"[{epoch: .2f} TDB | {progress:5.1f}%] " f"‖z‖ = {norm_z:.4e}")
 
             # If node augment deviaton, covariance and information
-            if hasattr(self, "flag_node") and self.flag_node is True:
+            if self.flag_node:
                 # Compute deviation and covariance at t0
                 prev_n = self.legs_n[counter_events - 1]
 
@@ -516,19 +471,45 @@ class SRIFB(FilterOD):
                 last_STM_legs.append(curr_STM_prev_leg)
 
                 dx_node = curr_STM_prev_leg @ dx_full_0
-                P_node = curr_STM_prev_leg @ P_full_0 @ curr_STM_prev_leg.T
+                # Covariance of the errors at the node: with consider states the
+                # joint one, whose estimated block is the consider-inflated Pc.
+                # P_full_0 pairs the conditional Pxx with Pxc and Pcc and need
+                # not be positive definite.
+                P_node = (
+                    curr_STM_prev_leg
+                    @ (P_cons_full_0 if self.has_consider else P_full_0)
+                    @ curr_STM_prev_leg.T
+                )
+
+                # keep the node solution in the previous definition: mapping back
+                # recovers from it the states dropped at this node
+                deviation_node_legs.append(dx_node)
+                covariance_node_legs.append(P_node)
 
                 # map definition change at node (augment/reset)
-                dx_node = self._map_deviation_definition_node(counter_events, dx_node)
-                P_node = self._map_covariance_definition_node(counter_events, P_node)
-
-                # After mapping you can re-init consider partition safely
+                prev_has_consider = self.has_consider
                 self._init_consider_partition(idx_leg=counter_events)
-                n_use = self.n_est if self.has_consider else self.n
-                nc = self.n_con
 
                 # restart SRIF factors for next leg from FULL information
-                if self.has_consider:
+                if not (prev_has_consider or self.has_consider):
+                    # carry the information itself across the node,
+                    # R_node = Rxx Phi^-1: re-factoring P_node would invert a
+                    # covariance too ill-conditioned after a dense arc
+                    R_node = np.linalg.solve(curr_STM_prev_leg.T, Rxx_hat_k.T).T
+                    # mapping back recovers the dropped states from it
+                    information_node_legs.append(R_node)
+                    Rxx_hat_k, zx_hat_k = self._map_information_definition_node(
+                        counter_events, R_node, zx_hat_k
+                    )
+                    Rxc_hat_k = None
+                else:
+                    information_node_legs.append(None)
+                    dx_node = self._map_deviation_definition_node(
+                        counter_events, dx_node
+                    )
+                    P_node = self._map_covariance_definition_node(
+                        counter_events, P_node
+                    )
                     # update Pcc prior across legs (mapped)
                     Pcc_bar_0 = P_node[np.ix_(self.idx_con, self.idx_con)]
 
@@ -539,16 +520,16 @@ class SRIFB(FilterOD):
 
                     # restart zx_hat_k from mapped deviation
                     zx_hat_k = Rxx_hat_k @ dx_node[self.idx_est]
-                else:
-                    R_node = self._sqrt_info_matrix(P_node)
-                    Rxx_hat_k = R_node
-                    Rxc_hat_k = None
-                    zx_hat_k = Rxx_hat_k @ dx_node
 
                 zx_hat_k = np.atleast_2d(zx_hat_k).reshape(-1, 1)
 
                 self.flag_node = False
                 self.update_flag = True
+
+        # Forward solution at each sequence node, in the previous leg's
+        # definition: SolutionOD maps final estimates back through it
+        self._node_deviations = deviation_node_legs
+        self._node_covariances = covariance_node_legs
 
         # Deviation and covariance last leg, after processing k measurements
         nx = self.n_est if self.has_consider else self.n
@@ -584,51 +565,49 @@ class SRIFB(FilterOD):
         if self.flag_sequence and map_back_sequence:
             deviation_0_legs_mapped = deviation_0_legs.copy()
             covariance_0_legs_mapped = covariance_0_legs.copy()
+            covariance_consider_0_legs_mapped = covariance_consider_0_legs.copy()
             last_leg_deviation = deviation_0_legs[-1]
-            last_leg_covariance = covariance_0_legs[-1]
-            if self.has_consider:
-                covariance_consider_0_legs_mapped = covariance_consider_0_legs.copy()
-                last_leg_covariance_consider = covariance_consider_0_legs[-1]
+            # Map the covariance of the errors, joint when the last leg considers
+            # states, like the forward node covariances it is conditioned on
+            last_leg_covariance = (
+                covariance_0_legs[-1]
+                if covariance_consider_0_legs[-1] is None
+                else covariance_consider_0_legs[-1]
+            )
             for idx in range(counter_events, 0, -1):
-                # Inverse STM (from t_node to t_0) of leg idx-1
-                prev_STM_inv = self._safe_inv(last_STM_legs[idx - 1])
-
-                # Map deviation
-                prev_leg_deviation_tnode = self._map_deviation_definition_node(
-                    idx, last_leg_deviation, flag_forward=False
+                # Map deviation and covariance across the node
+                (
+                    prev_leg_deviation_tnode,
+                    prev_leg_covariance_tnode,
+                ) = self._map_back_across_node(
+                    idx,
+                    last_leg_deviation,
+                    last_leg_covariance,
+                    deviation_node_legs[idx - 1],
+                    covariance_node_legs[idx - 1],
+                    information_node_legs[idx - 1],
                 )
-                prev_leg_deviation_t0 = prev_STM_inv @ prev_leg_deviation_tnode
+
+                # ... and from t_node to t_0 of leg idx-1
+                (
+                    prev_leg_deviation_t0,
+                    prev_leg_covariance_t0,
+                ) = self._map_node_to_leg_epoch(
+                    last_STM_legs[idx - 1],
+                    prev_leg_deviation_tnode,
+                    prev_leg_covariance_tnode,
+                    label=f"Leg {idx - 1} covariance",
+                )
                 deviation_0_legs_mapped[idx - 1] = prev_leg_deviation_t0
-
-                # Map covariance
-                prev_leg_covariance_tnode = self._map_covariance_definition_node(
-                    idx, last_leg_covariance, flag_forward=False
-                )
-                prev_leg_covariance_t0 = (
-                    prev_STM_inv @ prev_leg_covariance_tnode @ prev_STM_inv.T
-                )
-                covariance_0_legs_mapped[idx - 1] = prev_leg_covariance_t0
+                # stored as the leg's own pair, whichever legs consider states
+                (
+                    covariance_0_legs_mapped[idx - 1],
+                    covariance_consider_0_legs_mapped[idx - 1],
+                ) = self._split_consider_covariance(idx - 1, prev_leg_covariance_t0)
 
                 # Update last leg deviation and covariance
                 last_leg_deviation = prev_leg_deviation_t0
                 last_leg_covariance = prev_leg_covariance_t0
-
-                # Consider covariance mapping
-                if self.has_consider:
-                    prev_leg_covariance_consider_tnode = (
-                        self._map_covariance_definition_node(
-                            idx, last_leg_covariance_consider, flag_forward=False
-                        )
-                    )
-                    prev_leg_covariance_consider_t0 = (
-                        prev_STM_inv
-                        @ prev_leg_covariance_consider_tnode
-                        @ prev_STM_inv.T
-                    )
-                    covariance_consider_0_legs_mapped[idx - 1] = (
-                        prev_leg_covariance_consider_t0
-                    )
-                    last_leg_covariance_consider = prev_leg_covariance_consider_t0
 
         # Map the state deviation and covariance at epoch to all times k
         counter_events = 0
@@ -657,8 +636,7 @@ class SRIFB(FilterOD):
             #### Extract Measurement Data for Epoch t2 ####
             block = None
             if self.update_flag:
-                block = self.measurement_data.get_combined_for_t2(current_time)
-                block = block[current_time]
+                block = self._epoch_measurement_block(current_time)
                 sigmas = block["sigma"]
                 partials = block["partials"][:, : self.n]
                 residuals = block["residuals"]
@@ -687,24 +665,28 @@ class SRIFB(FilterOD):
             if self.flag_sequence and map_back_sequence:
                 deviation_source = deviation_0_legs_mapped
                 covariance_source = covariance_0_legs_mapped
-                if self.has_consider:
-                    covariance_consider_source = covariance_consider_0_legs_mapped
+                covariance_consider_source = covariance_consider_0_legs_mapped
             else:
                 deviation_source = deviation_0_legs
                 covariance_source = covariance_0_legs
-                if self.has_consider:
-                    covariance_consider_source = covariance_consider_0_legs
+                covariance_consider_source = covariance_consider_0_legs
             dx = STM_k @ deviation_source[counter_events]
-            P = STM_k @ covariance_source[counter_events] @ STM_k.T
-            if self.has_consider:
-                P_cons = STM_k @ covariance_consider_source[counter_events] @ STM_k.T
+            # per leg: self.has_consider is the last leg's
+            P_cons = covariance_consider_source[counter_events]
+            if P_cons is None:
+                P = STM_k @ covariance_source[counter_events] @ STM_k.T
+            else:
+                # Map the joint covariance and condition it at this epoch: the
+                # STM couples estimated and considered states, so the mapped
+                # conditional block would no longer be conditional
+                P, P_cons = self._split_consider_covariance(
+                    counter_events, STM_k @ P_cons @ STM_k.T
+                )
 
             # Store results
             self.state_deviation_history.append(dx)
             self.covariance_history.append(P)
-            self.covariance_consider_history.append(
-                P_cons if self.has_consider else None
-            )
+            self.covariance_consider_history.append(P_cons)
 
             # Compute/store residuals only when meaningful
             if self.update_flag and not self.covariance_analysis:
@@ -739,7 +721,7 @@ class SRIFB(FilterOD):
                     / (measurement_times[-1] - measurement_times[0])
                     * 100
                 )
-                trace_P = np.trace(P if not self.has_consider else P_cons)
+                trace_P = np.trace(P if P_cons is None else P_cons)
 
                 if self.update_flag and not self.covariance_analysis:
                     norm_prefit = np.linalg.norm(residuals)
@@ -761,10 +743,14 @@ class SRIFB(FilterOD):
         # Post-process residuals
         if not self.covariance_analysis:
             self.prefit_residuals = self._unwrap_residuals(
-                self.prefit_residuals, self.measurement_data.dataset_names
+                self.prefit_residuals,
+                self.measurement_data.dataset_names,
+                epoch_attr="prefit_epochs",
             )
             self.postfit_residuals = self._unwrap_residuals(
-                self.postfit_residuals, self.measurement_data.dataset_names
+                self.postfit_residuals,
+                self.measurement_data.dataset_names,
+                epoch_attr="postfit_epochs",
             )
 
         # Return SolutionOD object

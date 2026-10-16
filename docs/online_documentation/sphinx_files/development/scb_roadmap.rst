@@ -1,5 +1,6 @@
 .. SPDX-FileCopyrightText: 2026 Orbital Research Cluster for Celestial Applications (ORCCA) Lab, University of Colorado at Boulder
 .. SPDX-License-Identifier: ISC
+
 .. meta::
     :description lang=en:
         Scarabaeus roadmap.
@@ -15,58 +16,52 @@
 
 .. role:: gold
 
-=========================
+==========================
 :gold:`Scarabaeus Roadmap`
-=========================
-Last revised on 2026 MAY 27 by G. Fereoli.
+==========================
+Last revised on 2026 OCT 16 by G. Fereoli.
 
-Performance Improvements
----------------------------
-- Move performance-critical components from Python to Rust
-- Improve propagation, filtering, and Monte Carlo scalability
+Delta-DOR
+---------
+- Delta-DOR measurement model with analytical partials, estimated alongside DSN range
+  and Doppler
+
+Finite-Burn Optimization
+------------------------
+- Use Scarabaeus as a local targeting and optimization framework for finite burns
+
+Optical Navigation
+------------------
+- Further optical navigation models with analytical partials
+- Map-based landmark and catalogue navigation
+- Map-free visual odometry and feature tracking
+
+Rust Performance
+----------------
+- Move the measurement models (radiometric and optical) and their partials to Rust
+- Move the filters (sequential and batch) to Rust
 
 Measurement and Filtering V&V
--------------------------------
-- Document V&V of measurement models (DSN range, Doppler, range and range-rate) and analytical partial derivatives
+-----------------------------
+- Document V&V of measurement models (DSN range, Doppler, range and range-rate) and
+  analytical partial derivatives
 - Compare covariance analysis results to state-of-the-art OD software
 - Document data processing and filter results for multiple missions
 
-Real Measurement Model Enhancements
---------------------------------------
-- Extend geocentric-frame support so real radiometric models operate correctly
-  inside Earth's sphere of influence; implement partial derivatives of tropospheric
-  and ionospheric media corrections to enable atmospheric parameter estimation
-  alongside the spacecraft state
-
-Finite-Burn Targeting
-------------------------
-- Use Scarabaeus as a local targeting and optimization framework
-
-Delta-DOR Implementation
-----------------------
-- Full Delta-DOR measurement modeling and estimation support
-
-Terrain Relative Navigation
--------------------------------
-
-Map-Based
-~~~~~~~~~
-- Landmark and catalogue-based navigation
-
-Map-Free
-~~~~~~~~
-- Visual odometry and feature tracking
-
-Proximity Operations
------------------------
-- Small-body geophysical estimation
-- Gravity and rotational-state recovery
-- Reference-frame switching and local-frame operations
-
-Multi-Arc Filtering
-----------------------
-
 Binary Asteroid Simulator
------------------------------
+-------------------------
 - General-use binary asteroid simulation environment
 - Hera mission operational scenarios
+
+Completed in 2.0.0
+------------------
+- Spherical-harmonics, n-plate SRP and polyhedron gravity kernels, and the third-body
+  ephemeris cache, moved to Rust
+- Analytical partial derivatives of the real DSN radiometric models, including
+  tropospheric and ionospheric zenith delays, so atmospheric parameters are estimated
+  alongside the spacecraft state
+- Geocentric light-time option for the real radiometric models
+- Station location, Earth orientation, tide and IAU pole parameters estimable with
+  analytical partials
+- Polyhedral shape-model gravity, conversion of a shape model to spherical-harmonic
+  coefficients, and several spherical-harmonic fields per spacecraft

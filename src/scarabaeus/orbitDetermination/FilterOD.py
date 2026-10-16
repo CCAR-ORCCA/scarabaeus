@@ -9,20 +9,25 @@ from scarabaeus import (
     FilterSettings,
     ProcessNoiseSettings,
     StateNoiseCompensation,
-    DynamicModelCompensation,
+    DynamicalModelCompensation,
     StateDefinition,
     ArrayWFrame,
     ArrayWUnits,
     ScenarioSetup,
     MissionSequence,
     MeasurementSpec,
+    SpiceManager,
+    Units,
+    DynamicalUtils,
 )
 import scarabaeus.utils.NumpyWrapper as np
+import functools
 import os
 import time
 import scipy.linalg as spln
-from typing import List, Dict, Tuple, Optional
+from typing import Callable, List, Dict, Tuple, Optional, Union
 import warnings
+from scarabaeus.utils.Utils import Utils
 
 
 # -----------------------#
@@ -88,21 +93,28 @@ class FilterOD:
     measurements : MeasurementSpec
         Measurement specification object.
     settings : FilterSettings
-        Filter configuration settings.
+        Filter configuration settings. Its ``measurement_sigmas``, keyed by
+        dataset name, are set once, at construction and before the first
+        editing pass, on the model behind each dataset they name (see
+        :meth:`set_measurement_sigmas`). They therefore win over the sigma the
+        model was built with, ``model.sigma`` reports them, and the datasets of
+        every later iteration are built with them. The model is the only
+        source: a sigma set on it afterwards (through
+        :meth:`set_measurement_sigmas`, ``MeasurementSpec.edit`` or
+        ``model.sigma = ...``, e.g. from a :meth:`fit` callback) takes over
+        from the next iteration on. An ``ArrayWUnits`` value is converted to
+        the dataset's units; a bare float is taken to be in them already.
     traj_name : str, optional
-        Name for the trajectory BSP file.
+        Name for the trajectory BSP file. :meth:`fit` names the trajectories of
+        later iterations after it.
     traj_dir : str, optional
-        Directory to write trajectory.
+        Directory to write trajectory, for this and every later iteration.
+        Defaults to ``./data/kernels/scenario/`` under the current directory.
     overwrite_traj : bool
         If True, overwrite existing trajectory file.
-
-    Notes
-    -----
-    This class is not instantiated directly; use a concrete subclass
-    (:class:`~scarabaeus.LKF`, :class:`~scarabaeus.SRIF`,
-    :class:`~scarabaeus.LSB`, or :class:`~scarabaeus.SRIFB`).
-    Call :meth:`fit` to run the filter and retrieve results via
-    :class:`~scarabaeus.SolutionOD`.
+    verbose : bool, optional
+        If False, silence the printout of the propagation run at construction.
+        Defaults to True.
 
     See Also
     --------
@@ -112,10 +124,90 @@ class FilterOD:
     scarabaeus.SRIFB : Batch Square Root Information Filter.
     scarabaeus.SolutionOD : Container for the estimated state history and covariance.
 
+    Notes
+    -----
+    This class is not instantiated directly; use a concrete subclass
+    (:class:`~scarabaeus.LKF`, :class:`~scarabaeus.SRIF`,
+    :class:`~scarabaeus.LSB`, or :class:`~scarabaeus.SRIFB`).
+    Call :meth:`fit` to run the filter and retrieve results via
+    :class:`~scarabaeus.SolutionOD`.
+
     References
     ----------
-    Tapley, B. D., Schutz, B. E., & Born, G. H. (2004). Statistical Orbit Determination. Elsevier Academic Press. ISBN 978-0-12-683630-1.
+    .. [1] Tapley, B. D., Schutz, B. E., & Born, G. H. (2004). *Statistical Orbit
+       Determination*. Elsevier Academic Press. ISBN 978-0-12-683630-1.
     """
+
+    # ------------------#
+    # region   Errors  #
+    # ------------------#
+    class ConvergenceCriterionError(ValueError):
+        """Raised when an unknown convergence criterion is requested."""
+
+    class MissingAprioriSigmaError(ValueError):
+        """Raised when a newly augmented state has no ``extra_apriori_sigmas`` entry."""
+
+    class AprioriSigmaUnitsError(ValueError):
+        """Raised when an ``extra_apriori_sigmas`` entry cannot be expressed in the
+        units of the state element it initialises."""
+
+    class InitialCovarianceSizeError(ValueError):
+        """Raised when the initial covariance does not match the size of the
+        initial state (the first leg's on a sequence)."""
+
+    class MissingGaussMarkovModelError(ValueError):
+        """Raised when DMC process noise is used on a leg whose dynamics do not
+        integrate the first-order Gauss-Markov acceleration it drives."""
+
+    class ProcessNoiseBetaMismatchError(ValueError):
+        """Raised when the DMC ``beta`` given in the settings differs from the
+        decay rates of the Gauss-Markov acceleration in the dynamics."""
+
+    class DuplicateProcessNoiseBodyError(ValueError):
+        """Raised when two process noise settings drive the same body."""
+
+    class NoiseReferenceUnavailableError(ValueError):
+        """Raised when an RTN process noise drives a body whose reference
+        trajectory is not in the trajectory SPK: on a sequence, any body other
+        than the primary body of each leg."""
+
+    class UnknownSigmaDatasetError(ValueError):
+        """Raised when a measurement sigma names a dataset the filter does not
+        have."""
+
+    class MeasurementSigmaUnitsError(ValueError):
+        """Raised when a measurement sigma cannot be expressed in the units of
+        the dataset it is given for."""
+
+    class SharedSigmaModelError(ValueError):
+        """Raised when measurement sigmas would give one model two sigmas: the
+        datasets one model builds (its components, or the entries that reuse
+        it) share its sigma, so a sigma given for one of them must hold for
+        all of them."""
+
+    class SequenceStateDroppedWarning(UserWarning):
+        """Issued when a sequence leg drops a state the previous leg carried.
+
+        Dropping is supported (the state is marginalised at the node and
+        recovered when mapping back), so this is informational; silence it with
+        ``warnings.filterwarnings("ignore", category=FilterOD.SequenceStateDroppedWarning)``.
+        """
+
+    class UnnoisedBodyWarning(UserWarning):
+        """Issued when process noise is configured but an estimated, propagated
+        body has none.
+
+        Leaving a body noise-free is legitimate, so this is informational;
+        silence it with
+        ``warnings.filterwarnings("ignore", category=FilterOD.UnnoisedBodyWarning)``.
+        """
+
+    class CovarianceNotPSDWarning(RuntimeWarning):
+        """Issued when a covariance mapped back across a sequence is not
+        positive semi-definite beyond round-off."""
+
+    # endregion Errors #
+    # ------------------#
 
     # ------------------------------------------------------------------
     # Properties
@@ -223,6 +315,79 @@ class FilterOD:
     def covariance_analysis(self, value: bool):
         self._covariance_analysis = value
 
+    # ------------------------------------------------------------------
+    # Solution-history attributes shared by every filter (LKF / LSB /
+    # SRIF / SRIFB). They are populated during :meth:`_compute` and read
+    # back by :class:`~scarabaeus.SolutionOD`. Defined once here so the
+    # subclasses don't each repeat identical getter/setter plumbing.
+    # ------------------------------------------------------------------
+    @property
+    def covariance_history(self) -> list:
+        """Posterior covariance at each measurement epoch. Populated after
+        calling :meth:`fit`."""
+        return self._covariance_history
+
+    @covariance_history.setter
+    def covariance_history(self, value):
+        self._covariance_history = value
+
+    @property
+    def covariance_consider_history(self) -> list:
+        """Consider-augmented covariance at each measurement epoch (when consider
+        parameters are active). Populated after calling :meth:`fit`."""
+        return self._covariance_consider_history
+
+    @covariance_consider_history.setter
+    def covariance_consider_history(self, value):
+        self._covariance_consider_history = value
+
+    @property
+    def state_deviation_history(self) -> list:
+        """State deviation at each measurement epoch. Populated after calling
+        :meth:`fit`."""
+        return self._state_deviation_history
+
+    @state_deviation_history.setter
+    def state_deviation_history(self, value):
+        self._state_deviation_history = value
+
+    @property
+    def prefit_residuals(self) -> dict:
+        """Pre-update measurement residuals, keyed by epoch. Populated after
+        calling :meth:`fit`."""
+        return self._prefit_residuals
+
+    @prefit_residuals.setter
+    def prefit_residuals(self, value):
+        self._prefit_residuals = value
+
+    @property
+    def postfit_residuals(self) -> dict:
+        """Post-update measurement residuals, keyed by epoch. Populated after
+        calling :meth:`fit`."""
+        return self._postfit_residuals
+
+    @postfit_residuals.setter
+    def postfit_residuals(self, value):
+        self._postfit_residuals = value
+
+    @property
+    def cost_history(self) -> list:
+        """Weighted least-squares cost :math:`J = \\sum_i (r_i/\\sigma_i)^2` of the
+        post-fit residuals of every iteration performed by :meth:`fit`, as
+        ``[(J, n_residuals), ...]``."""
+        return self._cost_hist
+
+    # Whether this filter supports sequential process noise (SNC/DMC).
+    # Batch estimators (LSB, SRIFB) override this to False.
+    _supports_process_noise = True
+
+    # Whether ``_compute`` already maps the last leg's solution back through the
+    # sequence nodes, so that every leg of the deviation history holds the
+    # solution of the whole data arc. Batch estimators (LSB, SRIFB) override
+    # this to True; sequential filters hold per-leg solutions instead.
+    _maps_back_sequence = False
+
     # --------------------#
     # region Constructor #
     # --------------------#
@@ -234,6 +399,7 @@ class FilterOD:
         traj_name: Optional[str] = None,
         traj_dir: Optional[str] = None,
         overwrite_traj: bool = True,
+        verbose: bool = True,
     ):
         # Store inputs
         self.propagator = propagator
@@ -242,9 +408,18 @@ class FilterOD:
         self.initial_covariance = settings.initial_covariance
 
         # Build trajectory and measurements
+        self._traj_dir = traj_dir
         self.trajectory, self.measurement_data = self._initialize(
-            propagator, measurements, traj_name, traj_dir, overwrite_traj
+            propagator,
+            measurements,
+            traj_name,
+            traj_dir,
+            overwrite_traj,
+            verbose=verbose,
         )
+        # fit() names later iterations after this one, so re-linearising does
+        # not leave a new timestamped SPK behind on every pass
+        self._traj_name = os.path.basename(self.trajectory.spk_path)
 
         self.first_iteration_measurement_data = self.measurement_data
 
@@ -254,6 +429,10 @@ class FilterOD:
         self.covariance_analysis = False
         self.update_flag = True
         self.flag_desat = False
+        # Always defined so the filter loops can test them directly (rather than
+        # via hasattr); the sequence/non-sequence initializers refine them below.
+        self.flag_node = False
+        self.flag_MTM = False
         self.flag_sequence = self.trajectory.sequence_definition is not None
 
         # Setup based on trajectory type
@@ -265,21 +444,64 @@ class FilterOD:
         # Generate consider parameter partition (if applicable)
         self._init_consider_partition()
 
+        # The filters index P0 with the initial state's partition
+        n_initial = self.legs_n[0] if self.flag_sequence else self.n
+        P0_shape = np.shape(self.initial_covariance.matrix_without_units())
+        if P0_shape != (n_initial, n_initial):
+            raise self.InitialCovarianceSizeError(
+                f"The initial covariance is {P0_shape[0]}x{P0_shape[-1]}, but "
+                f"the initial state has {n_initial} elements."
+                + (
+                    " On a sequence it covers the first leg only: states "
+                    "added by later legs take their a-priori sigma from "
+                    "extra_apriori_sigmas."
+                    if self.flag_sequence
+                    else ""
+                )
+            )
+
         # Validate and apply settings
         self._apply_settings()
 
         # Track cumulative correction w.r.t. iteration-1 reference
         # frozen "initial" state definition
         self._ref0_state_def = self.trajectory.state_definition
-        # cumulative total in ref0 coordinates
+        # cumulative correction applied to the reference, in ref0 coordinates
         self._delta0_total = np.zeros((self.n, 1), dtype=float)
-        # optional history
+        # optional history of the total after each pass
         self._delta0_hist = []
-        # per-epoch cumulative deviation [n_epochs x n_states] across all iterations
+        # per-epoch deviation [n_epochs x n_states] applied to the reference so far,
+        # and the filter epochs its rows belong to
         self._cumulative_deviation = None
+        self._cumulative_epochs = None
         # solution history
         self._solution_history = []
         self._solution_history_smooth = []
+        # weighted least-squares cost per iteration, as (J, n_residuals)
+        self._cost_hist = []
+        # convergence test of every iteration, parallel to _delta0_hist
+        self._convergence_hist = []
+        # summary of the last convergence test performed by fit()
+        self.convergence_info = None
+
+        # Shared output containers (populated during _compute, read by
+        # SolutionOD). Subclasses add only their own extra containers.
+        self._covariance_history = []
+        self._covariance_consider_history = []
+        self._state_deviation_history = []
+        self._prefit_residuals = {}
+        self._postfit_residuals = {}
+
+        # Process-noise model: configured here when provided and supported,
+        # otherwise rejected for batch estimators that cannot use it.
+        self.process_noise = None
+        if self.settings.process_noise is not None:
+            if self._supports_process_noise:
+                self._initialize_process_noise_from_settings()
+            else:
+                raise NotImplementedError(
+                    f"Process noise is not supported by {type(self).__name__}."
+                )
 
     # endregion Constructor #
     # -----------------------#
@@ -290,28 +512,21 @@ class FilterOD:
 
     def _initialize_nonsequence_attributes(self) -> None:
         """
-        Initialize filter attributes for single-arc (non-sequence) trajectories.
+        Initialize filter attributes for a single-arc (non-sequence) trajectory.
 
-        Infers the state vector dimension ``n`` from the shape of the first stored
-        STM (assumed square), stores the state definition, and detects whether the
-        first STM is actually a Maneuver Transition Matrix (MTM).
+        Notes
+        -----
+        Sets the following attributes:
 
-        An MTM is identified by checking whether the lower-right 3x3 block of
-        ``STM[3:6, -3:]`` equals the identity matrix, which is the signature of
-        an analytically included impulsive delta-V in the state vector.
-
-        Attributes Set
-        --------------
-        n : int
-            Dimension of the estimated state vector.
-        state_vector : list
-            State vector definition copied from ``self.trajectory``.
-        flag_MTM : bool
-            True if the first trajectory STM is a Maneuver Transition Matrix.
-
-        Returns
-        -------
-        None
+        ``n`` : int
+            Dimension of the state vector, from the size of the first stored STM.
+        ``state_vector`` : list
+            State definition of :attr:`trajectory`.
+        ``flag_MTM`` : bool
+            ``True`` when the first stored STM is a Maneuver Transition Matrix
+            (MTM), i.e. a state longer than six whose velocity rows of the last
+            three columns, ``STM[3:6, -3:]``, form the identity: the signature of
+            an impulsive delta-v carried in the state vector.
         """
         self.n = int(np.sqrt(len(self.trajectory._STMs[0])))
         self.state_vector = self.trajectory.state_definition
@@ -328,36 +543,41 @@ class FilterOD:
 
     def _initialize_sequence_attributes(self) -> None:
         """
-        Initialize filter attributes for multi-leg (sequence) trajectories.
+        Initialize filter attributes for a multi-leg (sequence) trajectory.
 
-        Parses the sequence definition to extract per-leg epoch arrays, state
-        sizes, and models.  Separates single-epoch "event" entries (maneuver
-        nodes) from multi-epoch "leg" entries (propagation segments) so the
-        filter can handle covariance mapping across trajectory discontinuities.
+        Single-epoch entries of the sequence definition are events (maneuver
+        nodes) and multi-epoch entries are propagation legs; keeping them apart
+        lets the filter map the covariance across the trajectory's
+        discontinuities.
 
-        Attributes Set
-        --------------
-        sequence_epochs : list of np.ndarray
-            Epoch arrays for every leg, including single-point event epochs.
-        n : int
-            Full state vector dimension (from the propagator).
-        events_epochs : list of float
-            Scalar epoch values for trajectory events (maneuver nodes).
-        legs_n : list of int
-            State dimension for each propagation leg.
-        legs_epochs : list of np.ndarray
-            Epoch arrays for propagation legs only (multi-epoch entries).
-        legs_model : list of StateArray
-            State model objects for each propagation leg.
-        new_sigmas : list
-            Extra apriori sigma values from ``initial_covariance.extra_apriori_sigmas``,
-            used to initialise covariance blocks for newly augmented states.
-        flag_node : bool
-            Set to False; toggled to True by the filter when an event epoch is reached.
+        Notes
+        -----
+        Sets the following attributes:
 
-        Returns
-        -------
-        None
+        ``sequence_epochs`` : list of np.ndarray
+            Epoch array of every sequence entry, events included.
+        ``n`` : int
+            Full state dimension, from the propagator. The filters reassign it
+            to the current leg's width while they run.
+        ``n_global`` : int
+            Full state dimension (the union of all legs), kept fixed while
+            ``n`` changes.
+        ``events_epochs`` : list of float
+            Epoch of each event.
+        ``legs_n`` : list of int
+            State dimension of each propagation leg.
+        ``legs_epochs`` : list of np.ndarray
+            Epoch arrays of the propagation legs only.
+        ``legs_model`` : list of StateArray
+            State model of each propagation leg.
+        ``new_sigmas`` : list of ArrayWUnits
+            The ``initial_covariance.extra_apriori_sigmas`` values, units intact,
+            kept for inspection. The a-priori variances actually placed on the
+            covariance diagonal are built in :meth:`_map_covariance_definition_node`,
+            which converts each sigma to the units of the state element it
+            initialises.
+        ``flag_node`` : bool
+            ``False``; the filter sets it when it reaches an event epoch.
         """
 
         self.sequence_epochs = [
@@ -369,6 +589,9 @@ class FilterOD:
             for epoch in self.trajectory.sequence_definition.epochs_vec
         ]
         self.n = self.propagator.full_state_vector.size
+        # _compute moves self.n to each leg's width in turn. Not n_full:
+        # _init_consider_partition sets that to the current leg's width
+        self.n_global = self.n
         self.events_epochs = [
             sublist[0] for sublist in self.sequence_epochs if len(sublist) == 1
         ]
@@ -384,10 +607,12 @@ class FilterOD:
             for model in self.trajectory._sequence_definition.models
             if isinstance(model, StateArray)
         ]
-        self.new_sigmas = [
-            elem.values
-            for elem in self.initial_covariance.extra_apriori_sigmas.values()
-        ]
+        # Kept as ArrayWUnits: a bare number here invites the same units trap
+        # the covariance seeding had, since these sigmas are only meaningful
+        # against the units of the state element they initialise.
+        self.new_sigmas = list(
+            self.initial_covariance.extra_apriori_sigmas.values()
+        )
         self.flag_node = False
 
     def _apply_settings(self) -> None:
@@ -398,10 +623,12 @@ class FilterOD:
 
         1. ``initial_deviation`` — if provided, calls :meth:`_set_initial_deviation`.
         2. ``process_noise``     — if provided, calls :meth:`_configure_process_noise`
-           which sets ``SNC_flag`` or ``DMC_flag`` and stores noise parameters.
-        3. ``measurement_sigmas`` — if provided, overrides per-dataset sigma values
-           via :meth:`_apply_measurement_overrides`.
-        4. ``covariance_analysis`` — copies the boolean flag onto ``self``.
+           which sets ``SNC_flag`` and/or ``DMC_flag`` and stores noise parameters.
+        3. ``covariance_analysis`` — copies the boolean flag onto ``self``.
+
+        ``measurement_sigmas`` is not among them: :meth:`_initialize` sets it on
+        the models once, at construction, and every later iteration builds its
+        datasets from the models (see :meth:`set_measurement_sigmas`).
 
         Returns
         -------
@@ -414,10 +641,6 @@ class FilterOD:
         # Process noise
         if self.settings.process_noise is not None:
             self._configure_process_noise(self.settings.process_noise)
-
-        # Measurement overrides
-        if self.settings.measurement_sigmas is not None:
-            self._apply_measurement_overrides(self.settings.measurement_sigmas)
 
         # Flags
         self.covariance_analysis = self.settings.covariance_analysis
@@ -435,43 +658,228 @@ class FilterOD:
             )
         self.initial_deviation = x0
 
-    def _configure_process_noise(self, pn: ProcessNoiseSettings) -> None:
-        """Configure process noise model."""
-        self.process_noise_type = pn.type
-        self.process_noise_Q_cont = pn.Q_cont
+    def _configure_process_noise(
+        self, pn: Union[ProcessNoiseSettings, List[ProcessNoiseSettings]]
+    ) -> None:
+        """
+        Configure process noise model, or one per noised body for a list.
 
-        if pn.type == "DMC" and pn.beta is not None:
-            self.process_noise_beta = pn.beta
+        Parameters
+        ----------
+        pn : ProcessNoiseSettings or list of ProcessNoiseSettings
+            Process noise settings, one per noised body for a list.
+
+        Returns
+        -------
+        None
+            Sets ``process_noise_type``, ``process_noise_Q_cont``,
+            ``process_noise_beta`` (single values for a single settings
+            object, lists otherwise) and ``SNC_flag``/``DMC_flag``.
+        """
+        settings = pn if isinstance(pn, list) else [pn]
+        # Single values for a single model, as before; lists otherwise
+        single = len(settings) == 1
+        types = [s.type for s in settings]
+        self.process_noise_type = types[0] if single else types
+        self.process_noise_Q_cont = (
+            settings[0].Q_cont if single else [s.Q_cont for s in settings]
+        )
+
+        if "DMC" in types:
+            self.process_noise_beta = (
+                settings[0].beta if single else [s.beta for s in settings]
+            )
             self.DMC_flag = True
 
-        if pn.type == "SNC":
+        if "SNC" in types:
             self.SNC_flag = True
 
-    def _apply_measurement_overrides(self, overrides: Dict[str, float]) -> None:
-        """Apply measurement sigma overrides by dataset name."""
-        available = {ds.set_name for ds in self.measurement_data.datasets}
-        unknown = set(overrides.keys()) - available
+    def set_measurement_sigmas(
+        self, sigmas: Dict[str, Union[ArrayWUnits, float]]
+    ) -> None:
+        """
+        Set the measurement sigma of datasets by name, through their models.
+
+        Each sigma is set on the model that built the dataset, so
+        ``model.sigma`` reports it and the datasets of every later iteration
+        are built with it, and is written to the dataset's current ``sigma``
+        column as well. The construction applies ``settings.measurement_sigmas``
+        this way; call it between iterations, from a :meth:`fit` callback, to
+        reweight the data.
+
+        Parameters
+        ----------
+        sigmas : dict
+            ``{dataset_name: sigma}``. An ``ArrayWUnits`` sigma is converted to
+            the dataset's units; a bare float is taken to be in them already.
+            One model has one sigma, so the datasets it builds -- the
+            components of a two-component measurement, or the entries of a
+            spec that reuse it -- share it. A component left out keeps its
+            current sigma; any other dataset of that model must be given the
+            same sigma.
+
+        Raises
+        ------
+        UnknownSigmaDatasetError
+            If a name is not one of the filter's datasets.
+        MeasurementSigmaUnitsError
+            If a sigma cannot be converted to its dataset's units.
+        SharedSigmaModelError
+            If the datasets of one model would be given different sigmas.
+
+        Examples
+        --------
+        >>> def reweight(filt, iteration, solution):
+        ...     if iteration == 1:
+        ...         filt.set_measurement_sigmas({"GS1 Range": ArrayWUnits(5.0, m)})
+        >>> solution, n_iters, converged = lkf.fit(callback=reweight)
+        """
+        self._set_model_sigmas(sigmas, self.measurement_data.datasets)
+        self.measurement_data._build_indices()
+
+    def _set_model_sigmas(
+        self, sigmas: Dict[str, Union[ArrayWUnits, float]], datasets: list
+    ) -> None:
+        """
+        Set measurement sigmas on the models that built ``datasets``, and on the
+        datasets' ``sigma`` columns.
+
+        Everything is checked before anything is set, so a refused call leaves
+        the models and the datasets as they were.
+
+        Parameters
+        ----------
+        sigmas : dict
+            ``{dataset_name: sigma}``, as for :meth:`set_measurement_sigmas`.
+        datasets : list of MeasurementDataSet
+            The datasets the models built, matched to them through
+            ``_sigma_sources``, which :meth:`_initialize` records.
+
+        Raises
+        ------
+        UnknownSigmaDatasetError, MeasurementSigmaUnitsError, SharedSigmaModelError
+            As for :meth:`set_measurement_sigmas`.
+        """
+        by_name = {}
+        for ds in datasets:
+            by_name.setdefault(ds.set_name, []).append(ds)
+        unknown = set(sigmas) - set(by_name)
         if unknown:
-            raise ValueError(
-                f"measurement_sigmas contains unknown dataset name(s): {unknown}. "
-                f"Available datasets: {available}."
+            raise self.UnknownSigmaDatasetError(
+                f"measurement_sigmas names unknown dataset(s) {sorted(unknown)}. "
+                f"Available datasets: {sorted(by_name)}."
             )
 
-        for ds in self.measurement_data.datasets:
-            if ds.set_name in overrides:
-                sigma = overrides[ds.set_name]
-                new_sigma = (
-                    float(sigma.values) if hasattr(sigma, "values") else float(sigma)
+        values = {}
+        for name, sigma in sigmas.items():
+            units = by_name[name][0].units
+            # The sigma column is in the dataset's units, so a sigma in other
+            # units (km for a range dataset in m, say) is converted into them,
+            # and one in incompatible units is refused.
+            if getattr(sigma, "units", None) is not None and units is not None:
+                try:
+                    sigma = sigma.convert_to(units)
+                except ValueError as err:
+                    raise self.MeasurementSigmaUnitsError(
+                        f"measurement_sigmas['{name}'] is in {sigma.units}, which "
+                        f"cannot be converted to the dataset's units ({units}): {err}"
+                    ) from err
+            values[name] = float(getattr(sigma, "values", sigma))
+
+        # One sigma per model, one value per dataset it builds in a call. Every
+        # entry of a model that any of these sigmas reaches is checked, since
+        # setting the model changes the datasets of all of them.
+        reached = [m for m, built in self._sigma_sources if set(built) & set(values)]
+        new_sigma = {}
+        for model, built in self._sigma_sources:
+            if not any(model is m for m in reached):
+                continue
+            # A dataset not named keeps the sigma it was built with
+            vector = [
+                values[n]
+                if n in values
+                else float(np.asarray(by_name[n][0].data["sigma"], dtype=float).ravel()[0])
+                for n in built
+            ]
+            units = by_name[built[0]][0].units
+            if any(by_name[n][0].units != units for n in built):
+                units = None
+            if id(model) in new_sigma and new_sigma[id(model)][1] != vector:
+                raise self.SharedSigmaModelError(
+                    f"'{model.name}' builds the datasets "
+                    f"{new_sigma[id(model)][2]} and {built}, which would be given "
+                    f"the sigmas {new_sigma[id(model)][1]} and {vector}. One model "
+                    "has one sigma: give its datasets the same one, or give "
+                    "each its own model."
                 )
-                ds.data["sigma"] = np.full_like(np.array(ds.data["sigma"]), new_sigma)
-        self.measurement_data._build_indices()
+            new_sigma[id(model)] = (model, vector, built, units)
+
+        for model, vector, _, units in new_sigma.values():
+            value = vector[0] if len(vector) == 1 else np.array(vector)
+            model.sigma = ArrayWUnits(value, units) if units is not None else value
+        for name, value in values.items():
+            for ds in by_name[name]:
+                ds.data["sigma"] = np.full_like(
+                    np.asarray(ds.data["sigma"], dtype=float), value
+                )
+
+    def _process_noise_settings(self) -> List[ProcessNoiseSettings]:
+        """
+        The process noise settings, one per noised body.
+
+        Returns
+        -------
+        list of ProcessNoiseSettings
+            ``settings.process_noise`` as a list, empty without process noise.
+        """
+        pn = self.settings.process_noise
+        if pn is None:
+            return []
+        return list(pn) if isinstance(pn, list) else [pn]
+
+    def _process_noise_models(self) -> list:
+        """
+        The process noise models, one per noised body.
+
+        Returns
+        -------
+        list of ProcessNoise
+            :attr:`process_noise` as a list, empty without process noise.
+        """
+        if self.process_noise is None:
+            return []
+        if isinstance(self.process_noise, list):
+            return self.process_noise
+        return [self.process_noise]
+
+    def _process_noise_description(self) -> str:
+        """
+        Process noise types for the filter printout.
+
+        Returns
+        -------
+        str
+            The model type (e.g. ``'SNC'``) for a single model, otherwise each
+            type with the body it drives, e.g. ``'DMC (sc), SNC (ast)'``.
+        """
+        settings = self._process_noise_settings()
+        if len(settings) == 1:
+            return settings[0].type
+        return ", ".join(
+            f"{s.type} ({getattr(model.body, 'name', model.body)})"
+            for s, model in zip(settings, self._process_noise_models())
+        )
 
     def _initialize_process_noise_from_settings(self) -> None:
         """
-        Initialize process noise model from settings.
+        Initialize the process noise models from settings.
 
-        Creates the appropriate process noise object (SNC, DMC, or STOC)
-        based on settings and computes discrete-time covariances.
+        Creates one process noise object (SNC or DMC) per
+        :class:`~scarabaeus.ProcessNoiseSettings`, driving the states of its
+        ``body`` (the primary body of the trajectory when not given), and
+        computes their discrete-time covariances. A single model is kept as
+        is, several as a list, which the filters stack (see
+        :meth:`~scarabaeus.ProcessNoise.combined_gamma_at`).
 
         Returns
         -------
@@ -481,42 +889,144 @@ class FilterOD:
         ------
         ValueError
             If process noise type is not recognized.
+        DuplicateProcessNoiseBodyError
+            If two settings drive the same body.
+        NoiseReferenceUnavailableError
+            If an RTN noise drives a body whose reference trajectory is not
+            available (see :meth:`_reference_position_velocity`).
+        ProcessNoiseBetaMismatchError
+            If a DMC ``beta`` is given and differs from the decay rates of the
+            Gauss-Markov acceleration in the dynamics.
+
+        Warns
+        -----
+        UnnoisedBodyWarning
+            If an estimated, propagated body has no process noise.
         """
-        pn_settings = self.settings.process_noise
+        all_settings = self._process_noise_settings()
 
         # Get state and sequence definitions
         state_def = self.trajectory.state_definition
         seq_def = self.trajectory.sequence_definition
+        primary = (
+            self.trajectory._legs[0]["body"]
+            if self.flag_sequence
+            else self.trajectory.body
+        )
 
-        # Create appropriate process noise object
-        if pn_settings.type == "SNC":
-            self.process_noise = StateNoiseCompensation(
-                continuous_time_covariance=pn_settings.Q_cont,
-                state_definition=state_def,
-                sequence_definition=seq_def,
+        models = []
+        for pn_settings in all_settings:
+            body = pn_settings.body if pn_settings.body is not None else primary
+
+            # Create appropriate process noise object
+            if pn_settings.type == "SNC":
+                model = StateNoiseCompensation(
+                    continuous_time_covariance=pn_settings.Q_cont,
+                    state_definition=state_def,
+                    sequence_definition=seq_def,
+                    max_interval=pn_settings.max_interval,
+                    body=body,
+                )
+
+            elif pn_settings.type == "DMC":
+                model = DynamicalModelCompensation(
+                    continuous_time_covariance=pn_settings.Q_cont,
+                    state_definition=state_def,
+                    sequence_definition=seq_def,
+                    beta=pn_settings.beta,
+                    max_interval=pn_settings.max_interval,
+                    body=body,
+                )
+
+            else:
+                raise ValueError(
+                    f"Unknown process noise type: {pn_settings.type}. "
+                    "Must be 'SNC' or 'DMC'."
+                )
+
+            # The models add up, so a second one on a body would double its noise
+            body_id = getattr(model.body, "spice_id", model.body)
+            if any(getattr(m.body, "spice_id", m.body) == body_id for m in models):
+                raise self.DuplicateProcessNoiseBodyError(
+                    "Two ProcessNoiseSettings drive "
+                    f"{getattr(model.body, 'name', model.body)}: give each body "
+                    "a single one."
+                )
+            models.append(model)
+
+        self.process_noise = models[0] if len(models) == 1 else models
+        self._warn_unnoised_bodies()
+
+        # Compute discrete-time covariances over the filtering timeline
+        self._build_timeline()
+
+        # DMC decays at the rates the dynamics integrate the Gauss-Markov
+        # acceleration with, so a beta given in the settings is only checked
+        for pn_settings, model in zip(all_settings, models):
+            if pn_settings.type != "DMC" or pn_settings.beta is None:
+                continue
+            reference = self._reference_fogm_beta(
+                model._noise_epochs(self.timeline_times), model.body
             )
-
-        elif pn_settings.type == "DMC":
-            self.process_noise = DynamicModelCompensation(
-                continuous_time_covariance=pn_settings.Q_cont,
-                state_definition=state_def,
-                sequence_definition=seq_def,
-                beta=pn_settings.beta,
-            )
-
-        else:
-            raise ValueError(
-                f"Unknown process noise type: {pn_settings.type}. "
-                "Must be 'SNC' or 'DMC'."
-            )
-
-        # Compute discrete-time covariances
-        spacecraft_times = self.measurement_data.get_spacecraft_times()
-        self.process_noise._compute_discrete_time_covariances(spacecraft_times)
+            # A leg without the body has no rate (and no noise)
+            reference = reference[np.all(np.isfinite(reference), axis=1)]
+            if not np.allclose(reference, model.beta, rtol=1e-6, atol=0.0):
+                raise self.ProcessNoiseBetaMismatchError(
+                    f"The DMC beta in ProcessNoiseSettings ({model.beta}) "
+                    "differs from the decay rates of the Gauss-Markov acceleration "
+                    f"in the dynamics ({np.unique(reference, axis=0)}). DMC takes "
+                    "them from the dynamics: omit beta from ProcessNoiseSettings."
+                )
 
         # Set flag
-        self.SNC_flag = pn_settings.type == "SNC"
-        self.DMC_flag = pn_settings.type == "DMC"
+        types = {pn_settings.type for pn_settings in all_settings}
+        self.SNC_flag = "SNC" in types
+        self.DMC_flag = "DMC" in types
+
+    def _warn_unnoised_bodies(self) -> None:
+        """
+        Warn about every estimated, propagated body the process noise does
+        not drive.
+
+        Returns
+        -------
+        None
+
+        Warns
+        -----
+        UnnoisedBodyWarning
+            Once per body with an estimated, dynamic ``position`` and no
+            process noise.
+        """
+        if self.flag_sequence:
+            definitions = [model.state for model in self.legs_model]
+        else:
+            definitions = [self.trajectory.state_definition]
+        noised = {
+            getattr(model.body, "spice_id", model.body)
+            for model in self._process_noise_models()
+        }
+
+        unnoised = {}
+        for definition in definitions:
+            for name, _, est_flag, dyn_flag, owner, _ in definition:
+                owner_id = getattr(owner, "spice_id", owner)
+                if (
+                    name == "position"
+                    and est_flag == "estimated"
+                    and dyn_flag == "dynamic"
+                    and owner_id not in noised
+                ):
+                    unnoised.setdefault(owner_id, owner)
+
+        for owner in unnoised.values():
+            warnings.warn(
+                f"{getattr(owner, 'name', owner)} is estimated and propagated "
+                "but has no process noise. Add a ProcessNoiseSettings with its "
+                "body, unless it is meant to be noise-free.",
+                self.UnnoisedBodyWarning,
+                stacklevel=3,
+            )
 
     def _initialize(
         self,
@@ -525,6 +1035,7 @@ class FilterOD:
         traj_name: Optional[str] = None,
         traj_dir: Optional[str] = None,
         overwrite_traj: bool = True,
+        verbose: bool = True,
     ) -> Tuple[Trajectory, FilterDataManager]:
         """
         Initialize the reference trajectory and measurement data used by the filter.
@@ -557,11 +1068,16 @@ class FilterOD:
             Name of the trajectory BSP file.  If not provided, a unique name is
             generated from the target body name and the current time.
         traj_dir : str, optional
-            Directory where the trajectory BSP file is written.  Defaults to
-            ``./data/kernels/scenario/`` relative to the current working directory.
+            Directory where the trajectory BSP file is written.  Defaults to the
+            directory the filter was built with, else ``./data/kernels/scenario/``
+            relative to the current working directory.
         overwrite_traj : bool, optional
             If ``True``, remove an existing BSP file with the same name before
             writing the new trajectory.
+        verbose : bool, optional
+            Passed to the propagation of a mission sequence or scenario, whose
+            segment-by-segment printout it controls.  A plain propagator has no
+            such printout and ignores it.  Defaults to ``True``.
 
         Returns
         -------
@@ -591,14 +1107,16 @@ class FilterOD:
         """
 
         # Directories
-        traj_dir = traj_dir or (os.getcwd() + "/data/kernels/scenario/")
+        traj_dir = traj_dir or self._traj_dir or (os.getcwd() + "/data/kernels/scenario/")
         os.makedirs(traj_dir, exist_ok=True)
 
         # Propagate trajectory
         if isinstance(propagator, MissionSequence):
-            scenario = propagator.propagate()
+            scenario = propagator.propagate(verbose=verbose)
             self.propagator = scenario  # swap to ScenarioSetup for downstream use
             propagator = scenario
+        elif isinstance(propagator, ScenarioSetup):
+            propagator.propagate(verbose=verbose)
         else:
             propagator.propagate()
 
@@ -617,15 +1135,19 @@ class FilterOD:
         # Build trajectory
         if isinstance(propagator, ScenarioSetup):
             trajectory = Trajectory(traj_name, leg_array=propagator)
-            trajectory.write_to_spk(traj_path)
+            trajectory.write_to_spk(traj_path, **self._trajectory_write_formats())
 
         else:
             trajectory = Trajectory(
                 traj_name, state_array=propagator.propagated_state_array
             )
-            trajectory.write_to_spk(traj_path)
+            trajectory.write_to_spk(traj_path, **self._trajectory_write_formats())
         if hasattr(propagator, "STM") and propagator.STM is not None:
-            trajectory.add_STMs(propagator.STM)
+            # A propagated state array carries one STM per output epoch
+            trajectory.add_STMs(
+                propagator.STM,
+                None if isinstance(propagator, ScenarioSetup) else trajectory.epoch,
+            )
         else:
             raise ValueError("Propagator must have STM for OD.")
 
@@ -636,6 +1158,7 @@ class FilterOD:
             )
 
         datasets = []
+        sigma_sources = []
         for i, meas in enumerate(measurements):
             if "model" not in meas:
                 raise ValueError(
@@ -646,7 +1169,23 @@ class FilterOD:
             observed_meas = meas.get("observed_meas", None)
             dataset_name = meas.get("dataset_name", None)
             epochs = meas.get("epochs", None)
+
+            # Datasets are always regenerated here, even when the spec already
+            # carries one from MeasurementSpec.compute(). Those are computed
+            # against whatever reference the caller chose for inspecting
+            # residuals, typically the true trajectory, whereas the filter needs
+            # them against its own reference, which is perturbed and changes on
+            # every iterate() pass. Reusing them would quietly feed the filter
+            # residuals taken about the wrong trajectory.
+            #
+            # Outlier flags do carry over, because they live on the observations
+            # (ObsData.meas_outliers) and are reseeded into each regenerated
+            # dataset.
             model.update_reference_state(self.propagator.full_state_vector)
+            # The analytical light-time partials map a deviation between the
+            # endpoints of an observable through the reference STMs. Models
+            # that do not read it ignore it.
+            model.set_trajectory(trajectory)
             ds = model.generate_measurement_dataset(
                 dataset_name,
                 target=body_obj,
@@ -654,6 +1193,22 @@ class FilterOD:
                 epochs=epochs,
             )
             datasets.append(ds)
+            # A two-component model (ra/dec, sample/line) builds one dataset per
+            # component, all of them carrying its one sigma
+            built = ds if isinstance(ds, (list, tuple)) else [ds]
+            sigma_sources.append((model, [d.set_name for d in built]))
+        self._sigma_sources = sigma_sources
+
+        # First call: settings.measurement_sigmas go on the models, once, and
+        # before the editing below, which therefore weights the residuals by
+        # them, as every later iteration does
+        first_call = not hasattr(self, "_edited_outlier_flags")
+        if first_call and self.settings.measurement_sigmas is not None:
+            flat = [
+                d for ds in datasets
+                for d in (ds if isinstance(ds, (list, tuple)) else [ds])
+            ]
+            self._set_model_sigmas(self.settings.measurement_sigmas, flat)
 
         # Build FilterDataManager
         fdm = FilterDataManager(
@@ -663,10 +1218,11 @@ class FilterOD:
             editing_kwargs=self.settings.editing_kwargs,
             save_path=self.settings.output.fdm_output_path,
             save_name=self.settings.output.fdm_output_name,
+            save_format=getattr(self.settings.output, "fdm_output_format", "json"),
         )
 
         # First call: initialize from whatever editing produced
-        if not hasattr(self, "_edited_outlier_flags"):
+        if first_call:
             self._edited_outlier_flags = {
                 ds.set_name: np.array(ds.data["outlier_flag"], dtype=bool).copy()
                 for ds in fdm.datasets
@@ -691,8 +1247,11 @@ class FilterOD:
         overwrite_traj: bool = True,
         max_iterations: int = 10,
         convergence_threshold: float = 1e-6,
+        convergence_threshold_cost: float = 1e-3,
+        convergence_criterion: str = "any",
         verbose: bool = True,
         if_sequential_smooth: bool = False,
+        callback: Optional[Callable] = None,
     ):
         """
         Perform iterative orbit determination with automatic convergence checking.
@@ -700,23 +1259,67 @@ class FilterOD:
         Runs the filter iteratively, applying state corrections from each solution
         to the next iteration until convergence or maximum iterations is reached.
 
+        Two convergence tests are evaluated at every iteration:
+
+        * **State deviation** — RMS of the estimated deviation mapped back to the
+          epoch, compared against ``convergence_threshold``.  This is the strict
+          test: it declares convergence only when the reference trajectory stops
+          moving.
+        * **Cost function** — relative change of the normalised weighted
+          least-squares cost :math:`J/n = \\sum_i (r_i/\\sigma_i)^2 / n` between
+          consecutive iterations, compared against ``convergence_threshold_cost``.
+          When the problem is weakly observable the deviation keeps wandering
+          along the unobservable directions while the measurement fit no longer
+          improves; the run has converged as far as the data can tell, and only
+          this test detects it.
+
+        ``convergence_criterion`` selects how the two are combined.  The cost is
+        normalised by the number of residuals so that measurement editing (which
+        changes that number between iterations) is not mistaken for a cost change.
+
         Parameters
         ----------
         traj_name : str, optional
             Base name for trajectory files. Iteration number will be appended.
-            If None, auto-generates names. Defaults to None.
+            If None, the name the filter was built with is the base.
+            Defaults to None.
         traj_dir : str, optional
-            Directory for trajectory files. Defaults to None (current directory).
+            Directory for trajectory files. If None, the directory the filter
+            was built with. Defaults to None.
         overwrite_traj : bool, optional
             Whether to overwrite existing trajectories. Defaults to True.
         max_iterations : int, optional
             Maximum number of iterations. Defaults to 10.
         convergence_threshold : float, optional
             RMS deviation threshold for convergence. Defaults to 1e-6.
+        convergence_threshold_cost : float, optional
+            Threshold on the *relative* change of the normalised weighted cost
+            :math:`|\\Delta (J/n)| / (J/n)` between consecutive iterations.
+            Defaults to 1e-3.
+        convergence_criterion : str, optional
+            How the two tests are combined:
+
+            * ``'any'`` — converged as soon as either test passes (default).
+            * ``'deviation'`` — RMS deviation only (pre-cost-test behaviour).
+            * ``'cost'`` — cost-function stagnation only; the criterion of
+              choice for weakly observable problems.
+            * ``'both'`` — both tests must pass.
         verbose : bool, optional
             If True, prints iteration progress. Defaults to True.
         if_sequential_smooth : bool, optional
             If True, applies sequential smoothing after filtering. Defaults to False.
+        callback : callable, optional
+            Called as ``callback(filter, iteration, solution)`` after every
+            iteration, once its convergence test is done (its outcome is the
+            last entry of ``_convergence_hist``) and before the filter is
+            reinitialized for the next one. Its return value is ignored. It is
+            the place to reweight or edit the data between iterations: a sigma
+            set on a model (:meth:`set_measurement_sigmas`, or
+            ``model.sigma = ...``) or an outlier flagged through
+            ``MeasurementSpec.flag`` takes effect when the datasets are rebuilt
+            for the next iteration, so one made after the last iteration does
+            nothing within this call. Other settings are not guaranteed to be
+            picked up mid-run. Defaults to None.
 
         Returns
         -------
@@ -727,16 +1330,58 @@ class FilterOD:
         converged : bool
             Whether convergence was achieved.
 
+        Raises
+        ------
+        ConvergenceCriterionError
+            If ``convergence_criterion`` is not one of the accepted values.
+        NotImplementedError
+            If ``if_sequential_smooth=True`` on a batch filter (LSB, SRIFB).
+
+        Notes
+        -----
+        The cost is always evaluated on the *filter* post-fit residuals, also
+        when ``if_sequential_smooth=True``, so the iterations are compared on a
+        like-for-like basis.  Its per-iteration history is available as
+        :attr:`cost_history`, and the outcome of the last convergence test as
+        ``convergence_info``. Every iteration's test is kept in
+        ``_convergence_hist``, which :meth:`SolutionOD.save` writes to each
+        ``iter_<k>`` block.
+
+        Reweighting the data from ``callback`` changes the scale of the cost, so
+        the cost test of the next iteration compares two differently weighted
+        costs; prefer ``convergence_criterion='deviation'`` across a change of
+        sigmas.
+
         Examples
         --------
         >>> # Automatic iteration with convergence checking
         >>> lkf = LKF(propagator, covariance, measurements)
-        >>> solution, n_iters, converged = lkf.iterate(
+        >>> solution, n_iters, converged = lkf.fit(
         ...     max_iterations=5,
         ...     convergence_threshold=1e-6
         ... )
         >>> print(f"Converged in {n_iters} iterations: {converged}")
+
+        >>> # Weakly observable problem: stop when the fit stops improving
+        >>> solution, n_iters, converged = lkf.fit(
+        ...     max_iterations=10,
+        ...     convergence_threshold_cost=1e-3,
+        ...     convergence_criterion="cost",
+        ... )
+
+        >>> # Loosen the range sigma after the first iteration
+        >>> def reweight(filt, iteration, solution):
+        ...     if iteration == 1:
+        ...         filt.set_measurement_sigmas({"GS1 Range": ArrayWUnits(5.0, m)})
+        >>> solution, n_iters, converged = lkf.fit(callback=reweight)
         """
+
+        criterion = str(convergence_criterion).lower()
+        if criterion not in ("any", "deviation", "cost", "both"):
+            raise self.ConvergenceCriterionError(
+                f"Unknown convergence_criterion '{convergence_criterion}'. "
+                "Choose 'any', 'deviation', 'cost', or 'both'."
+            )
 
         if if_sequential_smooth and type(self).__name__ in ("LSB", "SRIFB"):
             raise NotImplementedError(
@@ -756,14 +1401,26 @@ class FilterOD:
             print("=" * 80)
             print(f"Max iterations: {max_iterations}")
             if not self.covariance_analysis:
-                print(f"Convergence threshold: {convergence_threshold:.2e}")
+                print(f"Convergence criterion: {criterion}")
+                print(f"  RMS deviation threshold:  {convergence_threshold:.2e}")
+                print(f"  Relative cost threshold:  {convergence_threshold_cost:.2e}")
             else:
                 print("Mode: covariance analysis (prediction-only)")
             print("=" * 80 + "\n")
 
+        if traj_name is None:
+            traj_name = self._traj_name
+
         converged = False
         solution = None
         rms_deviation = 0.0
+        cost = float("nan")
+        cost_normalized = float("nan")
+        cost_normalized_prev = float("nan")
+        cost_change = float("inf")
+        n_residuals = 0
+        converged_deviation = False
+        converged_cost = False
 
         for iteration in range(1, max_iterations + 1):
             if verbose:
@@ -774,6 +1431,12 @@ class FilterOD:
             # Compute filter solution
             solution = self._compute(printOutput=verbose)
             self._solution_history.append(solution)
+
+            # Cost of this pass, from the filter post-fit residuals (i.e. before
+            # any smoothing, so that all iterations are comparable)
+            if not self.covariance_analysis:
+                cost, n_residuals = self._cost_function()
+                self._cost_hist.append((cost, n_residuals))
 
             # Apply sequential smoothing if requested
             if if_sequential_smooth and (not self.covariance_analysis):
@@ -788,42 +1451,106 @@ class FilterOD:
                     print(f"\n{'='*60}")
                     print("✓ DONE (covariance analysis: single pass)")
                     print(f"{'='*60}\n")
+                if callback is not None:
+                    callback(self, iteration, solution)
                 break
 
             # Get state deviation from solution
-            deviation = solution.map_state_deviation_to_epoch()
             if self.flag_sequence:
-                # NOTE: In any case, you assume that the nodes are continuous, even if
-                # they are not explicitly mapped back with the proper flag, so it is acceptable to discard
-                # redundant position estimates, for example.
+                # NOTE: A state shared by several legs is taken from the first leg
+                # carrying it. That is consistent only if every leg holds the same
+                # solution. Batch filters map the last leg's solution back through
+                # the nodes themselves; for sequential filters, whose legs hold the
+                # solution of the data up to that leg only, the final estimate is
+                # mapped back here. Per-leg solutions would mix e.g. the initial
+                # state of the first arc with burn parameters fitted together with
+                # a different, discarded state.
+                deviation = solution.map_state_deviation_to_epoch(
+                    map_back_sequence=not self._maps_back_sequence
+                )
                 deviation = self.propagator._deviation_history_to_global_dx(deviation)
+            else:
+                deviation = solution.map_state_deviation_to_epoch()
 
-            # Accumulate total deviation w.r.t. first reference
-            self._delta0_total = self._delta0_total + deviation
-            self._delta0_hist.append(self._delta0_total.copy())
-
-            # Accumulate per-epoch deviation wrt first reference
-            if solution.deviation_est is not None:
-                if self._cumulative_deviation is None:
-                    self._cumulative_deviation = solution.deviation_est.copy()
-                else:
-                    self._cumulative_deviation = (
-                        self._cumulative_deviation + solution.deviation_est
-                    )
+            # Total deviation w.r.t. first reference after this pass. Filters return
+            # either (n,) or (n, 1); a flat one would broadcast the total to (n, n).
+            deviation = np.asarray(deviation, dtype=float).reshape(-1, 1)
+            self._delta0_hist.append(self._delta0_total + deviation)
 
             # Check convergence
             rms_deviation = np.sqrt(np.mean(deviation**2))
 
+            # Relative change of the normalized cost. Normalizing by the number
+            # of residuals keeps the test meaningful when measurement editing
+            # changes how many measurements are processed between iterations.
+            cost_normalized = cost / n_residuals if n_residuals > 0 else float("nan")
+            cost_change = float("inf")
+            if np.isfinite(cost_normalized) and np.isfinite(cost_normalized_prev):
+                cost_change = abs(cost_normalized - cost_normalized_prev) / max(
+                    abs(cost_normalized_prev), 1e-300
+                )
+
+            converged_deviation = bool(rms_deviation < convergence_threshold)
+            converged_cost = bool(cost_change < convergence_threshold_cost)
+
+            if criterion == "deviation":
+                converged = converged_deviation
+            elif criterion == "cost":
+                converged = converged_cost
+            elif criterion == "both":
+                converged = converged_deviation and converged_cost
+            else:  # "any"
+                converged = converged_deviation or converged_cost
+
+            self._convergence_hist.append(
+                {
+                    "iteration": iteration,
+                    "rms_deviation": float(rms_deviation),
+                    "cost": float(cost),
+                    "n_residuals": int(n_residuals),
+                    "cost_normalized": float(cost_normalized),
+                    # no previous cost on the first pass: null, not Infinity
+                    "cost_relative_change": (
+                        float(cost_change) if np.isfinite(cost_change) else None
+                    ),
+                    "converged_deviation": converged_deviation,
+                    "converged_cost": converged_cost,
+                    "converged": bool(converged),
+                }
+            )
+
             if verbose:
                 print(f"RMS State Deviation: {rms_deviation:.6e}")
+                if n_residuals > 0:
+                    print(
+                        f"Cost function J = Σ(r/σ)²: {cost:.6e} "
+                        f"(n = {n_residuals}, J/n = {cost_normalized:.6e})"
+                    )
+                    if np.isfinite(cost_change):
+                        print(f"Relative cost change: {cost_change:.6e}")
+                else:
+                    print(
+                        "Cost function: unavailable (no weighted residuals) "
+                        "-> cost criterion inactive"
+                    )
 
-            if rms_deviation < convergence_threshold:
-                converged = True
+            if callback is not None:
+                callback(self, iteration, solution)
+
+            if converged:
                 if verbose:
+                    triggers = []
+                    if converged_deviation:
+                        triggers.append("RMS deviation")
+                    if converged_cost:
+                        triggers.append("cost function")
                     print(f"\n{'='*60}")
                     print(f"✓ CONVERGED after {iteration} iteration(s)!")
+                    print(f"  Triggered by: {' and '.join(triggers)}")
                     print(f"{'='*60}\n")
                 break
+
+            cost_normalized_prev = cost_normalized
 
             # Reinitialize for next iteration (if not last iteration)
             if iteration < max_iterations:
@@ -843,12 +1570,42 @@ class FilterOD:
                     traj_name=next_traj_name,
                     traj_dir=traj_dir,
                     overwrite_traj=overwrite_traj,
+                    verbose=verbose,
                 )
+
+                # Only a correction applied to the reference is accumulated: the
+                # a priori of later passes, and the cumulative deviation their
+                # solutions report on top of their own, are relative to it. The
+                # last pass's correction is never applied, so a later fit() call
+                # resumes from the same reference without counting it twice.
+                self._delta0_total = self._delta0_total + deviation
+                if solution.deviation_est is not None:
+                    self._cumulative_deviation = solution.deviation_cumulative.copy()
+                    self._cumulative_epochs = np.asarray(
+                        getattr(self, "timeline_times", []), dtype=float
+                    )
+
+        if not self.covariance_analysis:
+            self.convergence_info = {
+                "criterion": criterion,
+                "iterations": iteration,
+                "converged": converged,
+                "rms_deviation": rms_deviation,
+                "rms_deviation_threshold": convergence_threshold,
+                "converged_deviation": converged_deviation,
+                "cost": cost,
+                "cost_normalized": cost_normalized,
+                "cost_relative_change": cost_change,
+                "cost_relative_change_threshold": convergence_threshold_cost,
+                "converged_cost": converged_cost,
+                "n_residuals": n_residuals,
+            }
 
         if (not self.covariance_analysis) and (not converged) and verbose:
             print(f"\n{'='*60}")
             print(f"!! Did NOT converge after {max_iterations} iterations")
-            print(f"  Final RMS deviation: {rms_deviation:.6e}")
+            print(f"  Final RMS deviation:        {rms_deviation:.6e}")
+            print(f"  Final relative cost change: {cost_change:.6e}")
             print(f"{'='*60}\n")
 
         # Automatically save final solution if requested through OutputSettings
@@ -859,6 +1616,98 @@ class FilterOD:
 
         return solution, iteration, converged
 
+    @staticmethod
+    def _accumulate_deviation(
+        cumulative: Optional[np.ndarray],
+        cumulative_epochs: Optional[np.ndarray],
+        deviation: np.ndarray,
+        epochs: np.ndarray,
+        max_epoch_shift: float = 1.0,
+    ) -> np.ndarray:
+        """
+        Add one iteration's per-epoch deviation to the running total, row by epoch.
+
+        The filter epochs are not fixed across iterations: they are spacecraft
+        times ``t2``, which move with the reference trajectory, and the set of
+        epochs can change (data edited in one iteration but not the next,
+        measurements that share an epoch in one iteration and not the next). Rows
+        are therefore paired by epoch rather than by position. A row of
+        ``deviation`` is paired with the row of ``cumulative`` whose epoch is its
+        nearest neighbour, when that pairing is mutual and the epochs are within
+        ``max_epoch_shift`` seconds. A row with no partner has no cumulative
+        value: it is set to NaN and a warning names how many rows that affects.
+
+        Parameters
+        ----------
+        cumulative : np.ndarray or None
+            Running total from the previous iterations [n_prev x n_states], or
+            None on the first iteration.
+        cumulative_epochs : np.ndarray or None
+            Epochs of the rows of ``cumulative``.
+        deviation : np.ndarray
+            This iteration's deviation [n x n_states].
+        epochs : np.ndarray
+            Epochs of the rows of ``deviation``.
+        max_epoch_shift : float, optional
+            Largest epoch difference [s] accepted when pairing rows.
+
+        Returns
+        -------
+        np.ndarray
+            Running total over this iteration's epochs [n x n_states].
+        """
+        deviation = np.asarray(deviation, dtype=float)
+        if cumulative is None:
+            return deviation.copy()
+        cumulative = np.asarray(cumulative, dtype=float)
+
+        n_new = deviation.shape[0]
+        have_epochs = (
+            cumulative_epochs is not None
+            and len(cumulative_epochs) == cumulative.shape[0]
+            and len(epochs) == n_new
+            and n_new > 0
+            and cumulative.shape[0] > 0
+        )
+        if not have_epochs or cumulative.shape[1:] != deviation.shape[1:]:
+            if cumulative.shape == deviation.shape:
+                return cumulative + deviation
+            warnings.warn(
+                f"Cumulative deviation dropped: the previous iteration's "
+                f"{cumulative.shape} cannot be matched to this iteration's "
+                f"{deviation.shape}. deviation_cumulative is NaN.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+            return np.full_like(deviation, np.nan)
+
+        prev = np.asarray(cumulative_epochs, dtype=float)
+        new = np.asarray(epochs, dtype=float)
+
+        def nearest(src, ref):
+            """Index into sorted ``ref`` of the nearest neighbour of each ``src``."""
+            if len(ref) == 1:
+                return np.zeros(len(src), dtype=int)
+            j = np.clip(np.searchsorted(ref, src), 1, len(ref) - 1)
+            left = j - 1
+            return np.where(np.abs(src - ref[left]) <= np.abs(src - ref[j]), left, j)
+
+        j = nearest(new, prev)  # new row -> previous row
+        back = nearest(prev, new)  # previous row -> new row
+        paired = (back[j] == np.arange(n_new)) & (np.abs(new - prev[j]) <= max_epoch_shift)
+
+        out = np.full_like(deviation, np.nan)
+        out[paired] = cumulative[j[paired]] + deviation[paired]
+        n_unpaired = int(n_new - paired.sum())
+        if n_unpaired:
+            warnings.warn(
+                f"{n_unpaired} of {n_new} filter epochs have no counterpart in the "
+                f"previous iteration; their deviation_cumulative rows are NaN.",
+                RuntimeWarning,
+                stacklevel=3,
+            )
+        return out
+
     def _reinitialize(
         self,
         state_deviation: Optional[np.ndarray] = None,
@@ -866,6 +1715,7 @@ class FilterOD:
         traj_name: Optional[str] = None,
         traj_dir: Optional[str] = None,
         overwrite_traj: bool = True,
+        verbose: bool = True,
     ) -> None:
         """
         Reinitialize the filter for iterative estimation.
@@ -890,11 +1740,14 @@ class FilterOD:
             Name for the new trajectory BSP file. If None, auto-generates a name.
             Defaults to None.
         traj_dir : str, optional
-            Directory to write the new trajectory. If None, uses current directory.
-            Defaults to None.
+            Directory to write the new trajectory. If None, the directory the
+            filter was built with. Defaults to None.
         overwrite_traj : bool, optional
             If True, overwrites existing trajectory file with the same name.
             Defaults to True.
+        verbose : bool, optional
+            If True, the re-propagation of a mission sequence prints its
+            segment-by-segment progress. Defaults to True.
 
         Returns
         -------
@@ -905,6 +1758,12 @@ class FilterOD:
         ------
         ValueError
             If state_deviation is provided but state_vector cannot be determined.
+
+        See Also
+        --------
+        fit : Automatic iterative estimation with convergence checking.
+        _apply_state_deviation : Applies deviation to state vector components.
+        _initialize : Builds trajectory and measurement datasets.
 
         Notes
         -----
@@ -919,27 +1778,17 @@ class FilterOD:
 
         Examples
         --------
-        >>> # Manual iteration control
-        >>> lkf = LKF(propagator, covariance, measurements)
-        >>>
-        >>> # Iteration 1
-        >>> solution_it1 = lkf._compute()
-        >>> deviation_it1 = solution_it1.map_state_deviation_to_epoch()
-        >>>
-        >>> # Iteration 2
-        >>> lkf._reinitialize(state_deviation=deviation_it1)
-        >>> solution_it2 = lkf._compute()
-        >>>
-        >>> # Iteration 3
-        >>> deviation_it2 = solution_it2.map_state_deviation_to_epoch()
-        >>> lkf._reinitialize(state_deviation=deviation_it2)
-        >>> solution_it3 = lkf._compute()
+        Work between iterations goes in a :meth:`fit` callback, which runs
+        before this method rebuilds the data, rather than in calls to this
+        method and ``_compute``:
 
-        See Also
-        --------
-        iterate : Automatic iterative estimation with convergence checking.
-        _apply_state_deviation : Applies deviation to state vector components.
-        _initialize : Builds trajectory and measurement datasets.
+        >>> lkf = LKF(propagator, covariance, measurements)
+        >>> def between_iterations(filt, iteration, solution):
+        ...     if iteration == 1:
+        ...         filt.set_measurement_sigmas({"GS1 Range": ArrayWUnits(5.0, m)})
+        >>> solution, n_iters, converged = lkf.fit(
+        ...     max_iterations=3, callback=between_iterations
+        ... )
         """
         if self.flag_sequence:
             # Reinitialize the propagator with updated state
@@ -974,6 +1823,7 @@ class FilterOD:
             traj_name=traj_name,
             traj_dir=traj_dir,
             overwrite_traj=overwrite_traj,
+            verbose=verbose,
         )
 
         # Re-check sequence definition (may have changed)
@@ -988,6 +1838,35 @@ class FilterOD:
         # Re-generate consider parameter partition (if applicable)
         self._init_consider_partition()
         self._apply_settings()
+
+    def _trajectory_write_formats(self) -> dict:
+        """
+        On-disk formats for the sidecars written beside a trajectory SPK.
+
+        The STM history is the largest artifact an OD run produces — one matrix
+        per output epoch, growing with the square of the state size — so a
+        finely sampled arc or an extra solve-for parameter can push it into
+        hundreds of megabytes of JSON. ``OutputSettings.trajectory_output_format``
+        selects the compact binary form instead; note that
+        ``fdm_output_format`` is a different setting covering the measurement
+        records, not these.
+
+        Returns
+        -------
+        dict
+            Keyword arguments for :meth:`~scarabaeus.Trajectory.write_to_spk`.
+        """
+        output = getattr(self, "settings", None) and self.settings.output
+        fmt = getattr(output, "trajectory_output_format", "json")
+        return {
+            "stm_format": fmt,
+            "sidecar_format": fmt,
+            # The filter serves its own STM lookups from the in-memory history,
+            # so the sidecar it writes here is for whoever reads the trajectory
+            # back later. A run that never does can skip the largest artifact
+            # an OD produces.
+            "write_stms": bool(getattr(output, "save_trajectory_stms", True)),
+        }
 
     def _apply_state_deviation(
         self,
@@ -1059,7 +1938,7 @@ class FilterOD:
         )
 
     def _unwrap_residuals(
-        self, postfit_residuals: list, dataset_names: list[str]
+        self, postfit_residuals: list, dataset_names: list[str], epoch_attr: str = None
     ) -> dict:
         """
         Organizes postfit residuals into a dictionary categorized by dataset.
@@ -1070,6 +1949,12 @@ class FilterOD:
             List of residuals and associated metadata.
         dataset_names : list
             List of dataset names corresponding to different measurements.
+        epoch_attr : str, optional
+            When given, the matching reception epoch (``t2``, TDB seconds) of every
+            residual entry is collected into a parallel ``{dataset: [t2, ...]}``
+            dict and stored on ``self`` under this attribute name (e.g.
+            ``"prefit_epochs"``). The residual entries themselves are left as
+            ``[residual, sigma]`` so existing consumers are unaffected.
 
         Returns
         -------
@@ -1078,296 +1963,678 @@ class FilterOD:
         """
         # Initialize dictionary with empty lists for each dataset
         unwrapped = {name: [] for name in dataset_names}
+        epochs = {name: [] for name in dataset_names}
 
         # Loop through epochs
         for epoch_residuals in postfit_residuals:
-            residuals, sigmas, _, _, sets, _ = epoch_residuals
+            residuals, sigmas, _, _, sets, t2_all = epoch_residuals
+
+            # ``t2_all`` is per-measurement, aligned with ``sets``/``sigmas``.
+            t2_arr = np.atleast_1d(np.asarray(t2_all, dtype=float)).ravel()
 
             # Assign residuals to their corresponding dataset
-            for res, sigma, dataset in zip(residuals.flatten(), sigmas, sets):
+            for i, (res, sigma, dataset) in enumerate(
+                zip(residuals.flatten(), sigmas, sets)
+            ):
                 if dataset in unwrapped:
                     unwrapped[dataset].append([res, sigma])
+                    epochs[dataset].append(
+                        float(t2_arr[i]) if i < t2_arr.size else float(t2_arr[-1])
+                    )
+
+        if epoch_attr is not None:
+            setattr(self, epoch_attr, epochs)
 
         return unwrapped
+
+    def _cost_function(self, residuals: Optional[dict] = None) -> Tuple[float, int]:
+        """
+        Weighted least-squares cost of the measurement residuals.
+
+        Evaluates the measurement part of the cost minimised by every filter of
+        this framework (see the class docstring),
+
+        .. math::
+
+            J = \\sum_i \\left(\\frac{r_i}{\\sigma_i}\\right)^2 ,
+
+        summed over every residual of the current pass.  The a-priori term
+        :math:`\\Delta x_0^T P_0^{-1} \\Delta x_0` is deliberately excluded: it is
+        the measurement fit that keeps changing (or stops changing) between
+        iterations, and the prior term is not comparable across the legs of a
+        mission sequence, where the state definition changes.
+
+        Residuals with a non-positive or non-finite sigma are skipped, so that
+        edited/unusable measurements do not contaminate the cost.
+
+        Parameters
+        ----------
+        residuals : dict, optional
+            ``{dataset: [[residual, sigma], ...]}`` mapping, as produced by
+            :meth:`_unwrap_residuals`. Defaults to :attr:`postfit_residuals`.
+
+        Returns
+        -------
+        cost : float
+            Weighted sum of squares. ``nan`` when no usable residual is found
+            (e.g. covariance analysis, or a custom filter that records none).
+        n_residuals : int
+            Number of residuals contributing to ``cost``.
+        """
+        if residuals is None:
+            residuals = self.postfit_residuals
+
+        if not isinstance(residuals, dict) or len(residuals) == 0:
+            return float("nan"), 0
+
+        cost = 0.0
+        n_residuals = 0
+        for entries in residuals.values():
+            if len(entries) == 0:
+                continue
+            arr = np.atleast_2d(np.asarray(entries, dtype=float))
+            res, sigma = arr[:, 0], arr[:, 1]
+            valid = np.isfinite(res) & np.isfinite(sigma) & (sigma > 0.0)
+            cost += float(np.sum((res[valid] / sigma[valid]) ** 2))
+            n_residuals += int(np.count_nonzero(valid))
+
+        if n_residuals == 0:
+            return float("nan"), 0
+
+        return cost, n_residuals
 
     def _map_covariance_definition_node(
         self, counter_events: int, old_covariance: np.ndarray, flag_forward: bool = True
     ) -> np.ndarray:
         """
-        Adjusts the covariance matrix to match a new state vector definition.
+        Adjust the covariance to a new leg's state definition via the reorder
+        operator ``Q`` (``P' = Q P Q^T``). Newly augmented states receive their
+        a-priori variance on the diagonal (uncorrelated, ``P_yz = 0``).
 
         Parameters
         ----------
         counter_events : int
-            Index of the current sequence event for state transition.
-
+            Index of the current sequence event.
         old_covariance : numpy.ndarray
-            Previous covariance matrix to be updated.
-
+            Covariance in the previous state definition.
         flag_forward : bool, optional
-            If ``True``, it maps from the previous state definition to the new one (augmentation);
+            ``True`` maps previous -> new (augmentation); ``False`` reduces.
             Defaults to ``True``.
 
         Returns
         -------
-        updated_covar : numpy.ndarray
-            Updated covariance matrix reflecting the new state definition.
+        numpy.ndarray
+            Covariance in the new state definition.
         """
-        # Get state definitions
-        if flag_forward:
-            new_list = self.legs_model[counter_events].state_definition
-            old_list = self.legs_model[counter_events - 1].state_definition
-        else:
-            new_list = self.legs_model[counter_events - 1].state_definition
-            old_list = self.legs_model[counter_events].state_definition
+        old_model, new_model = self._node_state_models(counter_events, flag_forward)
+        Q, _new_n, new_blocks = Utils.build_reorder_operator(
+            old_model.state_definition, new_model.state_definition
+        )
 
-        # Define new state size and covariance matrix
-        new_state_size = sum(element[1] for element in new_list)
-        new_covariance = np.zeros((new_state_size, new_state_size))
+        block_units = self._state_block_units(new_model)
+        new_block_variances = []
+        for name, start, size in new_blocks:
+            sig = self._apriori_sigma_values(name, size, block_units.get(start))
+            new_block_variances.append((start, sig ** 2))
 
-        # Create state mappings and compute offsets
-        old_state_mapping = self._create_state_mapping(old_list)
-        new_state_mapping = self._create_state_mapping(new_list)
-        old_offsets = self._compute_offsets(old_state_mapping)
-        new_offsets = self._compute_offsets(new_state_mapping)
+        return Utils.reorder_covariance(Q, old_covariance, new_block_variances)
 
-        # Fill in the new covariance matrix
-        for new_id, (_, new_size) in new_state_mapping.items():
-            if new_id in old_state_mapping:
-                old_offset = old_offsets[new_id]
-                new_offset = new_offsets[new_id]
+    def _apriori_sigma_values(self, name: str, size: int, target_units):
+        """
+        Return the a-priori sigma of a newly augmented state block, expressed in
+        the units of the state element it initialises.
 
-                new_covariance[
-                    new_offset : new_offset + new_size,
-                    new_offset : new_offset + new_size,
-                ] = old_covariance[
-                    old_offset : old_offset + new_size,
-                    old_offset : old_offset + new_size,
-                ]
+        The values supplied through ``extra_apriori_sigmas`` carry their own
+        units, which need not match the ones the state element was declared
+        with (e.g. a pointing bias declared in radians given a sigma in
+        degrees). The covariance is built in the state's own units, so the
+        supplied sigma is converted before it is squared onto the diagonal.
 
-                for other_new_id, (_, other_new_size) in new_state_mapping.items():
-                    if other_new_id in old_state_mapping and new_id != other_new_id:
-                        other_old_offset = old_offsets[other_new_id]
-                        other_new_offset = new_offsets[other_new_id]
+        Parameters
+        ----------
+        name : str
+            Name of the newly augmented state element.
+        size : int
+            Number of scalars in the block.
+        target_units : Units or None
+            Units of the state element. ``None`` when the element's units could
+            not be resolved, in which case the supplied values are used as-is.
 
-                        new_covariance[
-                            new_offset : new_offset + new_size,
-                            other_new_offset : other_new_offset + other_new_size,
-                        ] = old_covariance[
-                            old_offset : old_offset + new_size,
-                            other_old_offset : other_old_offset + other_new_size,
-                        ]
-                        new_covariance[
-                            other_new_offset : other_new_offset + other_new_size,
-                            new_offset : new_offset + new_size,
-                        ] = old_covariance[
-                            other_old_offset : other_old_offset + other_new_size,
-                            old_offset : old_offset + new_size,
-                        ]
-            else:
-                new_offset = new_offsets[new_id]
-                for i in range(new_size):
-                    if new_id not in self.initial_covariance.extra_apriori_sigmas:
-                        raise ValueError(
-                            f"No sigma provided for new state element '{new_id}'."
-                        )
-                    new_covariance[new_offset + i, new_offset + i] = (
-                        float(
-                            self.initial_covariance.extra_apriori_sigmas[
-                                new_id
-                            ].values.ravel()[i]
-                        )
-                        ** 2
-                    )
+        Returns
+        -------
+        numpy.ndarray
+            Sigma values in ``target_units``, truncated to ``size`` entries.
 
-        return new_covariance
+        Raises
+        ------
+        MissingAprioriSigmaError
+            If no ``extra_apriori_sigmas`` entry exists for ``name``.
+        AprioriSigmaUnitsError
+            If the supplied sigma cannot be converted to ``target_units``.
+        """
+        sigmas = self.initial_covariance.extra_apriori_sigmas
+        if name not in sigmas:
+            raise self.MissingAprioriSigmaError(
+                f"No sigma provided for new state element '{name}'."
+            )
+
+        sigma = sigmas[name]
+        if isinstance(target_units, Units):
+            try:
+                sigma = sigma.convert_to(target_units)
+            except (ValueError, TypeError) as exc:
+                raise self.AprioriSigmaUnitsError(
+                    f"A-priori sigma for '{name}' is given in "
+                    f"'{sigma.units}', which cannot be converted to the units "
+                    f"the state element is defined in ('{target_units}')."
+                ) from exc
+
+        return np.asarray(sigma.values).ravel()[:size]
+
+    @staticmethod
+    def _state_block_units(state_model) -> dict:
+        """
+        Map each state block's scalar offset to the units of its values.
+
+        The offsets match the ones produced by
+        :meth:`~scarabaeus.Utils.build_reorder_operator`, so a block reported as
+        newly augmented can be paired with the units it is defined in.
+        ``state_definition`` drops the values (and with them the units), which
+        is why the full ``state`` entries are walked here.
+
+        Parameters
+        ----------
+        state_model : StateArray
+            Leg state model to inspect.
+
+        Returns
+        -------
+        dict
+            ``{start_offset: Units or None}``; ``None`` for blocks whose units
+            are not a single homogeneous ``Units`` object.
+        """
+        units_by_start = {}
+        cursor = 0
+        for entry in state_model.state:
+            size = int(entry[1])
+            quantity = getattr(entry[5], "quantity", None) if len(entry) > 5 else None
+            units = getattr(quantity, "units", None)
+            units_by_start[cursor] = units if isinstance(units, Units) else None
+            cursor += size
+        return units_by_start
 
     def _map_deviation_definition_node(
         self, counter_events: int, old_deviation: np.ndarray, flag_forward: bool = True
     ) -> np.ndarray:
         """
-        Adjusts the deviation vector to align with a new state vector definition.
+        Adjust the state deviation to a new leg's definition via ``X' = Q X``.
+        Newly augmented states start at their a-priori mean, see
+        :meth:`_apriori_deviation`.
 
         Parameters
         ----------
         counter_events : int
-            Index of the current sequence event for state transition.
-
+            Index of the current sequence event.
         old_deviation : numpy.ndarray
-            Previous state deviation vector.
-
+            Deviation in the previous state definition.
         flag_forward : bool, optional
-            If ``True``, it maps from the previous state definition to the new one (augmentation);
-            Defaults to ``True``.
+            ``True`` maps previous -> new (augmentation); ``False`` reduces.
+            Reducing while new states appear is unexpected and raises.
 
         Returns
         -------
-        updated_dev : numpy.ndarray
-            Updated deviation vector reflecting the new state definition.
+        numpy.ndarray
+            Deviation in the new state definition (1-D).
         """
-        if flag_forward:
-            new_list = self.legs_model[counter_events].state_definition
-            old_list = self.legs_model[counter_events - 1].state_definition
+        old_list, new_list = self._node_state_lists(counter_events, flag_forward)
+        Q, _new_n, new_blocks = Utils.build_reorder_operator(old_list, new_list)
+        if new_blocks and not flag_forward:
+            raise ValueError(
+                "Deviation mapping has exhibited unexpected behavior, with "
+                "deviation elements missing during reduction."
+            )
+        deviation = Utils.reorder_vector(Q, old_deviation).ravel()
+        if new_blocks:
+            x_bar = self._apriori_deviation(counter_events).ravel()
+            for _name, start, size in new_blocks:
+                deviation[start : start + size] = x_bar[start : start + size]
+        return deviation
+
+    def _map_information_definition_node(
+        self, counter_events: int, R: np.ndarray, z: np.ndarray
+    ):
+        """
+        Carry a square-root information array across a sequence node.
+
+        ``[R | z]`` describes the solution at the node epoch in the definition of
+        leg ``counter_events - 1`` (``R`` need not be triangular). It is moved to
+        the definition of leg ``counter_events`` without passing through the
+        covariance, which after a long, dense arc is too ill-conditioned to be
+        inverted back into information reliably:
+
+        - states the new leg drops are marginalised: with their columns first, a
+          QR factorisation isolates their rows, and the remaining rows hold the
+          information on the kept states alone;
+        - the kept columns move to their positions in the new definition;
+        - newly augmented states contribute a-priori rows
+          ``diag(1/sigma) dx = diag(1/sigma) x_bar`` (uncorrelated, as in
+          :meth:`_map_covariance_definition_node`, and centred on
+          :meth:`_apriori_deviation`);
+        - a last QR factorisation restores the upper-triangular form.
+
+        Parameters
+        ----------
+        counter_events : int
+            Index of the sequence event (node) being crossed forward.
+        R : numpy.ndarray
+            ``(n_prev, n_prev)`` square-root information matrix at the node.
+        z : numpy.ndarray
+            Information vector (``n_prev`` elements).
+
+        Returns
+        -------
+        R_new : numpy.ndarray
+            ``(n_new, n_new)`` upper-triangular square-root information matrix.
+        z_new : numpy.ndarray
+            ``(n_new, 1)`` information vector.
+        """
+        old_model, new_model = self._node_state_models(counter_events, True)
+        Q, new_n, new_blocks = Utils.build_reorder_operator(
+            old_model.state_definition, new_model.state_definition
+        )
+        R = np.asarray(R, dtype=float)
+        z = np.asarray(z, dtype=float).reshape(-1, 1)
+        kept = np.flatnonzero(Q.any(axis=0))
+        dropped = np.flatnonzero(~Q.any(axis=0))
+
+        # Marginalise the dropped states
+        if dropped.size:
+            n_d = dropped.size
+            _, T = np.linalg.qr(np.hstack((R[:, dropped], R[:, kept], z)))
+            R_kept = T[n_d:, n_d:-1]
+            z_kept = T[n_d:, -1:]
         else:
-            new_list = self.legs_model[counter_events - 1].state_definition
-            old_list = self.legs_model[counter_events].state_definition
+            R_kept, z_kept = R, z
 
-        new_state_size = sum(element[1] for element in new_list)
-        new_deviation = np.zeros((new_state_size, 1))
+        # Kept information in the new definition, then the a-priori rows
+        R_rows = [np.zeros((R_kept.shape[0], new_n))]
+        R_rows[0][:, Q[:, kept].argmax(axis=0)] = R_kept
+        z_rows = [z_kept]
+        if new_blocks:
+            block_units = self._state_block_units(new_model)
+            x_bar = self._apriori_deviation(counter_events).ravel()
+            for name, start, size in new_blocks:
+                sig = self._apriori_sigma_values(name, size, block_units.get(start))
+                prior = np.zeros((size, new_n))
+                prior[np.arange(size), start + np.arange(size)] = 1.0 / sig
+                R_rows.append(prior)
+                z_rows.append((x_bar[start : start + size] / sig).reshape(-1, 1))
 
-        old_state_mapping = self._create_state_mapping(old_list)
-        new_state_mapping = self._create_state_mapping(new_list)
-        old_offsets = self._compute_offsets(old_state_mapping)
-        new_offsets = self._compute_offsets(new_state_mapping)
+        _, T = np.linalg.qr(np.hstack((np.vstack(R_rows), np.vstack(z_rows))))
+        m = min(T.shape[0], new_n)
+        R_new = np.zeros((new_n, new_n))
+        z_new = np.zeros((new_n, 1))
+        R_new[:m] = T[:m, :new_n]
+        z_new[:m] = T[:m, new_n:]
+        return R_new, z_new
 
-        for new_id, (_, new_size) in new_state_mapping.items():
-            # NOTE: if not in old_state_mapping, the deviation is already
-            # initialized to zero. It's an expected behavior when augmenting
-            # since the deviation is initialized to zero at the beginning of the filter.
-            # When not augmenting, an error is raised.
-            if new_id in old_state_mapping:
-                old_offset = old_offsets[new_id]
-                new_offset = new_offsets[new_id]
+    def _map_back_across_node(
+        self,
+        counter_events: int,
+        smoothed_deviation,
+        smoothed_covariance: np.ndarray,
+        node_deviation,
+        node_covariance: np.ndarray,
+        node_information: Optional[np.ndarray] = None,
+    ):
+        """
+        Carry a solution backward across a sequence node.
 
-                old_deviation = np.asarray(old_deviation).ravel()  # (N,)
-                new_deviation = np.asarray(new_deviation).ravel()  # (M,)
+        Batch filters use it on the solution of the last leg; for sequential
+        filters :meth:`SolutionOD.map_state_deviation_to_epoch` uses it on the
+        final estimate, with the forward solution stored at each node.
 
-                new_deviation[new_offset : new_offset + new_size] = old_deviation[
-                    old_offset : old_offset + new_size
-                ]
-            else:
-                if flag_forward == False:
-                    raise ValueError(
-                        "Deviation mapping has exhibited unexpected behavior, with deviation elements missing during reduction."
-                    )
+        The solution of the leg after the node is reduced to the previous leg's
+        definition at the node epoch. States augmented at the node are simply
+        discarded. States the previous leg *drops* at the node (e.g. the
+        parameters of a burn arc followed by a coast) have no counterpart after
+        it, so they are recovered by conditioning the previous leg's forward
+        solution at the node on the smoothed values of the kept states
+        (a Rauch-Tung-Striebel step without process noise).
 
-        return new_deviation
+        The conditioning is done in square-root information form. With the
+        dropped columns first, a QR factorisation of the forward square-root
+        information ``R`` at the node isolates the rows
+        ``[R_dd  R_dk]`` that carry the dropped states, and
+
+        .. math::
+
+            G = -R_{dd}^{-1} R_{dk}, \\qquad
+            \\delta x_d^s = \\delta x_d + G (\\delta x_k^s - \\delta x_k),
+
+            P_{dk}^s = G P_{kk}^s, \\qquad
+            P_{dd}^s = R_{dd}^{-1} R_{dd}^{-T} + G P_{kk}^s G^T.
+
+        This is the covariance-form step
+        :math:`G = P_{dk} P_{kk}^{-1}`,
+        :math:`P_{dd}^s = P_{dd} + G (P_{kk}^s - P_{kk}) G^T` written without
+        inverting :math:`P_{kk}` or differencing two nearly equal covariances,
+        which after a dense arc loses positive definiteness and lets the
+        recovered sigmas exceed their a priori. Here :math:`P^s` is
+        :math:`[I; G] P_{kk}^s [I; G]^T` plus the conditional covariance of the
+        dropped states, so it is positive semi-definite by construction.
+
+        It is exact: the data after the node depend on the dropped states only
+        through the kept ones. Considered states carry no deviation, so they
+        stay at zero. Never updated, a dropped considered state also keeps its
+        forward covariance; its cross terms :math:`G P_{kk}^s` hold as they
+        are, being :math:`P_{kk}^s P_{kk}^{-1} P_{kc}` either way.
+
+        Parameters
+        ----------
+        counter_events : int
+            Index of the sequence event (node) being crossed backward.
+        smoothed_deviation : numpy.ndarray or None
+            Deviation at the node in the definition of leg ``counter_events``.
+            ``None`` maps the covariance only.
+        smoothed_covariance : numpy.ndarray or None
+            Covariance at the node in the definition of leg ``counter_events``.
+            ``None`` maps the deviation only.
+        node_deviation : numpy.ndarray or None
+            Forward deviation of leg ``counter_events - 1`` propagated to the
+            node, in that leg's definition. Unused when ``smoothed_deviation``
+            is ``None``.
+        node_covariance : numpy.ndarray
+            Forward covariance of leg ``counter_events - 1`` propagated to the
+            node, in that leg's definition. Read when ``node_information`` is
+            ``None``, to build the square-root information from it, and for the
+            covariance of the dropped considered states.
+        node_information : numpy.ndarray, optional
+            Forward square-root information of leg ``counter_events - 1`` at the
+            node, in that leg's definition (``R`` with ``R^T R = P^{-1}``; it
+            need not be triangular). Supplied by SRIFB, which carries it across
+            the node anyway and so avoids re-factoring ``node_covariance``.
+
+        Returns
+        -------
+        deviation : numpy.ndarray or None
+            Column deviation at the node in the definition of leg
+            ``counter_events - 1``; ``None`` when ``smoothed_deviation`` is.
+        covariance : numpy.ndarray or None
+            Covariance at the node in the same definition; ``None`` when
+            ``smoothed_covariance`` is.
+        """
+        prev_list, next_list = self._node_state_lists(counter_events, True)
+        Q, _new_n, _new_blocks = Utils.build_reorder_operator(prev_list, next_list)
+        kept = np.flatnonzero(Q.any(axis=0))
+        dropped = np.flatnonzero(~Q.any(axis=0))
+
+        covariance = None
+        if smoothed_covariance is not None:
+            covariance = Q.T @ np.asarray(smoothed_covariance, dtype=float) @ Q
+        deviation = None
+        if smoothed_deviation is not None:
+            deviation = Utils.reorder_vector(Q.T, smoothed_deviation)
+
+        if dropped.size == 0:
+            return deviation, covariance
+
+        # Rows of the forward information that carry the dropped states
+        if node_information is None:
+            R_f = self._sqrt_info_matrix(node_covariance)
+        else:
+            R_f = np.asarray(node_information, dtype=float)
+        n_d = dropped.size
+        _, T = np.linalg.qr(np.hstack((R_f[:, dropped], R_f[:, kept])))
+        R_dd = T[:n_d, :n_d]
+        G = -spln.solve_triangular(R_dd, T[:n_d, n_d:], lower=False)
+        _idx_est, idx_con, _n = self._partition_indices(
+            self._leg_state_definition(counter_events - 1)
+        )
+
+        if covariance is not None:
+            S_dd = spln.solve_triangular(R_dd, np.eye(n_d), lower=False)
+            P_kk_s = covariance[np.ix_(kept, kept)]
+            covariance[np.ix_(dropped, kept)] = G @ P_kk_s
+            covariance[np.ix_(kept, dropped)] = (G @ P_kk_s).T
+            covariance[np.ix_(dropped, dropped)] = S_dd @ S_dd.T + G @ P_kk_s @ G.T
+            # considered states are never updated: hold their forward covariance
+            con = np.intersect1d(dropped, np.asarray(idx_con, dtype=int))
+            if con.size:
+                covariance[np.ix_(con, con)] = np.asarray(
+                    node_covariance, dtype=float
+                )[np.ix_(con, con)]
+            covariance = 0.5 * (covariance + covariance.T)
+
+        if deviation is not None:
+            dx_f = np.asarray(node_deviation, dtype=float).reshape(-1, 1)
+            deviation[dropped] = dx_f[dropped] + G @ (deviation[kept] - dx_f[kept])
+            deviation[idx_con] = 0.0
+
+        return deviation, covariance
+
+    def _map_node_to_leg_epoch(
+        self, STM: np.ndarray, deviation, covariance, label: str = "covariance"
+    ):
+        """
+        Carry a node solution back to its leg's reference epoch.
+
+        Applies :math:`\\Phi^{-1}` to the deviation and
+        :math:`\\Phi^{-1} P \\Phi^{-T}` to the covariance through linear solves
+        rather than an explicit inverse, symmetrises the result and warns with
+        :class:`CovarianceNotPSDWarning` if it is not positive semi-definite.
+
+        Parameters
+        ----------
+        STM : numpy.ndarray
+            ``(n, n)`` STM of the leg from its reference epoch to the node.
+        deviation : numpy.ndarray or None
+            Deviation at the node; ``None`` maps the covariance only.
+        covariance : numpy.ndarray or None
+            Covariance at the node; ``None`` maps the deviation only.
+        label : str, optional
+            Name of the covariance used in the warning. Defaults to
+            ``"covariance"``.
+
+        Returns
+        -------
+        deviation, covariance : numpy.ndarray or None
+            The deviation and covariance at the leg's reference epoch.
+        """
+        STM = np.asarray(STM, dtype=float)
+        try:
+            if deviation is not None:
+                deviation = np.linalg.solve(STM, deviation)
+            if covariance is not None:
+                covariance = np.linalg.solve(STM, np.linalg.solve(STM, covariance).T)
+        except np.linalg.LinAlgError:
+            STM_inv = self._safe_inv(STM)
+            if deviation is not None:
+                deviation = STM_inv @ deviation
+            if covariance is not None:
+                covariance = STM_inv @ covariance @ STM_inv.T
+
+        if covariance is not None:
+            covariance = 0.5 * (covariance + covariance.T)
+            self._check_covariance_psd(covariance, label)
+        return deviation, covariance
+
+    def _split_consider_covariance(self, idx_leg: int, covariance: np.ndarray):
+        """
+        Split a leg's joint error covariance into the pair the filters store.
+
+        On a leg with considered states, ``covariance_history`` holds the
+        "no-consider" covariance, whose estimated block is conditional on the
+        considered states, and ``covariance_consider_history`` the joint one.
+        A solution mapped back from a later leg arrives joint; the conditional
+        block is
+
+        .. math::
+
+            P_{xx} = P_c - P_{xc} P_{cc}^{-1} P_{xc}^T,
+
+        which on the leg it was computed in is the filter's own :math:`P_{xx}`,
+        since there :math:`P_{xc} = S_{xc} P_{cc}`.
+
+        Parameters
+        ----------
+        idx_leg : int
+            Leg whose definition ``covariance`` is in.
+        covariance : numpy.ndarray
+            Joint error covariance in that definition.
+
+        Returns
+        -------
+        covariance, covariance_consider : numpy.ndarray, numpy.ndarray or None
+            The conditional and the joint covariance, or ``covariance`` and
+            ``None`` when the leg has no considered states.
+        """
+        idx_est, idx_con, _n = self._partition_indices(
+            self._leg_state_definition(idx_leg)
+        )
+        if idx_con.size == 0:
+            return covariance, None
+        P_xc = covariance[np.ix_(idx_est, idx_con)]
+        P_xx = covariance[np.ix_(idx_est, idx_est)] - P_xc @ np.linalg.solve(
+            covariance[np.ix_(idx_con, idx_con)], P_xc.T
+        )
+        conditional = covariance.copy()
+        conditional[np.ix_(idx_est, idx_est)] = 0.5 * (P_xx + P_xx.T)
+        return conditional, covariance
+
+    def _check_covariance_psd(self, P: np.ndarray, label: str, tol: float = 1e-9):
+        """
+        Warn if ``P`` is not positive semi-definite beyond round-off.
+
+        The test runs on the correlation matrix, so the units spread across the
+        state do not set the threshold.
+
+        Parameters
+        ----------
+        P : numpy.ndarray
+            Symmetric covariance matrix.
+        label : str
+            Name of the covariance used in the warning.
+        tol : float, optional
+            Most negative correlation-matrix eigenvalue accepted, as a
+            magnitude. Default is ``1e-9``.
+
+        Warns
+        -----
+        CovarianceNotPSDWarning
+            If the smallest correlation-matrix eigenvalue is below ``-tol`` or
+            a variance is negative.
+        """
+        d = np.sqrt(np.abs(np.diag(P)))
+        d[d == 0.0] = 1.0
+        min_eig = np.linalg.eigh(P / np.outer(d, d))[0].min()
+        negative = np.flatnonzero(np.diag(P) < 0.0)
+        if min_eig < -tol or negative.size:
+            warnings.warn(
+                f"{label} is not positive semi-definite (smallest correlation "
+                f"eigenvalue {min_eig:.3e}, negative variances at {negative.tolist()}).",
+                self.CovarianceNotPSDWarning,
+            )
 
     def _map_stm_definition_node(
         self, counter_events: int, old_STM: np.ndarray, flag_forward: bool = True
     ) -> np.ndarray:
         """
-        Adjusts the State Transition Matrix (STM) to match a new state definition.
+        Adjust the STM to a new leg's definition via ``Phi' = Q Phi Q^T``.
+
+        STM mapping does not support newly augmented states (they have no source
+        partials); encountering one raises.
 
         Parameters
         ----------
         counter_events : int
-            Index of the current sequence event for state transition.
-
+            Index of the current sequence event.
         old_STM : numpy.ndarray
-            Previous STM to be updated.
-
+            STM in the previous state definition.
         flag_forward : bool, optional
-            If ``True``, it maps from the previous state definition to the new one (augmentation);
-            Defaults to ``True``.
+            ``True`` maps previous -> new; ``False`` reduces. Defaults to ``True``.
 
         Returns
         -------
-        updated_stm : numpy.ndarray
-            Updated State Transition Matrix reflecting the new state definition.
+        numpy.ndarray
+            STM in the new state definition.
         """
-        # Get state definitions
+        old_list, new_list = self._node_state_lists(counter_events, flag_forward)
+        Q, _new_n, new_blocks = Utils.build_reorder_operator(old_list, new_list)
+        if new_blocks:
+            raise ValueError(
+                "STM mapping is not supported for new state elements. "
+                "Missing STM elements."
+            )
+        return Utils.reorder_stm(Q, old_STM, new_blocks)
+
+    def _node_state_lists(self, counter_events: int, flag_forward: bool):
+        """
+        Return the ``(old_list, new_list)`` state definitions for a node mapping.
+
+        Parameters
+        ----------
+        counter_events : int
+            Index of the current sequence event (node).
+        flag_forward : bool
+            If ``True`` the new leg is ``counter_events`` and the old leg is the
+            previous one (augmentation); the roles reverse when reducing.
+
+        Returns
+        -------
+        old_list, new_list : list
+            The previous and target leg state definitions.
+        """
+        old_model, new_model = self._node_state_models(counter_events, flag_forward)
+        return old_model.state_definition, new_model.state_definition
+
+    def _node_state_models(self, counter_events: int, flag_forward: bool):
+        """
+        Return the ``(old_model, new_model)`` leg state models for a node mapping.
+
+        Same selection as :meth:`_node_state_lists`, but keeping the
+        :class:`~scarabaeus.StateArray` objects so callers can also read the
+        units of each state element, which ``state_definition`` drops.
+
+        Parameters
+        ----------
+        counter_events : int
+            Index of the current sequence event (node).
+        flag_forward : bool
+            If ``True`` the new model is ``counter_events`` and the old one is
+            the previous leg (augmentation); the roles reverse when reducing.
+
+        Returns
+        -------
+        old_model, new_model : StateArray
+            The previous and target leg state models.
+        """
         if flag_forward:
-            new_list = self.legs_model[counter_events].state_definition
-            old_list = self.legs_model[counter_events - 1].state_definition
-        else:
-            new_list = self.legs_model[counter_events - 1].state_definition
-            old_list = self.legs_model[counter_events].state_definition
-
-        # Define new state size and initialize the STM
-        new_state_size = sum(element[1] for element in new_list)
-        new_STM = np.eye(new_state_size)  # Initialize STM as identity matrix
-
-        # Create state mappings and compute offsets
-        old_state_mapping = self._create_state_mapping(old_list)
-        new_state_mapping = self._create_state_mapping(new_list)
-        old_offsets = self._compute_offsets(old_state_mapping)
-        new_offsets = self._compute_offsets(new_state_mapping)
-
-        # Fill in the new STM
-        for new_id, (_, new_size) in new_state_mapping.items():
-            if new_id in old_state_mapping:
-                old_offset = old_offsets[new_id]
-                new_offset = new_offsets[new_id]
-
-                new_STM[
-                    new_offset : new_offset + new_size,
-                    new_offset : new_offset + new_size,
-                ] = old_STM[
-                    old_offset : old_offset + new_size,
-                    old_offset : old_offset + new_size,
-                ]
-
-                for other_new_id, (_, other_new_size) in new_state_mapping.items():
-                    if other_new_id in old_state_mapping and new_id != other_new_id:
-                        other_old_offset = old_offsets[other_new_id]
-                        other_new_offset = new_offsets[other_new_id]
-
-                        new_STM[
-                            new_offset : new_offset + new_size,
-                            other_new_offset : other_new_offset + other_new_size,
-                        ] = old_STM[
-                            old_offset : old_offset + new_size,
-                            other_old_offset : other_old_offset + other_new_size,
-                        ]
-                        new_STM[
-                            other_new_offset : other_new_offset + other_new_size,
-                            new_offset : new_offset + new_size,
-                        ] = old_STM[
-                            other_old_offset : other_old_offset + other_new_size,
-                            old_offset : old_offset + new_size,
-                        ]
-            else:
-                raise ValueError(
-                    "STM mapping is not supported for new state elements. Missing STM elements."
-                )
-
-        return new_STM
-
-    def _create_state_mapping(self, state_list):
-        """
-        Generates a mapping from state variable names to their indices and sizes.
-
-        Parameters
-        ----------
-        state_list : list
-            List of state variable names and their associated sizes.
-
-        Returns
-        -------
-        dict
-            Dictionary mapping state variable names to (index, size) tuples.
-        """
-        return {element[0]: (idx, element[1]) for idx, element in enumerate(state_list)}
-
-    def _compute_offsets(self, state_mapping):
-        """
-        Computes the starting index (offset) for each state variable based on its size.
-
-        Parameters
-        ----------
-        state_mapping : dict
-            Mapping of state variable names to their indices and sizes.
-
-        Returns
-        -------
-        dict
-            Dictionary mapping state variable names to their offsets in the state vector.
-        """
-        return {
-            key: sum(value[1] for value in list(state_mapping.values())[:i])
-            for i, (key, value) in enumerate(state_mapping.items())
-        }
+            return (
+                self.legs_model[counter_events - 1],
+                self.legs_model[counter_events],
+            )
+        return (
+            self.legs_model[counter_events],
+            self.legs_model[counter_events - 1],
+        )
 
     def _validate_sequence_batch(self):
         """
-        Validates consistency in state vector definitions across sequential estimation legs.
+        Reports state elements dropped between consecutive sequence legs.
 
-        Ensures that each state vector in a sequence contains all necessary elements from previous legs.
+        Dropping is supported by the batch filters (the element is marginalised
+        at the node and recovered when mapping back), so each leg that drops
+        elements issues one :class:`SequenceStateDroppedWarning` naming them.
 
         Returns
         -------
         None
+
+        Warns
+        -----
+        SequenceStateDroppedWarning
+            Once per leg that drops elements of the previous leg.
         """
         # Initialize list of state vectors
         list_state_vectors = [
@@ -1376,24 +2643,17 @@ class FilterOD:
 
         # Take consecutive pairs of state_vectors
         for i in range(1, len(list_state_vectors)):
-            prev_state_vec = list_state_vectors[i - 1]
-            curr_state_vec = list_state_vectors[i]
+            prev_ids = [prev_tuple[0] for prev_tuple in list_state_vectors[i - 1]]
+            curr_ids = [curr_tuple[0] for curr_tuple in list_state_vectors[i]]
 
-            # Initialize lists of IDs for previous and current state vectors
-            prev_ids = [prev_tuple[0] for prev_tuple in prev_state_vec]
-            curr_ids = [curr_tuple[0] for curr_tuple in curr_state_vec]
-
-            # Ensure that every element in the previous state vector is present in the current state vector (i.e., only increment components)
-            for prev_id in prev_ids:
-                if prev_id not in curr_ids:
-                    print(
-                        f"Warning: State vector leg {i} does not contain element '{prev_id}'"
-                    )
-
-                    # raise Exception(
-                    #    f"Inconsistency detected: State vector leg {i} does not contain element '{prev_id}' from state vector leg {i-1}.\n"
-                    #    "The current implementation needs that for the batch filtering."
-                    # )
+            dropped = [prev_id for prev_id in prev_ids if prev_id not in curr_ids]
+            if dropped:
+                warnings.warn(
+                    f"State vector leg {i} does not contain element(s) {dropped} "
+                    f"of leg {i - 1}; they are recovered when mapping back.",
+                    self.SequenceStateDroppedWarning,
+                    stacklevel=2,
+                )
 
     def observability_test(self, print_obs=False, threshold=1e-1, meas_corr=None):
         """
@@ -1528,42 +2788,32 @@ class FilterOD:
 
     def _init_consider_partition(self, idx_leg=0) -> None:
         """
-        Initialize the partition of state variables into estimated and considered parameters.
+        Split the state into estimated and considered parameters.
 
-        This method processes the trajectory state definition to categorize state variables
-        based on their estimation flags. Variables marked as "considered" are separated from
-        those to be estimated, and their indices are stored for later use in filtering operations.
-
-        The method also computes the total state dimension and performs sanity checks to ensure
-        consistency between the state definition size and the STM (State Transition Matrix)
-        inferred size.
+        Entries flagged ``"considered"`` go to the consider partition and every
+        other entry to the estimated one; see :meth:`_partition_indices`.
 
         Parameters
         ----------
         idx_leg : int, optional
-            Index of the leg to use for state definition when in sequence mode. Defaults to 0
+            Leg whose state definition is used in sequence mode. Defaults to ``0``.
 
-        Raises
-        ------
-        warnings.UserWarning
-            If the state definition size differs from the STM inferred size, indicating
-            potential inconsistencies in state ordering or STM mapping.
+        Notes
+        -----
+        Sets the following attributes:
 
-
-        Attributes Set
-        ---------------
-        idx_est : np.ndarray
-            Integer array of indices for estimated state variables.
-        idx_con : np.ndarray
-            Integer array of indices for considered (not estimated) state variables.
-        n_full : int
-            Total dimension of the full state vector.
-        n_est : int
-            Number of estimated state variables.
-        n_con : int
-            Number of considered (not estimated) state variables.
-        has_consider : bool
-            Flag indicating whether there are any considered parameters (True if n_con > 0).
+        ``idx_est`` : np.ndarray
+            Indices of the estimated state elements.
+        ``idx_con`` : np.ndarray
+            Indices of the considered state elements.
+        ``n_full`` : int
+            Dimension of the full state vector.
+        ``n_est`` : int
+            Number of estimated state elements.
+        ``n_con`` : int
+            Number of considered state elements.
+        ``has_consider`` : bool
+            ``True`` when ``n_con > 0``.
         """
         if self.flag_sequence:
             state_def = self.legs_model[idx_leg].state
@@ -1572,6 +2822,36 @@ class FilterOD:
                 self.trajectory.state_definition
             )  # list of tuples (name, dim, est, dyn, owner, value)
 
+        idx_est, idx_con, cursor = self._partition_indices(state_def)
+
+        self.idx_est = idx_est
+        self.idx_con = idx_con
+
+        self.n_full = cursor
+        self.n_est = int(self.idx_est.size)
+        self.n_con = int(self.idx_con.size)
+
+        self.has_consider = self.n_con > 0
+
+    @staticmethod
+    def _partition_indices(state_def):
+        """
+        Split a state definition into estimated and considered index arrays.
+
+        Pure counterpart of :meth:`_init_consider_partition`, so a partition
+        can be computed for any leg without disturbing the filter's current
+        one.
+
+        Parameters
+        ----------
+        state_def : list of tuple
+            ``(name, dim, est_flag, dyn_flag, owner, value)`` entries.
+
+        Returns
+        -------
+        tuple
+            ``(idx_est, idx_con, n_full)``.
+        """
         idx_est = []
         idx_con = []
 
@@ -1584,14 +2864,144 @@ class FilterOD:
                 idx_est.extend(range(cursor, cursor + dim))
             cursor += dim
 
-        self.idx_est = np.asarray(idx_est, dtype=int)
-        self.idx_con = np.asarray(idx_con, dtype=int)
+        return (
+            np.asarray(idx_est, dtype=int),
+            np.asarray(idx_con, dtype=int),
+            cursor,
+        )
 
-        self.n_full = cursor
-        self.n_est = int(self.idx_est.size)
-        self.n_con = int(self.idx_con.size)
+    def _leg_state_definition(self, idx_leg: int):
+        """State definition of leg ``idx_leg``, or the trajectory's when flat."""
+        if self.flag_sequence:
+            return self.legs_model[idx_leg].state
+        return self.trajectory.state_definition
 
-        self.has_consider = self.n_con > 0
+    def _map_deviation_at_node(
+        self, counter_events: int, dx_est_prev: np.ndarray
+    ) -> np.ndarray:
+        """
+        Carry the running deviation across a sequence node.
+
+        The operator built by :meth:`_map_deviation_definition_node` is sized
+        from the legs' **full** state definitions, but the filter's running
+        deviation is the **estimated partition only** — it multiplies ``Hx``,
+        which has ``n_est`` columns. Handing that partition straight to the
+        mapping mismatches whenever a leg carries consider parameters. It only
+        appears to work while the previous leg's full size happens to equal its
+        estimated size, which holds for a plain position/velocity leg and stops
+        holding the moment a leg adds burn parameters.
+
+        This embeds the partition back into the previous leg's full definition,
+        maps it, and returns the new leg's estimated partition. Consider
+        parameters carry no tracked deviation — only covariance — so they enter
+        the full vector as zeros.
+
+        Parameters
+        ----------
+        counter_events : int
+            Index of the sequence event (node) being crossed.
+        dx_est_prev : numpy.ndarray
+            Deviation in the previous leg's estimated partition.
+
+        Returns
+        -------
+        numpy.ndarray
+            Column vector of the deviation in the new leg's estimated
+            partition.
+        """
+        idx_est_new, _, _ = self._partition_indices(
+            self._leg_state_definition(counter_events)
+        )
+        dx_prev_full = self._full_leg_deviation(counter_events - 1, dx_est_prev)
+
+        dx_full = np.asarray(
+            self._map_deviation_definition_node(counter_events, dx_prev_full)
+        ).reshape(-1, 1)
+
+        return dx_full[idx_est_new, 0].reshape(-1, 1)
+
+    def _full_leg_deviation(self, idx_leg: int, dx_est: np.ndarray) -> np.ndarray:
+        """
+        Embed a deviation of a leg's estimated partition into its full definition.
+
+        Consider parameters carry no tracked deviation, so they enter as zeros.
+        A deviation that is already full-sized (no consider parameters on the
+        leg) passes through untouched.
+
+        Parameters
+        ----------
+        idx_leg : int
+            Index of the sequence leg the deviation belongs to.
+        dx_est : numpy.ndarray
+            Deviation in the leg's estimated partition (or full definition).
+
+        Returns
+        -------
+        numpy.ndarray
+            Column vector of the deviation in the leg's full definition.
+        """
+        idx_est, _, n_full = self._partition_indices(
+            self._leg_state_definition(idx_leg)
+        )
+        dx = np.asarray(dx_est, dtype=float).reshape(-1, 1)
+
+        if dx.size == n_full:
+            return dx
+        if dx.size == idx_est.size:
+            dx_full = np.zeros((n_full, 1))
+            dx_full[idx_est, 0] = dx.ravel()
+            return dx_full
+        raise ValueError(
+            f"Deviation of size {dx.size} matches neither the full "
+            f"({n_full}) nor the estimated ({idx_est.size}) dimension "
+            f"of leg {idx_leg}."
+        )
+
+    def _apriori_deviation(self, idx_leg: int = 0) -> np.ndarray:
+        """
+        A-priori state deviation of a leg with respect to the current reference.
+
+        The a-priori state is the reference the first iteration started from.
+        Once :meth:`fit` has moved the reference by ``_delta0_total``, the
+        a-priori state sits at ``-_delta0_total`` from it, and that is the
+        mean the prior information must carry. Starting every iteration from
+        a zero a-priori deviation instead re-centres the prior on the latest
+        estimate: the prior then constrains nothing, and directions the data
+        observe weakly (e.g. burn parameters of an arc with no tracking)
+        drift further at every iteration.
+
+        Parameters
+        ----------
+        idx_leg : int, optional
+            Index of the sequence leg. Ignored for single-arc trajectories.
+            Defaults to 0.
+
+        Returns
+        -------
+        numpy.ndarray
+            Column vector in the leg's full state definition. Considered
+            states are never corrected, so their entries are zero.
+        """
+        delta = getattr(self, "_delta0_total", None)
+        if not self.flag_sequence:
+            if delta is None:
+                return np.zeros((self.n, 1))
+            return -np.asarray(delta, dtype=float).reshape(-1, 1)
+
+        x_bar = np.zeros((self.legs_n[idx_leg], 1))
+        if delta is None or not np.any(delta):
+            return x_bar
+
+        sequence = self.trajectory._sequence_definition
+        leg_names = [
+            name
+            for name, seg_type in zip(sequence.names, sequence.types)
+            if seg_type in ("Leg", "Finite Burn")
+        ]
+        delta = np.asarray(delta, dtype=float).ravel()
+        for ls, le, gs, ge in self.propagator._leg_to_global_maps[leg_names[idx_leg]]:
+            x_bar[ls:le, 0] = -delta[gs:ge]
+        return x_bar
 
     @property
     def apriori_covariance_est(self) -> "np.ndarray":
@@ -1611,6 +3021,371 @@ class FilterOD:
         if self.has_consider:
             return P0[np.ix_(self.idx_est, self.idx_est)]
         return P0
+
+    def _build_timeline(self):
+        """
+        Build the filtering timeline shared by every filter's ``_compute`` loop.
+
+        Returns
+        -------
+        (measurement_times, event_times, timeline_times) : tuple of np.ndarray
+            ``measurement_times`` are the spacecraft measurement epochs;
+            ``event_times`` are the sequence event epochs (empty for single-arc
+            trajectories); ``timeline_times`` is their sorted union — the array
+            the per-epoch loop iterates over.
+        """
+        measurement_times = np.asarray(
+            self.measurement_data.get_spacecraft_times(), dtype=float
+        )
+        if self.flag_sequence:
+            event_times = np.asarray(self.events_epochs, dtype=float)
+            timeline_times = np.unique(
+                np.concatenate((measurement_times, event_times))
+            )
+        else:
+            event_times = np.array([])
+            timeline_times = measurement_times
+        # Cache the timeline so downstream consumers (e.g. SolutionOD) can attach
+        # an epoch to every state-deviation / covariance row. These histories are
+        # built over ``timeline_times`` (measurements ∪ events), which is longer
+        # than the measurement-only ``timestamps`` whenever a sequence has event
+        # epochs that do not coincide with a measurement epoch.
+        self.timeline_times = timeline_times
+        # The filters index the process noise by position in this timeline, so
+        # it is discretized over the same epochs: an event epoch splits the
+        # interval it falls in. Redone whenever the timeline changes (e.g. the
+        # measurements are rebuilt between iterations).
+        # An RTN noise is redone every time: it is rotated along the reference
+        # trajectory, which is rebuilt between iterations. So is a DMC noise,
+        # which decays at the reference Gauss-Markov rates (estimated or not)
+        # and, for an RTN or body-fixed Gauss-Markov acceleration, is rotated
+        # into its frame along the reference trajectory.
+        # Each model reads the reference of the body it drives.
+        for model in self._process_noise_models():
+            reference_state = functools.partial(
+                self._reference_position_velocity, body=model.body
+            )
+            if isinstance(model, DynamicalModelCompensation):
+                model._compute_discrete_time_covariances(
+                    timeline_times,
+                    reference_state,
+                    functools.partial(self._reference_fogm_beta, owner=model.body),
+                    functools.partial(self._reference_fogm_frame, owner=model.body),
+                )
+            elif model.frame == "RTN" or not np.array_equal(
+                model.epochs, timeline_times
+            ):
+                model._compute_discrete_time_covariances(
+                    timeline_times, reference_state
+                )
+        return measurement_times, event_times, timeline_times
+
+    def _reference_leg_of(self, times) -> np.ndarray:
+        """
+        Index into ``trajectory._legs`` of the leg each time falls in: the
+        first leg ending at or after it, the last one past the end. Zero on a
+        single arc.
+
+        Parameters
+        ----------
+        times : array_like
+            TDB seconds past J2000.
+
+        Returns
+        -------
+        np.ndarray
+            Integer array of shape ``(len(times),)``.
+        """
+        times = np.asarray(times, dtype=float)
+        if not self.flag_sequence:
+            return np.zeros(times.shape, dtype=int)
+        leg_ends = np.array([np.max(leg["epoch_leg"].et) for leg in self.trajectory._legs])
+        return np.minimum(np.searchsorted(leg_ends, times), len(leg_ends) - 1)
+
+    def _reference_position_velocity(self, times, body=None):
+        """
+        Position and velocity of the reference trajectory at ``times``.
+
+        Read from the trajectory SPK, which is loaded once written. On a
+        sequence each time is taken relative to the origin, and in the frame,
+        of the leg it falls in. The legs meet at their nodes, where SPICE
+        returns only one of the two states, so the times should lie inside a
+        leg.
+
+        Parameters
+        ----------
+        times : array_like
+            TDB seconds past J2000.
+        body : Body, optional
+            Body whose reference to read. A single arc writes every
+            propagated body to the SPK, a sequence only the primary body of
+            each leg. Defaults to ``None``, the primary body.
+
+        Returns
+        -------
+        (positions, velocities) : tuple of np.ndarray
+            Arrays of shape ``(len(times), 3)``, in km and km/s.
+
+        Raises
+        ------
+        NoiseReferenceUnavailableError
+            If, on a sequence, ``body`` is not the primary body of every leg.
+        """
+        times = np.asarray(times, dtype=float)
+        if self.flag_sequence:
+            legs = [
+                (leg["body"], leg["origin"], leg["frame"])
+                for leg in self.trajectory._legs
+            ]
+            if body is not None:
+                body_id = getattr(body, "spice_id", body)
+                other = next(
+                    (leg_body for leg_body, _, _ in legs if leg_body.spice_id != body_id),
+                    None,
+                )
+                if other is not None:
+                    raise self.NoiseReferenceUnavailableError(
+                        f"The reference trajectory of {getattr(body, 'name', body)} "
+                        "is not available: a sequence writes only the primary "
+                        f"body of each leg ({other.name}) to the trajectory SPK. "
+                        "Give its process noise in an inertial frame."
+                    )
+        else:
+            legs = [
+                (
+                    self.trajectory.body if body is None else body,
+                    self.trajectory.origin,
+                    self.trajectory.ref_frame,
+                )
+            ]
+
+        states = np.array([
+            SpiceManager.get_state(body, t, frame, origin).values
+            for t, (body, origin, frame) in zip(
+                times, (legs[i] for i in self._reference_leg_of(times))
+            )
+        ]).reshape(-1, 6)
+        return states[:, :3], states[:, 3:]
+
+    def _reference_fogm_models(self, owner=None) -> list:
+        """
+        The first-order Gauss-Markov model each leg integrates, with the leg's
+        reference initial state and the body that owns its ``a_fogm``.
+
+        Parameters
+        ----------
+        owner : Body, optional
+            Body whose Gauss-Markov acceleration to read. Defaults to
+            ``None``, the owner of the first ``a_fogm`` of each leg.
+
+        Returns
+        -------
+        list of tuple
+            One ``(state, leg_owner, gauss_markov)`` per leg, in leg order;
+            ``leg_owner`` and ``gauss_markov`` are ``None`` on a leg whose
+            state carries no ``a_fogm`` of ``owner``.
+
+        Raises
+        ------
+        MissingGaussMarkovModelError
+            If a leg's dynamics do not integrate the Gauss-Markov acceleration
+            of the body that owns ``a_fogm``.
+        """
+        if self.flag_sequence:
+            sequence = self.trajectory._sequence_definition
+            props = [sequence.props[leg["seq_idx"]] for leg in self.trajectory._legs]
+        else:
+            props = [self.propagator]
+
+        owner_id = getattr(owner, "spice_id", owner)
+        legs = []
+        for prop in props:
+            state = prop.full_state_vector
+            leg_owner = next(
+                (
+                    entry[4]
+                    for entry in state.state
+                    if entry[0] == "a_fogm"
+                    and (
+                        owner is None
+                        or getattr(entry[4], "spice_id", None) == owner_id
+                    )
+                ),
+                None,
+            )
+            if leg_owner is None:
+                # Nothing to decay on this leg, nor noise to drive
+                legs.append((state, None, None))
+                continue
+            gauss_markov = next(
+                (
+                    force_model.force_models["FirstOrderGaussMarkov"]
+                    for force_model in prop.force_models
+                    if "FirstOrderGaussMarkov"
+                    in getattr(force_model, "dynamics_mode_list", ())
+                    and getattr(force_model.primary_body, "spice_id", None)
+                    == leg_owner.spice_id
+                ),
+                None,
+            )
+            if gauss_markov is None:
+                raise self.MissingGaussMarkovModelError(
+                    f"DMC drives the a_fogm of {leg_owner.name}, but no force model on "
+                    "its leg integrates it: enable first_order_gauss_markov in the "
+                    "ForceModelTranslation of that body."
+                )
+            legs.append((state, leg_owner, gauss_markov))
+        return legs
+
+    def _reference_fogm_beta(self, times, owner=None):
+        """
+        Decay rates of the first-order Gauss-Markov acceleration at ``times``,
+        as the dynamics integrate it on the leg each time falls in.
+
+        They are the ``beta_fogm`` state value when the state carries one
+        (which the filter may estimate), otherwise the force model's own
+        (``fogm_beta``), from the leg's reference initial state.
+
+        Parameters
+        ----------
+        times : array_like
+            TDB seconds past J2000.
+        owner : Body, optional
+            Body whose Gauss-Markov acceleration to read. Defaults to
+            ``None``, the owner of the first ``a_fogm`` of each leg.
+
+        Returns
+        -------
+        np.ndarray
+            Array of shape ``(len(times), 3)``, in 1/s. NaN on a leg whose
+            state carries no ``a_fogm`` of ``owner``.
+
+        Raises
+        ------
+        MissingGaussMarkovModelError
+            If a leg's dynamics do not integrate the Gauss-Markov acceleration
+            of the body that owns ``a_fogm``.
+        """
+        betas = []
+        for state, leg_owner, gauss_markov in self._reference_fogm_models(owner):
+            if gauss_markov is None:
+                betas.append(np.full(3, np.nan))
+                continue
+            beta = gauss_markov._get_beta_fogm(
+                state._make_direct_representation(), leg_owner
+            )
+            betas.append(
+                np.broadcast_to(np.asarray(beta, dtype=float).reshape(-1), (3,))
+            )
+        return np.array(betas)[self._reference_leg_of(times)]
+
+    def _reference_fogm_frame(self, times, owner=None):
+        """
+        Rotation from the frame the first-order Gauss-Markov acceleration is
+        expressed in to the propagation frame, at ``times``, along the
+        reference trajectory.
+
+        The identity for an inertial Gauss-Markov acceleration and on a leg
+        that carries none. A body-fixed rotation depends on the epoch alone,
+        so the reference trajectory is read only when some leg's acceleration
+        is RTN.
+
+        Parameters
+        ----------
+        times : array_like
+            TDB seconds past J2000.
+        owner : Body, optional
+            Body whose Gauss-Markov acceleration to read. Defaults to
+            ``None``, the owner of the first ``a_fogm`` of each leg.
+
+        Returns
+        -------
+        np.ndarray
+            Array of shape ``(len(times), 3, 3)``.
+
+        Raises
+        ------
+        MissingGaussMarkovModelError
+            If a leg's dynamics do not integrate the Gauss-Markov acceleration
+            of the body that owns ``a_fogm``.
+        """
+        times = np.asarray(times, dtype=float)
+        rotations = np.tile(np.eye(3), (len(times), 1, 1))
+        legs = self._reference_fogm_models(owner)
+        frames = {gm.frame for _, _, gm in legs if gm is not None}
+        if frames <= {"inertial"}:
+            return rotations
+
+        if "RTN" in frames:
+            positions, velocities = self._reference_position_velocity(times, owner)
+        else:
+            positions = velocities = np.full((len(times), 3), np.nan)
+        for i, leg in enumerate(self._reference_leg_of(times)):
+            _, leg_owner, gauss_markov = legs[leg]
+            if gauss_markov is None or gauss_markov.frame == "inertial":
+                continue
+            rotations[i] = DynamicalUtils.frame_matrix(
+                gauss_markov,
+                positions[i],
+                {("velocity", leg_owner.spice_id): velocities[i]},
+                times[i],
+                leg_owner,
+            )
+        return rotations
+
+    def _epoch_measurement_block(self, epoch):
+        """
+        Return the combined measurement block for a single ``t2`` epoch.
+
+        Thin wrapper over :meth:`FilterDataManager.get_combined_for_t2` that
+        drops the redundant ``{epoch: block}`` indirection repeated at every
+        call site.
+
+        Parameters
+        ----------
+        epoch : float
+            Reception (``t2``) epoch, TDB seconds past J2000.
+
+        Returns
+        -------
+        dict
+            The measurement block for ``epoch`` (keys such as ``sigma``,
+            ``partials``, ``residuals``, ``instruments``, ``t2``).
+        """
+        return self.measurement_data.get_combined_for_t2(epoch)[epoch]
+
+    def _measurement_covariance(
+        self, sigmas, epoch, meas_corr=None, underweighting_factor=1.0
+    ):
+        """
+        Build the measurement-noise covariance ``R`` for one epoch.
+
+        Equivalent to ``underweighting_factor * CovarianceMatrix(sigmas, epoch,
+        from_list=True, corr_factors=meas_corr).matrix`` as a numpy array.
+
+        Parameters
+        ----------
+        sigmas : array_like
+            Per-measurement standard deviations for this epoch.
+        epoch : float
+            Measurement epoch, TDB seconds past J2000.
+        meas_corr : list, optional
+            Off-diagonal correlation factors forwarded to
+            :class:`~scarabaeus.CovarianceMatrix`. Defaults to ``None``.
+        underweighting_factor : float, optional
+            Multiplicative scale applied to ``R`` (``>1`` de-weights
+            measurements). Batch filters use the default ``1.0``.
+
+        Returns
+        -------
+        numpy.ndarray
+            The measurement-noise covariance matrix ``R``.
+        """
+        return underweighting_factor * np.array(
+            CovarianceMatrix(
+                sigmas, epoch, from_list=True, corr_factors=meas_corr
+            ).matrix
+        )
 
     def _split_stm_phi_psi(self, STM: np.ndarray) -> tuple:
         """
@@ -1769,10 +3544,12 @@ class FilterOD:
 
         where :math:`P` is a covariance matrix.
 
-        The routine first attempts a Cholesky decomposition of the inverse
-        covariance matrix. If Cholesky factorization fails (typically due to
-        loss of positive definiteness or numerical conditioning issues),
-        the function falls back to an eigenvalue-based construction.
+        The factorisation is carried out on the correlation matrix, so the
+        spread of units across the state (e.g. km next to km/s next to a
+        unitless scale factor) does not reach the numerics, and without forming
+        the inverse explicitly. If Cholesky factorization still fails (loss of
+        positive definiteness), the function falls back to an eigenvalue-based
+        construction.
 
         Parameters
         ----------
@@ -1780,15 +3557,13 @@ class FilterOD:
             Covariance matrix.
 
         min_eig : float, optional
-            Minimum eigenvalue allowed during the eigenvalue fallback.
-            Eigenvalues smaller than this threshold are clipped to
-            ``min_eig`` to preserve numerical stability. Default is
-            ``1e-14``.
+            Smallest eigenvalue of the correlation matrix kept by the eigenvalue
+            fallback, relative to its largest one. Default is ``1e-14``.
 
         Returns
         -------
         ndarray of shape (n, n)
-            Square-root information matrix.
+            Upper-triangular square-root information matrix.
 
         Warns
         -----
@@ -1801,39 +3576,39 @@ class FilterOD:
         Primary method
         ^^^^^^^^^^^^^^
 
-        The preferred computation is
+        With :math:`P = D C D`, :math:`D = \\mathrm{diag}(\\sqrt{P_{ii}})`, and
+        :math:`J` the reversal permutation, the lower Cholesky factor of the
+        reversed correlation matrix :math:`J C J = L L^T` gives
 
         .. math::
 
-            R = \\mathrm{chol}(P^{-1})
+            R = J L^{-1} J D^{-1},
 
-        where ``chol`` denotes the upper-triangular Cholesky factor.
+        which is upper triangular with positive diagonal, i.e. exactly
+        :math:`\\mathrm{chol}(P^{-1})`.
 
         Fallback method
         ^^^^^^^^^^^^^^^
 
-        If Cholesky decomposition fails, the matrix is reconstructed using
-        the eigendecomposition
-
-        .. math::
-
-            P = V \\Lambda V^T
-
-        and the square-root information matrix is approximated as
-
-        .. math::
-
-            R = V \\Lambda^{-1/2} V^T
-
-        after clipping small eigenvalues.
-
-        This approach improves robustness in estimation problems involving
-        near-singular covariance matrices or rank-deficient systems.
+        If Cholesky decomposition fails, :math:`C = V \\Lambda V^T` is used with
+        the eigenvalues clipped from below, and the symmetric square root
+        :math:`V \\Lambda^{-1/2} V^T` is brought back to upper-triangular form
+        by a QR factorisation (which leaves :math:`R^T R` unchanged), so callers
+        that back-substitute through :math:`R` still see a triangular matrix.
         """
+        P = np.asarray(P, dtype=float)
+        P = 0.5 * (P + P.T)
+        n = P.shape[0]
+
+        # Unit scaling: factor the correlation matrix, undo the scaling after
+        scale = np.sqrt(np.abs(np.diag(P)))
+        scale[scale == 0.0] = 1.0
+        C = P / np.outer(scale, scale)
 
         try:
-            R = spln.cholesky(self._safe_inv(P), lower=False)
-            return R
+            L = spln.cholesky(C[::-1, ::-1], lower=True)
+            R_C = spln.solve_triangular(L, np.eye(n), lower=True)[::-1, ::-1]
+            return R_C / scale
 
         except np.linalg.LinAlgError:
             warnings.warn(
@@ -1842,13 +3617,12 @@ class FilterOD:
                 RuntimeWarning,
             )
 
-        # Eigenvalue fallback
-        eigvals, eigvecs = np.linalg.eigh(P)
+        # Eigenvalue fallback, clipping relative to the largest eigenvalue
+        eigvals, eigvecs = np.linalg.eigh(C)
+        eigvals = np.maximum(eigvals, min_eig * np.max(eigvals))
 
-        # Clip small eigenvalues
-        eigvals = np.maximum(eigvals, min_eig)
+        # Symmetric square root of inv(C), re-triangularised
+        _, R_C = np.linalg.qr(eigvecs @ np.diag(1.0 / np.sqrt(eigvals)) @ eigvecs.T)
+        R_C = R_C * np.where(np.diag(R_C) < 0.0, -1.0, 1.0)[:, None]
 
-        # R ≈ sqrt(inv(P))
-        R = eigvecs @ np.diag(1.0 / np.sqrt(eigvals)) @ eigvecs.T
-
-        return R
+        return R_C / scale

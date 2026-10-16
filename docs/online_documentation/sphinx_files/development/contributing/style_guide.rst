@@ -1,5 +1,6 @@
 .. SPDX-FileCopyrightText: 2026 Orbital Research Cluster for Celestial Applications (ORCCA) Lab, University of Colorado at Boulder
 .. SPDX-License-Identifier: ISC
+
 .. _style_guide:
 .. create a gold color role for headers
 .. raw:: html
@@ -67,7 +68,7 @@ under ``docs/TemplateClass.py`` and contains more comments to supplement it. Man
 snippets for brevity.
 
 SPDX License Identifier
-===========
+=======================
 You'll notice that every file in Scarabaeus begins with these lines:
 
 .. code-block:: python

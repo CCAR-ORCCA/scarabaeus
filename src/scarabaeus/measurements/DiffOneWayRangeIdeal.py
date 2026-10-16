@@ -3,17 +3,16 @@
 from scarabaeus import (
     constants,
     Measurement,
+    MissionSequence,
     Units,
     Frame,
     ArrayWUnits,
     ArrayWFrame,
     EpochArray,
-    StateArray,
     Spacecraft,
     Instrument,
     GroundStation,
     Noise,
-    SpiceManager,
     StateDefinition,
 )
 
@@ -53,12 +52,18 @@ class DiffOneWayRangeIdeal(Measurement):
         Instrument object associated with the measurement model.
     sigma : ArrayWUnits, optional
         Measurement standard deviation in seconds. Defaults to ``None``.
-    meas_bias : float, optional
-        Measurement bias. Defaults to ``None``.
-    state_definition : StateVector, optional
-        State vector definition list. Defaults to ``None``.
-    sequence_definition : list, optional
-        Sequence definition list. Defaults to ``None``.
+    meas_bias : float | ArrayWUnits | ArrayWFrame, optional
+        Measurement bias, added to the first station's range; a float is
+        taken in km. A ``dor_bias`` entry for this station in the reference
+        state overrides it; it holds one value for every pass or one per
+        pass (see :meth:`~scarabaeus.Measurement.set_pass_epochs`) and must
+        be given in km.
+        Defaults to ``None``.
+    state_definition : list, optional
+        StateVector definition list. Defaults to ``None``.
+    sequence_definition : MissionSequence, optional
+        Mission sequence whose per-leg state definitions replace
+        *state_definition*. Defaults to ``None``.
     ground_station_2 : GroundStation, optional
         Second ground station needed for the differential measurement model.
         Defaults to ``None``.
@@ -77,7 +82,7 @@ class DiffOneWayRangeIdeal(Measurement):
         instrument: Instrument,
         sigma: ArrayWUnits = None,
         meas_bias: float = None,
-        state_definition: StateArray = None,
+        state_definition: list = None,
         sequence_definition=None,
         ground_station_2: GroundStation = None,
     ):
@@ -94,7 +99,6 @@ class DiffOneWayRangeIdeal(Measurement):
         self._sequence_definition = sequence_definition
         self._station = ground_station_2
         self._measurement_type = "DiffOneWayRangeIdeal"
-        self._reference_state_vector: StateArray | None = None
 
     # -------------------------#
     # region ====> Properties #
@@ -107,26 +111,19 @@ class DiffOneWayRangeIdeal(Measurement):
         return self._station
 
     @property
-    def sigma(self) -> ArrayWUnits:
-        """
-        The standard deviation of the measurement model.
-        """
-        return self._sigma
-
-    @property
     def meas_bias(self):
-        """Constant range bias applied to all computed observables [s]."""
+        """Range bias added to the first station's range [km]."""
         return self._meas_bias
 
     @property
-    def state_definition(self) -> dict:
+    def state_definition(self) -> list:
         """
         The state vector definition
         """
         return self._state_definition
 
     @property
-    def sequence_definition(self) -> dict:
+    def sequence_definition(self) -> MissionSequence:
         """
         The sequence definition.
         """
@@ -139,33 +136,6 @@ class DiffOneWayRangeIdeal(Measurement):
     # Methods #
     # ---------#
 
-    def _extract_dor_bias(self) -> ArrayWUnits | None:
-        """
-        Return range bias for THIS station, as stored in the state, if present.
-        """
-        if self._reference_state_vector is None:
-            return self._meas_bias.quantity if self._meas_bias is not None else None
-
-        state_allowed = StateDefinition._generate_allowed_state_dictionary()
-
-        # Prefer meas_bias_ideal_* if available in the allowed dictionary
-        if "dor_bias" not in state_allowed:
-            return None
-
-        for state_entry in self._reference_state_vector.state:
-            component = state_entry[0]
-            body = state_entry[4]
-            value = state_entry[5]  # ArrayWFrame (even for scalar bias)
-
-            if state_allowed["dor_bias"][2].match(component) is None:
-                continue
-
-            body_sid = getattr(body, "spice_id", None)
-            if body_sid == self.instrument.spice_id:
-                return value.quantity
-
-        return None
-
     def computed_measurements(
         self,
         target: Spacecraft,
@@ -177,113 +147,88 @@ class DiffOneWayRangeIdeal(Measurement):
         noisy: bool = False,
     ) -> ArrayWFrame:
         """
-        Computes the doppler measurement between ``target.name`` and ``self.instrument.name`` (2-way doppler).
+        Compute the differential one-way range between the two stations.
 
-        If a receiver_station is specified as an instrument (i.e. a ground station) 3-way doppler is computed instead.
+        At each epoch the geometric ranges from the first station
+        (:attr:`instrument`) and the second station (:attr:`station`) to the
+        target are differenced and divided by the speed of light,
+        :math:`(\\rho_2 - \\rho_1) / c`. A ``gs_delta_location`` in the reference
+        state shifts the first station, and the bias of
+        :meth:`_extract_bias` is added to the first station's range.
 
         Parameters
         ----------
         target : Spacecraft
             The target spacecraft.
-
         epoch_array : EpochArray, optional
-            An array of epochs (times) at which the range rate measurements should be computed.
-            If provided, overrides ``epoch_start``, ``epoch_end``, and ``tstep``.
-
+            Epochs at which the measurements are computed. If provided, it
+            overrides ``epoch_start``, ``epoch_end`` and ``tstep``. Defaults to
+            ``None``.
         epoch_start : EpochArray, optional
-            The starting epoch for the range ratemeasurement computations.
-            Required if ``epoch_array`` is not provided.
-
+            First epoch of the computation. Required if ``epoch_array`` is not
+            provided. Defaults to ``None``.
         epoch_end : EpochArray, optional
-            The ending epoch for the range ratemeasurement computations.
-            Required if ``epoch_array`` is not provided.
-
-        tstep :float
-            The time step, in seconds, between consecutive range ratemeasurements
-            if ``epoch_array`` is not provided. Defaults to ``1`` second.
-
+            Last epoch of the computation. Required if ``epoch_array`` is not
+            provided. Defaults to ``None``.
+        tstep : float, optional
+            Time step between consecutive measurements, in seconds, when
+            ``epoch_array`` is not provided. Defaults to ``1``.
         frame : Frame, optional
-            The reference frame in which the range rate computation is performed.
-            Defaults to a J2000 Frame object.
+            Reference frame in which the relative states are computed. Defaults to
+            ``J2000``.
+        noisy : bool, optional
+            Whether to add white Gaussian noise with standard deviation
+            :attr:`sigma`. Defaults to ``False``.
 
-        noisy : bool
-            Indicates if noise is added to the computed range rate measurement. Defaults to ``False``.
+        Returns
+        -------
+        t1 : EpochArray
+            The computation epochs, returned for compatibility with the real
+            measurement models.
+        t2 : EpochArray
+            Same as ``t1``.
+        t3 : EpochArray
+            Same as ``t1``.
+        meas_AWF : ArrayWFrame
+            The DOR measurements, in seconds.
+
+        Raises
+        ------
+        ValueError
+            If neither ``epoch_array`` nor ``epoch_start`` and ``epoch_end`` are
+            provided.
+        RuntimeError
+            If the measurements do not all share one unit.
+        MissingPassIndexError
+            If the bias holds one value per pass (more than one element)
+            and no epoch-to-pass mapping is set.
+
+        Notes
+        -----
+        The station delta location and the bias are applied to the first station
+        only.
         """
         ## Input check
-        if epoch_array is None:
-            if epoch_start is None or epoch_end is None:
-                raise RuntimeError(
-                    "Please provide an EpochArray or provide start and end Epochs"
-                )
-            else:
-                _units = epoch_start.times.units
-                epoch_array = [
-                    EpochArray(ArrayWUnits(_t, _units), timeFrame=epoch_start.system)
-                    for _t in np.arange(
-                        epoch_start.times.values, epoch_end.times.values + tstep, tstep
-                    )
-                ]
+        epoch_array = Measurement._resolve_epoch_array(
+            epoch_array, epoch_start, epoch_end, tstep
+        )
 
         # Get AWU for speed-of-light constant
         c = constants.c
 
-        # Pull current bias + gs delta from state (if provided)
-        bias_awu = self._extract_dor_bias()  # ArrayWUnits or None
-        gs_delta_awf = self._extract_gs_delta_location()  # ArrayWFrame or None
+        # One bias for every pass, or one per pass.
+        _bias_full = self._extract_bias("dor_bias", km)
 
         ## Append measurements in a list at multiple epochs
         meas_list = []
         for epoch in epoch_array:
-            # NOTE: Missing handling of gs delta location and bias for the second station (if present).
-            # This is currently only implemented for the first station, but it should be extended to both stations if needed.
+            bias_awu = self._bias_at_epoch(_bias_full, epoch)
 
             # Generate the relative state between first GS and target
-            relative_state1 = SpiceManager.get_state(
-                trgt_bdy=target.name,
-                epoch_time=epoch.times.values,
-                reference_frame=frame.name,
-                obsvr_bdy=self.instrument.name,
-            )
+            relative_state1 = self._relative_state(target, epoch, frame)
             # Generate the relative state between second GS and target
-            relative_state2 = SpiceManager.get_state(
-                trgt_bdy=target.name,
-                epoch_time=epoch.times.values,
-                reference_frame=frame.name,
-                obsvr_bdy=self.station.name,
-            )
+            relative_state2 = self._relative_state(target, epoch, frame, self.station)
 
-            # Apply GS delta location if present: modify 3D relative position then take norm
-            if gs_delta_awf is not None:
-                A = SpiceManager.get_xfrm(
-                    frame_from=gs_delta_awf.frame.name,
-                    frame_to=frame.name,
-                    epoch=epoch.times.values,
-                )
-                delta_in_frame_vals = (
-                    A
-                    @ gs_delta_awf.quantity.values.reshape(
-                        3,
-                    )
-                ).reshape(
-                    3,
-                )
-                delta_in_frame = ArrayWUnits(
-                    delta_in_frame_vals, gs_delta_awf.quantity.units
-                )
-
-                # Update relative position in-place (relative_state is ArrayWUnits)
-                # Convention: r_rel = r_trg - r_obs, so observer correction enters with minus sign
-                relative_state1 = ArrayWUnits(
-                    np.hstack(
-                        [
-                            relative_state1[0:3].values - delta_in_frame.values,
-                            relative_state1[3:6].values,
-                        ]
-                    ),
-                    relative_state1.units,
-                )
-
-            # Get range measurements as AWU
             range1 = relative_state1[0:3].norm()
             range2 = relative_state2[0:3].norm()
             # Add range bias if requested
@@ -343,7 +288,9 @@ class DiffOneWayRangeIdeal(Measurement):
 
         References
         ----------
-        Tapley, B. D., Schutz, B. E., & Born, G. H. (2004). Statistical Orbit Determination. Elsevier Academic Press. ISBN 978-0-12-683630-1 (p. 161, eq. 4.2.6).
+        .. [1] Tapley, B. D., Schutz, B. E., & Born, G. H. (2004). *Statistical
+           Orbit Determination*. Elsevier Academic Press. ISBN
+           978-0-12-683630-1, p. 161, eq. 4.2.6.
         """
         range1 = relative_state_1[0:3].norm()
         range2 = relative_state_2[0:3].norm()
@@ -362,6 +309,36 @@ class DiffOneWayRangeIdeal(Measurement):
         ]
         return np.array(h_tilde)
 
+    def _leg_position_partials(
+        self, relative_state_1: ArrayWUnits, relative_state_2: ArrayWUnits
+    ) -> tuple:
+        """
+        Split the position partial into each station's own contribution.
+
+        :meth:`_compute_h_tilde_pos` returns the difference the observable
+        actually measures. A station parameter, though, moves one station only,
+        so its partial has to chain through that leg alone; a body-owned
+        Earth-orientation parameter moves both and the two blocks add.
+
+        Parameters
+        ----------
+        relative_state_1, relative_state_2 : ArrayWUnits
+            Relative states from station #1 and station #2 to the target.
+
+        Returns
+        -------
+        tuple of numpy.ndarray
+            The two ``(3,)`` contributions to the DOR partial with respect to
+            target position, in seconds per km, summing to the full partial.
+        """
+        c = constants.c
+        range1 = relative_state_1[0:3].norm()
+        range2 = relative_state_2[0:3].norm()
+        return (
+            np.array([(-(relative_state_1[i] / range1) / c).values for i in range(3)]),
+            np.array([((relative_state_2[i] / range2) / c).values for i in range(3)]),
+        )
+
     def _compute_h_tilde_vel(self) -> np.ndarray:
         """
         Generates the portion in the h_tilde matrix relative to the partial of the DOR measurement model
@@ -374,7 +351,9 @@ class DiffOneWayRangeIdeal(Measurement):
 
         References
         ----------
-        Tapley, B. D., Schutz, B. E., & Born, G. H. (2004). Statistical Orbit Determination. Elsevier Academic Press. ISBN 978-0-12-683630-1 (p. 161, eq. 4.2.6).
+        .. [1] Tapley, B. D., Schutz, B. E., & Born, G. H. (2004). *Statistical
+           Orbit Determination*. Elsevier Academic Press. ISBN
+           978-0-12-683630-1, p. 161, eq. 4.2.6.
         """
         h_tilde = [
             ArrayWUnits(0, None).values,
@@ -395,7 +374,9 @@ class DiffOneWayRangeIdeal(Measurement):
 
         References
         ----------
-        Tapley, B. D., Schutz, B. E., & Born, G. H. (2004). Statistical Orbit Determination. Elsevier Academic Press. ISBN 978-0-12-683630-1 (p. 161, eq. 4.2.6).
+        .. [1] Tapley, B. D., Schutz, B. E., & Born, G. H. (2004). *Statistical
+           Orbit Determination*. Elsevier Academic Press. ISBN
+           978-0-12-683630-1, p. 161, eq. 4.2.6.
         """
         h_tilde = [(ArrayWUnits(0, None)).values]
         return np.array(h_tilde)
@@ -425,9 +406,9 @@ class DiffOneWayRangeIdeal(Measurement):
 
         References
         ----------
-        Tapley, B. D.; Schutz, B. E.; Born, G. H. (2004).
-        *Statistical Orbit Determination*.
-        Elsevier Academic Press. ISBN 978-0-12-683630-1. Eq. 4.2.6.
+        .. [1] Tapley, B. D., Schutz, B. E., & Born, G. H. (2004). *Statistical
+           Orbit Determination*. Elsevier Academic Press. ISBN
+           978-0-12-683630-1, eq. 4.2.6.
         """
         range1 = relative_state_1[0:3].norm()
         c = constants.c
@@ -462,9 +443,9 @@ class DiffOneWayRangeIdeal(Measurement):
 
         References
         ----------
-        Tapley, B. D.; Schutz, B. E.; Born, G. H. (2004).
-        *Statistical Orbit Determination*.
-        Elsevier Academic Press. ISBN 978-0-12-683630-1. Eq. 4.2.6.
+        .. [1] Tapley, B. D., Schutz, B. E., & Born, G. H. (2004). *Statistical
+           Orbit Determination*. Elsevier Academic Press. ISBN
+           978-0-12-683630-1, eq. 4.2.6.
         """
         range2 = relative_state_2[0:3].norm()
         c = constants.c
@@ -496,9 +477,9 @@ class DiffOneWayRangeIdeal(Measurement):
 
         References
         ----------
-        Tapley, B. D.; Schutz, B. E.; Born, G. H. (2004).
-        *Statistical Orbit Determination*.
-        Elsevier Academic Press. ISBN 978-0-12-683630-1. Eq. 4.2.6.
+        .. [1] Tapley, B. D., Schutz, B. E., & Born, G. H. (2004). *Statistical
+           Orbit Determination*. Elsevier Academic Press. ISBN
+           978-0-12-683630-1, eq. 4.2.6.
         """
         c = constants.c
         h_tilde = [(-ArrayWUnits(1.0, None) / c).values]
@@ -516,7 +497,9 @@ class DiffOneWayRangeIdeal(Measurement):
 
         References
         ----------
-        Tapley, B. D., Schutz, B. E., & Born, G. H. (2004). Statistical Orbit Determination. Elsevier Academic Press. ISBN 978-0-12-683630-1 (p. 161, eq. 4.2.6).
+        .. [1] Tapley, B. D., Schutz, B. E., & Born, G. H. (2004). *Statistical
+           Orbit Determination*. Elsevier Academic Press. ISBN
+           978-0-12-683630-1, p. 161, eq. 4.2.6.
         """
         h_tilde = [0, 0, 0]
         return np.array(h_tilde)
@@ -546,56 +529,17 @@ class DiffOneWayRangeIdeal(Measurement):
         -------
         h_tilde : list
             The H-tilde array with all measurements _partials from this model by component.
+
+        Raises
+        ------
+        MissingPassIndexError
+            If the state holds a stacked per-pass bias for this station
+            (dimension > 1) and no epoch-to-pass mapping is set.
         """
-        # Pull current bias + gs delta from state (if provided)
-        gs_delta_awf = self._extract_gs_delta_location()  # ArrayWFrame or None
-
         # Generate the relative state between first GS and target
-        relative_state_1 = SpiceManager.get_state(
-            trgt_bdy=target.name,
-            epoch_time=epoch.times.values,
-            reference_frame=frame.name,
-            obsvr_bdy=self.instrument.name,
-        )
+        relative_state_1 = self._relative_state(target, epoch, frame)
 
-        # Apply GS delta location if present: modify 3D relative position then take norm
-        if gs_delta_awf is not None:
-            A = SpiceManager.get_xfrm(
-                frame_from=gs_delta_awf.frame.name,
-                frame_to=frame.name,
-                epoch=epoch.times.values,
-            )
-            delta_in_frame_vals = (
-                A
-                @ gs_delta_awf.quantity.values.reshape(
-                    3,
-                )
-            ).reshape(
-                3,
-            )
-            delta_in_frame = ArrayWUnits(
-                delta_in_frame_vals, gs_delta_awf.quantity.units
-            )
-
-            # Update relative position in-place (relative_state is ArrayWUnits)
-            # Convention: r_rel = r_trg - r_obs, so observer correction enters with minus sign
-            relative_state_1 = ArrayWUnits(
-                np.hstack(
-                    [
-                        relative_state_1[0:3].values - delta_in_frame.values,
-                        relative_state_1[3:6].values,
-                    ]
-                ),
-                relative_state_1.units,
-            )
-
-        # Generate the relative state between second GS and target
-        relative_state_2 = SpiceManager.get_state(
-            trgt_bdy=target.name,
-            epoch_time=epoch.times.values,
-            reference_frame=frame.name,
-            obsvr_bdy=self.station.name,
-        )
+        relative_state_2 = self._relative_state(target, epoch, frame, self.station)
 
         # Generate the dictionary of allowed StateVector component from the StateArray class
         state_allowed = StateDefinition._generate_allowed_state_dictionary()
@@ -639,40 +583,18 @@ class DiffOneWayRangeIdeal(Measurement):
                 elif state_allowed["eta_srp"][2].match(component):
                     # eta_srp
                     h_tilde.extend(self._compute_h_tilde_eta_srp())
-                elif state_allowed["gs_delta_location"][2].match(component):
-                    raise NotImplementedError(
-                        "DiffOneWayRangeIdeal: partials w.r.t. gs_delta_location have not "
-                        "been verified. The analytic formulas are implemented in "
-                        "_compute_h_tilde_gs1_delta_location / _compute_h_tilde_gs2_delta_location "
-                        "but must be validated before use in a filter."
+
+                elif state_allowed["dor_bias"][2].match(component):
+                    # The bias is a range on the first leg, so each slot
+                    # carries -1/c rather than 1.
+                    per_km = float(np.ravel(self._compute_h_tilde_dor_bias())[0])
+                    h_tilde.extend(
+                        per_km * np.asarray(
+                            self._bias_partials(
+                                component, component_def[1], comp_body, epoch
+                            )
+                        )
                     )
-                    # --- unverified implementation (kept for reference) ---
-                    # A_ei = SpiceManager.get_xfrm(
-                    #     frame_from="IAU_EARTH", frame_to="J2000", epoch=epoch.times.values,
-                    # )
-                    # if self.instrument.spice_id == comp_body.spice_id:
-                    #     # GS1: ddtau/dr_GS1 = +rhohat1/c
-                    #     h_from = self._compute_h_tilde_gs1_delta_location(relative_state_1)
-                    #     h_tilde.extend(h_from @ A_ei)
-                    # elif self._station is not None and self._station.spice_id == comp_body.spice_id:
-                    #     # GS2: ddtau/dr_GS2 = −rhohat2/c
-                    #     h_from = self._compute_h_tilde_gs2_delta_location(relative_state_2)
-                    #     h_tilde.extend(h_from @ A_ei)
-                    # else:
-                    #     h_tilde.extend([0.0, 0.0, 0.0])
-                elif "dor_bias" in state_allowed and state_allowed["dor_bias"][2].match(
-                    component
-                ):
-                    raise NotImplementedError(
-                        "DiffOneWayRangeIdeal: partials w.r.t. dor_bias have not been "
-                        "verified. The analytic formula is implemented in "
-                        "_compute_h_tilde_dor_bias but must be validated before use in a filter."
-                    )
-                    # --- unverified implementation (kept for reference) ---
-                    # if self.instrument.spice_id == comp_body.spice_id:
-                    #     h_tilde.extend(self._compute_h_tilde_dor_bias())
-                    # else:
-                    #     h_tilde.extend([0.0])
                 elif any(
                     state_allowed[key][2].match(component)
                     for key in state_allowed
@@ -680,6 +602,17 @@ class DiffOneWayRangeIdeal(Measurement):
                 ):
                     # dv maneuver (dv_man, dv_man1, dv_man2)
                     h_tilde.extend(self._compute_h_tilde_dv_man())
+                elif self._is_station_parameter(component):
+                    leg_1, leg_2 = self._leg_position_partials(
+                        relative_state_1, relative_state_2)
+                    h_tilde.extend(
+                        self._compute_h_tilde_station(
+                            component_def, epoch.times.values, frame,
+                            leg_1, station=self.instrument)[0]
+                        + self._compute_h_tilde_station(
+                            component_def, epoch.times.values, frame,
+                            leg_2, station=self.station)[0])
+
                 else:  # If the component is not above, we add zeros by default.
                     h_tilde.extend([0.0 for _ in range(component_def[1])])
         return h_tilde

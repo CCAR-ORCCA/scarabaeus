@@ -34,7 +34,7 @@
 - Estimating dynamical, measurement, and consider parameters
 - Performing maneuver planning and finite/impulsive burn modelling
 
-SCB interfaces with [NASA SPICE](https://naif.jpl.nasa.gov/naif/toolkit.html) for time, frame, and kernel management and ships a compiled **Rust** back-end for performance-critical integrators.
+SCB interfaces with [NASA SPICE](https://naif.jpl.nasa.gov/naif/toolkit.html) for time, frame, and kernel management and ships a compiled **Rust** back-end (`scarabaeus.rust`) for the integrator, the ephemeris cache and the gravity and SRP kernels.
 
 ---
 
@@ -61,14 +61,21 @@ SCB interfaces with [NASA SPICE](https://naif.jpl.nasa.gov/naif/toolkit.html) fo
 |---|---|
 | `PointMassGravity` | Two-body (Keplerian) gravitational acceleration |
 | `ThreeBodyGravity` | Third-body perturbation via SPICE ephemeris |
-| `SphericalHarmonicsGravity` | Gravity field up to arbitrary degree/order |
+| `SphericalHarmonicsGravity` *(Rust core)* | Gravity field up to arbitrary degree/order; several fields per spacecraft |
+| `PolyhedralGravity` *(Rust core)* | Constant-density polyhedral shape-model gravity, valid down to the surface |
 | `CannonballSRP` | Solar radiation pressure (cannonball model) |
-| `nPlateSRP` | Solar radiation pressure (N-plate model with CK-frame solar arrays) |
+| `nPlateSRP` *(Rust core)* | Solar radiation pressure (N-plate model with CK-frame solar arrays) |
+| `ThermalRadiation` | Thermal re-radiation recoil acceleration |
+| `AntennaRadiationPressure` | Recoil from the radiated antenna power |
 | `YarkovskyEffect` | Yarkovsky non-gravitational force |
 | `FirstOrderGaussMarkov` | First-order Gauss–Markov stochastic accelerations |
 | `PiecewiseFirstOrderGaussMarkov` | Piecewise Gauss–Markov accelerations |
+| `PiecewisePolynomialAcceleration` | Piecewise constant or linear empirical accelerations |
+| `FourierAcceleration` | Empirical accelerations as a Fourier series in time, argument of latitude or solar longitude |
 | `ImpulsiveBurn` | Instantaneous delta-v manoeuvres |
+| `SmoothedImpulsiveBurn` | Impulsive manoeuvre as a narrow smooth pulse, without splitting the trajectory |
 | `FiniteBurn` | Continuous thrust finite burn arcs |
+| `CustomDynamicModel` / `CustomParameter` | User-defined force models and solve-for parameters, written in a script |
 
 ### Integrators
 | Class | Description |
@@ -87,6 +94,9 @@ SCB interfaces with [NASA SPICE](https://naif.jpl.nasa.gov/naif/toolkit.html) fo
 | `DiffOneWayRangeIdeal` | Differential one-way range (DDOR) |
 | `AngularIdeal` | Right ascension / declination optical measurements |
 | `CentroidingIdeal` | Pixel-plane centroiding measurements |
+| `CustomMeasurement` | User-defined observable and Jacobian |
+
+`MeasurementScheduler` builds simulated tracking schedules; `MeasurementRegistry`, `MeasurementStream` and `MeasurementConfig` describe real data streams; `MediaCorrections`, `RampTableManager`, `SolidTide`, `PoleTide`, `OceanLoading` and `BodyOrientation` model the media, ramps, station displacements and Earth orientation of the real DSN observables.
 
 ### Orbit Determination
 | Class | Description |
@@ -96,9 +106,12 @@ SCB interfaces with [NASA SPICE](https://naif.jpl.nasa.gov/naif/toolkit.html) fo
 | `LKF` | Linearised Kalman Filter |
 | `LSB` | Least-squares batch estimator |
 | `MultiFilterOD` | Multi-arc OD over disjoint data windows |
+| `CustomFilter` | User-supplied estimator run on the library's residuals, partials and STMs |
 | `MeasurementEditing` | Outlier detection and data editing |
 | `StateNoiseCompensation` | SNC process noise formulation |
 | `DynamicalModelCompensation` | DMC process noise formulation |
+| `SolutionOD` | Saved OD solution with metadata, Keplerian covariance mapping |
+| `SolutionCloseness` | Statistical distance between OD solutions |
 
 ### Spacecraft & Environment
 - `Spacecraft`, `CelestialBody`, `GroundStation` body hierarchy
@@ -116,7 +129,9 @@ SCB interfaces with [NASA SPICE](https://naif.jpl.nasa.gov/naif/toolkit.html) fo
 - `OrbitalElements` — Cartesian ↔ Keplerian conversions
 - `Bplane` — B-plane targeting utilities
 - `Plotting` — styled matplotlib helpers
-- `DatabaseManager` — local / MongoDB data back-end
+- `EphemerisCache` *(Rust)* — Chebyshev ephemeris cache for third-body accelerations
+- `ShapeHarmonics` — spherical-harmonic coefficients of a polyhedral shape model
+- `Serialization` — JSON / pickle save and load helpers
 
 ---
 
@@ -137,11 +152,16 @@ scarabaeus/
 │   │   ├── timeAndFrame/         # EpochArray, Frame, ArrayWFrame, SpiceManager
 │   │   ├── uncertaintyQuantification/
 │   │   ├── units/                # Units, Dimensions, ArrayWUnits
-│   │   └── utils/                # Plotting, OrbitalElements, DatabaseManager, Utils
+│   │   └── utils/                # Plotting, OrbitalElements, EphemerisCache, Serialization, Utils
 │   └── scarabaeus_rust/          # Rust back-end (compiled via maturin / PyO3)
 │       └── src/
 │           ├── ias15.rs          # IAS15 integrator
 │           ├── integration_event.rs
+│           ├── ephemeris_cache.rs
+│           ├── spherical_harmonics.rs
+│           ├── nplate_srp.rs
+│           ├── polyhedron_gravity.rs
+│           ├── polyhedron_harmonics.rs
 │           └── lib.rs
 ├── tutorials/                    # Worked examples (basics → advanced)
 ├── tests/                        # pytest test suite
@@ -261,7 +281,7 @@ A tiered tutorial suite lives in [`tutorials/`](tutorials/) as Jupyter Notebooks
 |---|---|
 | [`basics_AWU_and_AWF.ipynb`](tutorials/basics_AWU_and_AWF.ipynb) | `ArrayWUnits` and `ArrayWFrame` — dimension-safe arithmetic and frame-attached arrays |
 | [`basics_EpochArray.ipynb`](tutorials/basics_EpochArray.ipynb) | Time representations and conversions (UTC, TDB, TT, SCLK) |
-| [`basics_SpiceManager_and_CelestialBodies.ipynb`](tutorials/basics_SpiceManager_and_CelestialBodies.ipynb) | Loading SPICE kernels, time/frame queries, and defining celestial bodies |
+| [`basics_SpiceManager_CelestialBody_Constants.ipynb`](tutorials/basics_SpiceManager_CelestialBody_Constants.ipynb) | Loading SPICE kernels, time/frame queries, and defining celestial bodies |
 
 ### Intermediate
 | Tutorial | Description |
@@ -287,18 +307,18 @@ A tiered tutorial suite lives in [`tutorials/`](tutorials/) as Jupyter Notebooks
 Scarabaeus ships a multi-tier pytest suite under [`tests/`](tests/):
 
 ```bash
-pytest tests/unit_testing/        # fast, isolated unit tests
-pytest tests/integration_testing/ # end-to-end scenarios
-pytest                            # full suite with coverage report
+pytest tests/python_tests/unit_testing/        # fast, isolated unit tests
+pytest tests/python_tests/integration_testing/ # end-to-end scenarios
+pytest                                          # full suite with coverage report
 ```
 
-Coverage and JUnit XML reports are written to `tests/reports/`.
+Coverage and JUnit XML reports are written to `tests/python_tests/reports/`.
 
 ---
 
 ## Contributing
 
-Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) and the [developer guide](https://ccar-orcca.github.io/scarabaeus-docs/dev_guide/dev_guide_frontpage.html) before opening a pull request.
+Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) and the [developer guide](https://ccar-orcca.github.io/scarabaeus-docs/development/development_frontpage.html) before opening a pull request.
 
 ### Reporting issues
 
@@ -306,11 +326,11 @@ Open a GitHub Issue and include: a short title, steps to reproduce (minimal work
 
 ### Submitting code
 
-1. Set up the [developer environment](#developer-installation).
-2. Branch from `develop` with a descriptive name, e.g. `feature/add-xyz` or `fix/filter-bug`.
+1. Fork the repository and set up the [developer environment](#developer-installation) on your fork.
+2. Branch from `main` with a descriptive name, e.g. `feature/add-xyz` or `fix/filter-bug`.
 3. Follow the **NumPy docstring convention** for all public API.
 4. Run the test suite and ensure all tests pass: `pytest`.
-5. Open a PR against the `develop` branch with a clear description of what changed and why. Reference related Issues (e.g. `Closes #42`).
+5. Open a PR against the `main` branch with a clear description of what changed and why. Reference related Issues (e.g. `Closes #42`).
 
 > Jupyter notebook outputs are stripped automatically by the `nbstripout` pre-commit hook — do not commit notebooks with cell outputs.
 
@@ -318,27 +338,18 @@ Open a GitHub Issue and include: a short title, steps to reproduce (minimal work
 
 ## Citing Scarabaeus
 
-If you use Scarabaeus in academic work, please cite the following conference paper:
-
-> McMahon J., Fereoli G., Wolf T., Ellis Z., Aldhanhani B., Kuleib M., Frank W., Pugliatti M., Almashjari M., Knittel J. (2026).
-> **Scarabaeus: An Open-Source Tool for Interplanetary Spacecraft Navigation.**
-> *30th International Symposium on Space Flight Dynamics (ISSFD)*, Toulouse, France, June 1–5, 2026. Organized by CNES.
+If you use Scarabaeus in academic work, please cite it as:
 
 ```bibtex
-@inproceedings{mcmahon2026scarabaeus,
-  author    = {McMahon, J. and Fereoli, G. and Wolf, T. and Ellis, Z. and
-               Aldhanhani, B. and Kuleib, M. and Frank, W. and Pugliatti, M. and
-               Almashjari, M. and Knittel, J.},
-  title     = {Scarabaeus: An Open-Source Tool for Interplanetary Spacecraft Navigation},
-  booktitle = {30th International Symposium on Space Flight Dynamics (ISSFD)},
-  year      = {2026},
-  address   = {Toulouse, France},
-  note      = {Organized by CNES. A formal DOI (Zenodo or JOSS) is forthcoming.},
-  url       = {https://www.researchgate.net/publication/404941039_Scarabaeus_An_Open-Source_Tool_for_Interplanetary_Spacecraft_Navigation},
+@software{scarabaeus2026,
+  author       = {ORCCA Lab, University of Colorado Boulder},
+  title        = {Scarabaeus: Open-source spacecraft navigation \& orbit determination framework},
+  year         = {2026},
+  version      = {2026.0.0},
+  url          = {https://ccar-orcca.github.io/scarabaeus-docs/},
+  license      = {ISC},
 }
 ```
-
-> **Note:** A formal DOI (Zenodo or JOSS) is forthcoming. When available, add a `doi:` field to [CITATION.cff](CITATION.cff) and update the `note` field in the BibTeX entry above.
 
 ---
 

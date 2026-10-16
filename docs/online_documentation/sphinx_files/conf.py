@@ -1,13 +1,13 @@
 # SPDX-FileCopyrightText: 2026 Orbital Research Cluster for Celestial Applications (ORCCA) Lab, University of Colorado at Boulder
 # SPDX-License-Identifier: ISC
-import sys, os, types
+import sys, os, re, types, inspect
 from pathlib import Path
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.abspath("../../.."), "src")))
 sys.path.insert(1, os.path.abspath(os.path.join(os.path.abspath("../../.."), "docs")))
 sys.path.append(os.path.abspath("sphinxext"))
 
-autodock_mock_imports = ["numpy", "inspect", "pkgutil", "pathlib", "importlib"]
+# autodoc_mock_imports = ["numpy", "inspect", "pkgutil", "pathlib", "importlib"]
 
 add_module_names = False
 
@@ -26,9 +26,9 @@ copyright = "2025, ORCCA Laboratory, University of Colorado Boulder"
 author = "ORCCA Laboratory, University of Colorado Boulder"
 
 # The short X.Y version
-version = ""
+version = "2.0"
 # The full version, including alpha/beta/rc tags
-release = ""
+release = "2.0.0"
 
 # -- General configuration ---------------------------------------------------
 
@@ -44,7 +44,6 @@ extensions = [
     "sphinx.ext.autodoc",
     "sphinx.ext.intersphinx",
     "sphinx.ext.autosummary",
-    "sphinx.ext.napoleon",
     "sphinx.ext.mathjax",
     "matplotlib.sphinxext.plot_directive",
     "nbsphinx",
@@ -72,8 +71,8 @@ nbsphinx_thumbnails = {
         '_images/_collections_tutorials_basics_AWU_and_AWF_22_0.png',
     '_collections/tutorials/basics_EpochArray':
         '_images/_collections_tutorials_basics_EpochArray_23_0.png',
-    '_collections/tutorials/basics_SpiceManager_and_CelestialBodies':
-        '_images/_collections_tutorials_basics_SpiceManager_and_CelestialBodies_17_1.png',
+    '_collections/tutorials/basics_SpiceManager_CelestialBody_Constants':
+        '_images/_collections_tutorials_basics_SpiceManager_CelestialBody_Constants_15_1.png',
     # intermediate
     '_collections/tutorials/intermediate_Propagator_and_Trajectory':
         '_images/_collections_tutorials_intermediate_Propagator_and_Trajectory_21_1.png',
@@ -83,13 +82,13 @@ nbsphinx_thumbnails = {
         '_images/_collections_tutorials_intermediate_Measurements_22_1.png',
     # advanced
     '_collections/tutorials/advanced_IdealMSR_BatchOD':
-        '_images/_collections_tutorials_advanced_IdealMSR_BatchOD_35_0.png',
+        '_images/_collections_tutorials_advanced_IdealMSR_BatchOD_34_1.png',
     '_collections/tutorials/advanced_IdealMSR_SequentialOD':
         '_images/_collections_tutorials_advanced_IdealMSR_SequentialOD_10_0.png',
     '_collections/tutorials/advanced_RealMSR_MediaCorrections':
         '_images/_collections_tutorials_advanced_RealMSR_MediaCorrections_9_0.png',
     '_collections/tutorials/advanced_RealMSR_OSIRIS_REx_OD':
-        '_images/_collections_tutorials_advanced_RealMSR_OSIRIS_REx_OD_14_0.png',
+        '_images/_collections_tutorials_advanced_RealMSR_OSIRIS_REx_OD_22_1.png',
 }
 
 from IPython.core.interactiveshell import InteractiveShell
@@ -102,16 +101,7 @@ collections = {'tutorial_notebooks' : {'driver': 'copy_folder',
                'template_class'     : {'driver': 'copy_file',
                                        'source': template_class_path,
                                        'target': 'TemplateClass.py'}}
-template_class_path = str(Path(__file__).parent.parent.parent / 'TemplateClass.py')
-collections = {'tutorial_notebooks' : {'driver': 'copy_folder',
-                                       'source': tutorials_path,
-                                       'target': 'tutorials'},
-               'template_class'     : {'driver': 'copy_file',
-                                       'source': template_class_path,
-                                       'target': 'TemplateClass.py'}}
 
-napoleon_use_param = True
-napoleon_preprocess_types = True
 # typehints_fully_qualified = False
 autosummary_generate = False
 
@@ -127,12 +117,12 @@ autodoc_member_order = "groupwise"
 autodoc_typehints = "signature"
 
 # make autodoc read the pyi stub instead of the compiled module
-_stub_path = Path(__file__).parent.parent.parent.parent / "src" / "scarabaeus" / "scarabaeus_rust.pyi"
-_mod = types.ModuleType("scarabaeus.scarabaeus_rust")
+_stub_path = Path(__file__).parent.parent.parent.parent / "src" / "scarabaeus" / "rust.pyi"
+_mod = types.ModuleType("scarabaeus.rust")
 _mod.__file__ = str(_stub_path)
 exec(compile(_stub_path.read_text(), _stub_path, "exec"), _mod.__dict__)
-sys.modules["scarabaeus.scarabaeus_rust"] = _mod
-sys.modules["scarabaeus_rust"] = _mod
+sys.modules["scarabaeus.rust"] = _mod
+sys.modules["rust"] = _mod
 
 # for constants table
 sys.path.insert(0, os.path.abspath('../../src'))
@@ -213,8 +203,50 @@ def generate_constants_table(app):
     with open(output_path, 'w') as f:
         f.write(output)
 
+# numpydoc puts every callable member in a class's "Methods" table, so the
+# nested exception classes showed up there as if they were methods
+from numpydoc.docscrape import ClassDoc
+
+_numpydoc_methods = ClassDoc.methods
+
+def _methods_without_classes(self):
+    return [name for name in _numpydoc_methods.fget(self)
+            if not inspect.isclass(getattr(self._cls, name, None))]
+
+ClassDoc.methods = property(_methods_without_classes)
+
+# "groupwise" ordering puts exceptions before everything else, so a class page
+# opened on a wall of nested exceptions; list them after the methods instead
+try:
+    from sphinx.ext.autodoc._property_types import _ClassDefProperties
+    _ClassDefProperties._groupwise_order_key = property(
+        lambda self: 90 if self.obj_type == 'exception' else 20)
+except (ImportError, AttributeError):  # Sphinx < 9
+    from sphinx.ext.autodoc import ExceptionDocumenter
+    ExceptionDocumenter.member_order = 90
+
+def _current_autodoc_class(app):
+    current = getattr(app.env, 'current_document', None)
+    if current is not None:
+        return current.autodoc_class
+    return app.env.temp_data.get('autodoc:class')
+
+def skip_inherited_nested_classes(app, what, name, obj, skip, options):
+    # with :inherited-members:, every nested exception also brings in
+    # args, with_traceback and add_note from BaseException
+    if what == 'exception' and hasattr(BaseException, name):
+        return True
+    # a nested class (the per-class exceptions, mostly) is documented on the
+    # class that defines it, not again on every subclass page
+    if inspect.isclass(obj) and '.' in getattr(obj, '__qualname__', ''):
+        documented = _current_autodoc_class(app)
+        if documented and obj.__qualname__.split('.')[0] != documented:
+            return True
+    return None
+
 def setup(app):
     app.connect('builder-inited', generate_constants_table)
+    app.connect('autodoc-skip-member', skip_inherited_nested_classes)
 
 # lets links to types from the specified libraries become clickable
 # see these links for more links with intersphinx
@@ -249,7 +281,10 @@ language = "en"
 # List of patterns, relative to source directory, that match files and
 # directories to ignore when looking for source files.
 # This pattern also affects html_static_path and html_extra_path.
-exclude_patterns = ["_build", "Thumbs.db", ".DS_Store"]
+# the override pages are copied into versions/ by release_gen.py, so building
+# them in place too would define every release-note label twice
+exclude_patterns = ["_build", "Thumbs.db", ".DS_Store",
+                    "release_notes/overridden_versions"]
 
 # The name of the Pygments (syntax highlighting) style to use.
 pygments_style = 'sphinx'
@@ -277,6 +312,19 @@ numpydoc_attributes_as_param_list = True
 numpydoc_use_plots = True
 numpydoc_class_members_toctree = False
 
+def _shows_inherited_members():
+    # numpydoc's Attributes/Methods tables link every inherited member, but a
+    # page without :inherited-members: doesn't document them, so the links went
+    # to whichever other class had a member of the same name
+    shown = {}
+    for page in Path(__file__).parent.glob('api_ref/**/*.rst'):
+        for match in re.finditer(r'^\.\. autoclass:: (\S+)\n((?:[ \t]+:.*\n?)*)',
+                                 page.read_text(), re.MULTILINE):
+            shown[match.group(1)] = ':inherited-members:' in match.group(2)
+    return shown
+
+numpydoc_show_inherited_class_members = _shows_inherited_members()
+
 # Theme options are theme-specific and customize the look and feel of a theme
 # further.  For a list of options available for each theme, see the
 # documentation.
@@ -288,6 +336,16 @@ html_theme_options = {
     "primary_sidebar_end": ["indices.html"],
     "logo": {"text": "Scarabaeus"},
     "header_links_before_dropdown": 6,
+    "external_links": [
+        {"name": "GitHub Repo", "url": "https://github.com/CCAR-ORCCA/scarabaeus"},
+    ],
+    "icon_links": [
+        {
+            "name": "GitHub",
+            "url": "https://github.com/CCAR-ORCCA/scarabaeus",
+            "icon": "fa-brands fa-github",
+        }
+    ]
 }
 
 html_context = {"default_mode": "dark"}
@@ -394,10 +452,6 @@ epub_exclude_files = ["search.html"]
 
 
 # -- Extension configuration -------------------------------------------------
-
-# extensions = [
-#    "sphinxcontrib.tikz",
-# ]
-
-# tikz_proc_suite = "pdf2svg"  # or 'dvisvgm', 'imagemagick', depending on your setup
-# tikz_use_preview = True
+plot_rcparams = {'backend': 'Agg'}
+plot_html_show_formats = False
+plot_working_directory = None
