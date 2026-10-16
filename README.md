@@ -10,7 +10,7 @@
 
 <p align="center">
   <b>Open-source spacecraft navigation & orbit determination framework</b><br>
-  Developed by the <a href="https://www.colorado.edu/aerospace/research/research-areas/space-exploration/orcca">Orbital Research Cluster for Celestial Applications (ORCCA)</a><br>
+  Developed by the <a href="https://www.colorado.edu/faculty/mcmahon/orcca">Orbital Research Cluster for Celestial Applications (ORCCA)</a><br>
   Colorado Center for Astrodynamics Research (CCAR) · University of Colorado Boulder
 </p>
 
@@ -30,7 +30,7 @@
 
 - Building and propagating spacecraft trajectories with multiple force models
 - Simulating or ingesting radiometric and optical measurements
-- Running sequential and batch OD filters (SRIF, LKF, LSB, …)
+- Running sequential and batch OD filters (LKF, SRIF, LSB, SRIFB, …) and sampling their posteriors with MCMC
 - Estimating dynamical, measurement, and consider parameters
 - Performing maneuver planning and finite/impulsive burn modelling
 
@@ -77,61 +77,79 @@ SCB interfaces with [NASA SPICE](https://naif.jpl.nasa.gov/naif/toolkit.html) fo
 | `FiniteBurn` | Continuous thrust finite burn arcs |
 | `CustomDynamicModel` / `CustomParameter` | User-defined force models and solve-for parameters, written in a script |
 
+`ForceModelTranslation` assembles the models above for one spacecraft and is what `Propagator` takes as `force_models`. `DynamicModel` and `ForceModel` are their abstract base classes, and `DynamicalUtils` holds the attitude and component-frame geometry they share. `Maneuver` and `ManeuverParser` describe finite burns as time polynomials of thrust, mass flow and pointing. `ForceModelRotation` (attitude dynamics) is a placeholder and not implemented yet.
+
 ### Integrators
-| Class | Description |
+Selected with `Propagator(..., integrator=...)`:
+
+| `integrator` | Description |
 |---|---|
-| `IAS15` *(Rust)* | Implicit adaptive 15th-order integrator (Rein & Spiegel 2015) |
-| `DOP853` | Dormand–Prince 8(5,3) via SciPy |
+| `"DOP853"` (default) | Dormand–Prince 8(5,3) via SciPy `solve_ivp`, with the state transition matrix |
+| `"IAS15"` *(Rust)* | Implicit adaptive 15th-order integrator (Rein & Spiegel 2015); state only, so pass `propagate_STM=False` |
 
 ### Measurement Models
 | Class | Type |
 |---|---|
-| `RangeIdeal` | Two-way range (ideal/simulated) |
-| `RangeRateIdeal` | Two-way range rate (ideal/simulated) |
-| `DopplerIdeal` | Doppler range rate (ideal/simulated) |
+| `RangeIdeal` | Range (geometric, no light time or media) |
+| `RangeRateIdeal` | Line-of-sight range rate (geometric, no light time or media) |
+| `DopplerIdeal` | Two- and three-way Doppler shift (no light time or media) |
 | `DopplerReal` | Doppler from real DSN tracking data |
 | `SequentialRangingReal` | Sequential ranging from real DSN tracking data |
-| `DiffOneWayRangeIdeal` | Differential one-way range (DDOR) |
+| `DiffOneWayRangeIdeal` | Differential one-way range (DOR) between two stations |
 | `AngularIdeal` | Right ascension / declination optical measurements |
 | `CentroidingIdeal` | Pixel-plane centroiding measurements |
 | `CustomMeasurement` | User-defined observable and Jacobian |
 
-`MeasurementScheduler` builds simulated tracking schedules; `MeasurementRegistry`, `MeasurementStream` and `MeasurementConfig` describe real data streams; `MediaCorrections`, `RampTableManager`, `SolidTide`, `PoleTide`, `OceanLoading` and `BodyOrientation` model the media, ramps, station displacements and Earth orientation of the real DSN observables.
+`Measurement` is the base class of every model above. `MeasurementScheduler` builds simulated tracking schedules. `MeasurementRegistry` (with `MeasurementType`), `MeasurementStream` and `MeasurementConfig` describe real data streams, which are read into `ObsData`. `MeasurementSpec` and `MeasurementDataSet` package the measurements for the filters, and `OpNavManager` is the pinhole projection the optical models share. `MediaCorrections`, `RampTableManager`, `SolidTide`, `PoleTide`, `OceanLoading` and `BodyOrientation` model the media, ramps, station displacements and Earth orientation of the real DSN observables.
 
 ### Orbit Determination
 | Class | Description |
 |---|---|
-| `SRIF` | Square Root Information Filter (forward pass) |
-| `SRIFB` | Square Root Information Filter (smoother / backward pass) |
-| `LKF` | Linearised Kalman Filter |
-| `LSB` | Least-squares batch estimator |
-| `MultiFilterOD` | Multi-arc OD over disjoint data windows |
+| `LKF` | Linearised Kalman Filter (sequential), with a Rauch–Tung–Striebel smoother |
+| `SRIF` | Square Root Information Filter (sequential), with a Bierman–Thornton backward smoother |
+| `LSB` | Weighted least-squares batch estimator |
+| `SRIFB` | Square Root Information Filter in batch form (no process noise) |
+| `MCMC` | Markov chain Monte Carlo sampling (`emcee`) of the posterior about a converged filter solution |
+| `MultiFilterOD` | Multi-arc OD combining independent filters, each with its own propagator, data and settings |
 | `CustomFilter` | User-supplied estimator run on the library's residuals, partials and STMs |
-| `MeasurementEditing` | Outlier detection and data editing |
-| `StateNoiseCompensation` | SNC process noise formulation |
-| `DynamicalModelCompensation` | DMC process noise formulation |
-| `SolutionOD` | Saved OD solution with metadata, Keplerian covariance mapping |
+| `MeasurementEditing` | Outlier editing: lasso selection, chi-squared, kurtosis, date ranges, isolation forest |
+| `StateNoiseCompensation` | SNC process noise |
+| `DynamicalModelCompensation` | DMC process noise |
+| `SolutionOD` | OD solution with metadata, saved to JSON, with Keplerian covariance mapping |
 | `SolutionCloseness` | Statistical distance between OD solutions |
 
+`FilterOD` is the base class of the filters. A run is configured with `FilterSettings` (a-priori covariance, process noise, measurement noise, editing and output), `ProcessNoiseSettings` and `OutputSettings`. `ProcessNoise` is the base class of SNC and DMC, `FilterDataManager` combines and edits the measurement data sets, and `UtilsOD` holds static helpers for comparing and merging solutions.
+
+### Uncertainty Quantification
+- `CovarianceMatrix` — covariance with units, standard deviations and correlations
+- `MonteCarloSamples` — weighted sample clouds with their moments, percentiles and effective sample size
+- `UncertaintyQuantification` — common base class of the two
+
 ### Spacecraft & Environment
-- `Spacecraft`, `CelestialBody`, `GroundStation` body hierarchy
+- `Body` — base class of `Spacecraft`, `CelestialBody` and `GroundStation`
 - `nPlateModel` — N-plate geometry with static and CK-frame (rotating) panels
-- `Camera`, `Antenna` instrument classes
-- `MissionSequence` — chained propagation / manoeuvre / OD arcs
+- `Instrument` — base class of the `Camera` and `Antenna` instruments; `Actuator` for thrusting components
+- `StateDefinition` / `StateArray` — build and hold the estimation state vector
+- `Propagator` — numerical propagation of the state and STM under a set of force models
+- `MissionSequence` — trajectory legs joined at nodes, with impulsive burns at the nodes; `ScenarioSetup` propagates it leg by leg
 - `Trajectory` — post-processing and visualisation of propagated states
-- `Propagator` — configurable propagator wrapping any force model
 
 ### Utilities
-- `ArrayWUnits` / `Units` — dimension-safe arithmetic with full unit tracking
-- `ArrayWFrame` — arrays with attached reference frames
+- `ArrayWUnits` / `Units` / `Dimensions` — dimension-safe arithmetic with full unit tracking
+- `Frame` / `ArrayWFrame` — SPICE reference frames and arrays attached to them
 - `EpochArray` — time object supporting UTC, TDB, TT, SCLK conversions
 - `SpiceManager` — unified SPICE wrapper (kernels, frames, ephemeris queries)
+- `Constants` — physical and planetary constants
 - `OrbitalElements` — Cartesian ↔ Keplerian conversions
 - `Bplane` — B-plane targeting utilities
+- `Noise` — Gaussian noise for simulated measurements
+- `SCBPolynomial` — polynomials for time-varying scalar profiles
+- `CustomCallable` — keyword-checked user functions behind the `Custom*` classes
 - `Plotting` — styled matplotlib helpers
 - `EphemerisCache` *(Rust)* — Chebyshev ephemeris cache for third-body accelerations
 - `ShapeHarmonics` — spherical-harmonic coefficients of a polyhedral shape model
 - `Serialization` — JSON / pickle save and load helpers
+- `Utils` — general array and file helpers
 
 ---
 
@@ -141,18 +159,18 @@ SCB interfaces with [NASA SPICE](https://naif.jpl.nasa.gov/naif/toolkit.html) fo
 scarabaeus/
 ├── src/
 │   ├── scarabaeus/               # Python front-end
-│   │   ├── body/                 # Body, CelestialBody, GroundStation
-│   │   ├── dynamics/             # Force models and burn models
-│   │   ├── environment/          # Propagator, StateArray, Trajectory, MissionSequence
+│   │   ├── body/                 # Body, CelestialBody, GroundStation, station tides and ocean loading
+│   │   ├── dynamics/             # Force models, burn models, ForceModelTranslation
+│   │   ├── environment/          # Propagator, StateDefinition, StateArray, Trajectory, MissionSequence, ScenarioSetup
 │   │   ├── finiteBurn/           # Maneuver, ManeuverParser
 │   │   ├── guidance/             # B-plane targeting
-│   │   ├── measurements/         # Measurement model classes
-│   │   ├── orbitDetermination/   # Filter classes (SRIF, LKF, LSB, …)
-│   │   ├── spacecraft/           # Spacecraft, Instrument, Camera, Antenna, nPlateModel
-│   │   ├── timeAndFrame/         # EpochArray, Frame, ArrayWFrame, SpiceManager
-│   │   ├── uncertaintyQuantification/
+│   │   ├── measurements/         # Measurement models, scheduling, real data streams, media corrections
+│   │   ├── orbitDetermination/   # Filters (LKF, SRIF, LSB, SRIFB, MCMC, …), process noise, solutions
+│   │   ├── spacecraft/           # Spacecraft, Instrument, Camera, Antenna, Actuator, nPlateModel
+│   │   ├── timeAndFrame/         # EpochArray, Frame, ArrayWFrame, SpiceManager, BodyOrientation
+│   │   ├── uncertaintyQuantification/  # CovarianceMatrix, MonteCarloSamples
 │   │   ├── units/                # Units, Dimensions, ArrayWUnits
-│   │   └── utils/                # Plotting, OrbitalElements, EphemerisCache, Serialization, Utils
+│   │   └── utils/                # Constants, Plotting, OrbitalElements, EphemerisCache, ShapeHarmonics, SolutionCloseness, Serialization, Utils
 │   └── scarabaeus_rust/          # Rust back-end (compiled via maturin / PyO3)
 │       └── src/
 │           ├── ias15.rs          # IAS15 integrator
@@ -175,25 +193,23 @@ scarabaeus/
 
 ## Requirements
 
-| Dependency | Version | Notes |
+| Dependency | Minimum | Used for |
 |---|---|---|
-| Python | 3.11+ | |
-| Rust / Cargo | 1.75+ | developer build only |
-| NumPy | latest | |
-| SciPy | latest | |
-| SpiceyPy | latest | SPICE toolkit Python bindings |
-| matplotlib | latest | |
-| pandas | latest | |
-| scikit-learn | latest | |
-| trimesh | latest | mesh geometry (N-plate model) |
-| autograd | latest | automatic differentiation |
-| tqdm | latest | progress bars |
-| pymongo / ssh\_pymongo | latest | optional MongoDB data back-end |
-| ipykernel / ipympl | latest | Jupyter notebook support |
+| Python | 3.11.9 | |
+| Rust (rustup) | 1.85 | compiling the Rust back-end, which `pip install` does (the crate uses the 2024 edition) |
+| NumPy / SciPy | | arrays, linear algebra, DOP853 integration |
+| SpiceyPy | | SPICE toolkit Python bindings |
+| pyerfa | 2.0 | Earth orientation (ERFA routines) |
+| autograd | | automatic differentiation |
+| scikit-learn | | isolation-forest measurement editing |
+| emcee / corner | | MCMC sampling and its corner plots |
+| matplotlib / mpld3 | | plotting |
+| tqdm | | progress bars |
+| ipykernel / ipympl | | Jupyter notebook support |
 
-> **pip version** — the developer install uses `--group dev` syntax, which requires **pip ≥ 25**. Run `pip install --upgrade pip` if you encounter an error.
+Only Python and Rust have to be installed beforehand: pip installs the Python packages, and the rest of the list in [`pyproject.toml`](pyproject.toml), automatically.
 
-Full dependency list is in [`pyproject.toml`](pyproject.toml).
+> **pip version** — the developer install uses `--group dev` syntax, which requires **pip ≥ 25.1**. Run `pip install --upgrade pip` if you encounter an error.
 
 ---
 
@@ -201,14 +217,22 @@ Full dependency list is in [`pyproject.toml`](pyproject.toml).
 
 ### User Installation
 
-#### 1. Clone the repository
+#### 1. Install Rust
+
+pip compiles the Rust back-end while it installs Scarabaeus, so Rust 1.85 or newer is needed. Follow the [rustup installer](https://rustup.rs/) instructions, then verify:
+
+```bash
+rustc --version
+```
+
+#### 2. Clone the repository
 
 ```bash
 git clone https://github.com/ccar-orcca/scarabaeus.git
 cd scarabaeus
 ```
 
-#### 2. Create a virtual environment
+#### 3. Create a virtual environment
 
 ```bash
 python -m venv .venv
@@ -218,17 +242,13 @@ source .venv/bin/activate
 .venv\Scripts\activate
 ```
 
-#### 3. Install Scarabaeus
+#### 4. Install Scarabaeus
 
 ```bash
 pip install .
 ```
 
-Or, once the package is published on PyPI:
-
-```bash
-pip install scarabaeus
-```
+Scarabaeus is not published on PyPI yet, so it is installed from the clone.
 
 > **SPICE kernels** — SCB relies on SPICE kernels for ephemeris, frame, and spacecraft clock data. These are not distributed with the package. Load them in your script using `scb.SpiceManager.load_kernel_from_mkfile(path_to_metakernel)`.
 
@@ -240,29 +260,21 @@ pip install scarabaeus
 
 #### 1. Follow the user installation steps above
 
-#### 2. Install the developer extras
+#### 2. Install in editable mode with the developer extras
 
 ```bash
 pip install -e . --group dev
 ```
 
-#### 3. Install Rust
-
-Follow the [rustup installer](https://rustup.rs/) instructions, then verify:
-
-```bash
-rustc --version
-```
-
-#### 4. Build the Rust back-end
+#### 3. Rebuild the Rust back-end after Rust changes
 
 ```bash
 maturin develop
 ```
 
-This compiles the Rust code and binds it to the Python package. Re-run whenever Rust source files change.
+This recompiles the Rust code and binds it to the Python package. Re-run it whenever Rust source files change.
 
-#### 5. Install commit hooks
+#### 4. Install commit hooks
 
 ```bash
 pre-commit install
@@ -297,8 +309,8 @@ A tiered tutorial suite lives in [`tutorials/`](tutorials/) as Jupyter Notebooks
 |---|---|
 | [`advanced_IdealMSR_BatchOD.ipynb`](tutorials/advanced_IdealMSR_BatchOD.ipynb) | End-to-end batch OD (LSB, SRIFB) with simulated measurements, process noise, and measurement editing |
 | [`advanced_IdealMSR_SequentialOD.ipynb`](tutorials/advanced_IdealMSR_SequentialOD.ipynb) | Sequential OD (LKF, SRIF, RTS smoother) with SNC/DMC process noise and consider parameters |
-| [`advanced_RealMSR_MediaCorrections.ipynb`](tutorials/advanced_RealMSR_MediaCorrections.ipynb) | OSIRIS-REx Pt 2 — tropospheric/ionospheric media corrections and DSN ramp table management |
-| [`advanced_RealMSR_OSIRIS_REx_OD.ipynb`](tutorials/advanced_RealMSR_OSIRIS_REx_OD.ipynb) | OSIRIS-REx OD with real DSN radiometric tracking data |
+| [`advanced_RealMSR_MediaCorrections.ipynb`](tutorials/advanced_RealMSR_MediaCorrections.ipynb) | OSIRIS-REx real data — tropospheric/ionospheric media corrections and DSN ramp table management |
+| [`advanced_RealMSR_OSIRIS_REx_OD.ipynb`](tutorials/advanced_RealMSR_OSIRIS_REx_OD.ipynb) | OSIRIS-REx two-pass batch OD with real DSN radiometric tracking data |
 
 ---
 
@@ -338,16 +350,17 @@ Open a GitHub Issue and include: a short title, steps to reproduce (minimal work
 
 ## Citing Scarabaeus
 
-If you use Scarabaeus in academic work, please cite it as:
+If you use Scarabaeus in academic work, please cite the paper:
 
 ```bibtex
-@software{scarabaeus2026,
-  author       = {ORCCA Lab, University of Colorado Boulder},
-  title        = {Scarabaeus: Open-source spacecraft navigation \& orbit determination framework},
-  year         = {2026},
-  version      = {2026.0.0},
-  url          = {https://ccar-orcca.github.io/scarabaeus-docs/},
-  license      = {ISC},
+@inproceedings{scarabaeus2026,
+  author    = {McMahon, J. and Fereoli, G. and Wolf, T. and Ellis, Z. and Aldhanhani, B. and Kuleib, M. and Frank, W. and Pugliatti, M. and Almashjari, M. and Knittel, J.},
+  title     = {Scarabaeus: An Open-Source Tool for Interplanetary Spacecraft Navigation},
+  booktitle = {30th International Symposium on Space Flight Dynamics (ISSFD)},
+  address   = {Toulouse, France},
+  month     = jun,
+  year      = {2026},
+  url       = {https://www.researchgate.net/publication/404941039_Scarabaeus_An_Open-Source_Tool_for_Interplanetary_Spacecraft_Navigation},
 }
 ```
 
@@ -357,4 +370,4 @@ If you use Scarabaeus in academic work, please cite it as:
 
 Scarabaeus is distributed under the [ISC License](LICENSE).
 
-Copyright (c) 2026 CCAR-ORCCA, University of Colorado Boulder.
+Copyright (c) 2026, Orbital Research Cluster for Celestial Applications (ORCCA) Lab, University of Colorado at Boulder.
