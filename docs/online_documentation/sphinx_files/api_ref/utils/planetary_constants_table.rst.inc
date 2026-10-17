@@ -8,27 +8,57 @@ Physical Constants
    * - Name
      - Value
      - Units
+   * - ``DOPPLER_COUNT_INTERVAL_DEFAULT``
+     - 60.0
+     - sec
    * - ``G``
      - 6.6743e-20
      - km^3/(kg*sec^2)
    * - ``L_tilde_GR``
      - 1.480827e-08
      - unitless
+   * - ``PASS_GAP_DEFAULT``
+     - 21600.0
+     - sec
+   * - ``RAMP_MARGIN_DEFAULT``
+     - 3600.0
+     - sec
+   * - ``RAMP_RATE_DEFAULT``
+     - 0.2826
+     - sec^-2
+   * - ``RCV_TIME_TAG_DELAY_DEFAULT``
+     - 0.0008
+     - sec
+   * - ``SCHEDULE_EDGE_TOLERANCE``
+     - 0.01
+     - sec
    * - ``Stefan_Boltzmann``
      - 5.670374419e-08
      - kg/sec^3
+   * - ``TT_minus_TAI``
+     - 32.184
+     - sec
    * - ``c``
      - 299792.458
      - km/sec
+   * - ``earth_rotation_rate``
+     - 7.292115e-05
+     - Hz
    * - ``gamma_GR``
      - 1.0
      - unitless
+   * - ``omega_Earth``
+     - 7.292115e-05
+     - rad/sec
    * - ``srp_constant1``
      - 102115339416981.84
      - (kg*km)/sec^2
    * - ``srp_constant2``
      - 101979437570000.0
      - (kg*km)/sec^2
+   * - ``zero_Celsius``
+     - 273.15
+     - unitless
 
 Major Bodies
 ^^^^^^^^^^^^^

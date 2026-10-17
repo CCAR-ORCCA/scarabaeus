@@ -11,8 +11,6 @@ import sys
 
 if sys.version_info >= (3, 11):
     from typing import Self
-else:
-    from typing_extensions import Self
 
 # define units
 unitless = Units.get_units("unitless")
@@ -120,6 +118,18 @@ class Frame:
     # region Methods
     def __repr__(self):
         return f"{self._name} ({self._origin} - {self._origin_name})"
+
+    def __eq__(self, other) -> bool:
+        """ Two frames are equal when SPICE resolves them to the same frame ID,
+            so separately built ``Frame('J2000')`` objects can be combined in
+            :class:`~scarabaeus.ArrayWFrame` arithmetic.
+        """
+        if not isinstance(other, Frame):
+            return NotImplemented
+        return self._frame_id == other._frame_id
+
+    def __hash__(self) -> int:
+        return hash(self._frame_id)
 
     def disp_properties(self) -> None:
         """ Displays the frame object properties. """
@@ -267,23 +277,22 @@ class Frame:
     def get_transformation(
         source_frame: Self, target_frame: Self, epoch: EpochArray
     ) -> ArrayWUnits:
-        """ Get 4x4 transformation matrix that combine rotation and translation between
-            source and target frames at a given epoch.
-            Parameters
-            ----------
-            source_frame : Frame
-                The source frame which the transformation matrix needs to be computed from.
+        """Get the (4, 4) transformation matrix that combines rotation and
+        translation between the source and target frames at a given epoch.
 
-            target_frame : Frame
-                The target frame which the transformation matrix needs to be computed to.
+        Parameters
+        ----------
+        source_frame : Frame
+            The source frame which the transformation matrix needs to be computed from.
+        target_frame : Frame
+            The target frame which the transformation matrix needs to be computed to.
+        epoch : EpochArray
+            The ephemeris time at which the transformation holds.
 
-            epoch : EpochArray
-                The ephemeris time at which the transformation holds.
-
-            Returns
-            -------
-            T : ArrayWUnits
-                The requested (4x4) transformation matrix T.
+        Returns
+        -------
+        T : ArrayWUnits
+            The requested (4, 4) transformation matrix T.
         """
         if epoch.system != "TDB":
             raise ValueError("Epoch array must be in TDB (ephemeris time)")

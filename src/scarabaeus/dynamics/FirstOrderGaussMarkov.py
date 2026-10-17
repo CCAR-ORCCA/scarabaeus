@@ -7,6 +7,7 @@ from scarabaeus import (
     Spacecraft,
     Frame,
     DynamicModel,
+    DynamicalUtils,
 )
 import scarabaeus.utils.NumpyWrapper as np
 
@@ -24,7 +25,10 @@ class FirstOrderGaussMarkov(DynamicModel):
     where :math:`\\mathbf{B} = \\mathrm{diag}(\\beta_x, \\beta_y, \\beta_z)`
     with :math:`\\beta_i = 1/\\tau_i` being the inverse correlation times.
     The spacecraft translational dynamics become
-    :math:`\\ddot{\\mathbf{r}} = \\mathbf{a}_{\\mathrm{other}} + \\mathbf{a}_{gm}`.
+    :math:`\\ddot{\\mathbf{r}} = \\mathbf{a}_{\\mathrm{other}} +
+    \\mathbf T\\,\\mathbf{a}_{gm}`, where :math:`\\mathbf T` rotates the
+    frame the components are expressed in (``frame``) into the propagation
+    frame.
     The :math:`\\beta_i` can be estimated as static parameters via
     ``("beta_fogm", spice_id)`` state entries.
 
@@ -46,10 +50,9 @@ class FirstOrderGaussMarkov(DynamicModel):
 
     Parameters
     ----------
-    state_array : StateArray
-        State definition containing the ``a_fogm`` Gauss-Markov acceleration
-        state and, optionally, the ``beta_fogm`` inverse correlation
-        coefficients.
+    origin : Body
+        Propagation origin. ``a_fogm`` and ``beta_fogm`` are read from the
+        propagated state at evaluation time.
     spacecraft : Spacecraft
         Spacecraft object associated with the propagated body.
     base_frame : Frame
@@ -59,6 +62,24 @@ class FirstOrderGaussMarkov(DynamicModel):
         :math:`[\\beta_x, \\beta_y, \\beta_z]` in 1/TU.  Used when
         ``beta_fogm`` is not found in the state array.  Defaults to
         isotropic unit decay ``[1, 1, 1]``.
+    frame : str, optional
+        Frame the components of :math:`\\mathbf a_{gm}` (and of
+        :math:`\\boldsymbol\\beta`) are expressed in: ``"inertial"`` (the
+        propagation frame, the default), ``"RTN"`` (radial / along-track /
+        cross-track, the RTN triad) or ``"body_fixed"``.
+    body_fixed_frame : str or Frame, optional
+        Frame the components are expressed in, for ``frame="body_fixed"``
+        (for example ``'IAU_BENNU'``).
+    relative_body : str or Body, optional
+        Body the RTN triad is built about, when that is not the propagation
+        origin. Defaults to the propagation origin.
+
+    See Also
+    --------
+    scarabaeus.StateArray : State vector used to initialize the model.
+    scarabaeus.Propagator : Propagator that integrates the augmented state.
+    scarabaeus.DynamicModel : Abstract base class for all force model components.
+    scarabaeus.PiecewiseFirstOrderGaussMarkov : Batch-segmented variant of this model.
 
     Notes
     -----
@@ -70,22 +91,25 @@ class FirstOrderGaussMarkov(DynamicModel):
 
     - ``('beta_fogm', 3, 'estimated', 'static', owner, value)``
 
+    The Gauss-Markov state lives in the chosen frame: in ``"RTN"`` its three
+    components are radial, along-track and cross-track, each with its own
+    correlation time, and the drift :math:`-\\mathbf B\\,\\mathbf a_{gm}`
+    acts on those components. Only the applied acceleration
+    :math:`\\mathbf T\\,\\mathbf a_{gm}` is rotated, so
+    :math:`\\partial \\mathbf a / \\partial \\mathbf a_{gm} = \\mathbf T`.
+    The RTN triad is built from the state, which adds the position and
+    velocity partials :meth:`~scarabaeus.DynamicalUtils.frame_partials` returns;
+    the inertial and body-fixed rotations depend on the epoch alone.
+
     The model is linear in :math:`\\mathbf a_{gm}` for fixed :math:`\\mathbf B`.
     If process noise is needed in a filter, this class provides the deterministic
     drift and Jacobians; the user should inject the corresponding process noise
     covariance separately.
 
-    See Also
-    --------
-    scarabaeus.StateArray : State vector used to initialize the model.
-    scarabaeus.Propagator : Propagator that integrates the augmented state.
-    scarabaeus.DynamicModel : Abstract base class for all force model components.
-    scarabaeus.PiecewiseFirstOrderGaussMarkov : Batch-segmented variant of this model.
-
     References
     ----------
-    Maybeck, P. S. (1979). Stochastic Models, Estimation, and Control.
-    Brown, R. G., & Hwang, P. Y. C. (2012). Introduction to Random Signals and Applied Kalman Filtering.
+    .. [1] Maybeck, P. S. (1979). Stochastic Models, Estimation, and Control.
+    .. [2] Brown, R. G., & Hwang, P. Y. C. (2012). Introduction to Random Signals and Applied Kalman Filtering.
 
     Examples
     --------
@@ -108,7 +132,7 @@ class FirstOrderGaussMarkov(DynamicModel):
         )
 
         gm_model = FirstOrderGaussMarkov(
-            state_array=state_vector,
+            origin=state_vector.origin,
             spacecraft=sc,
             base_frame="J2000",
         )
@@ -116,15 +140,23 @@ class FirstOrderGaussMarkov(DynamicModel):
 
     def __init__(
         self,
-        state_array: StateArray,
+        origin: Body,
         spacecraft: Spacecraft,
         base_frame: Frame,
         default_beta: np.ndarray | None = None,
+        frame: str = "inertial",
+        body_fixed_frame=None,
+        relative_body=None,
     ):
-        self._origin = state_array.origin
+        self._origin = origin
         self._origin_name = self._origin.name
         self._spacecraft = spacecraft
         self._ref_frame = base_frame
+        self._frame, self._body_fixed_frame, self._relative_body = (
+            DynamicalUtils.resolve_frame(frame, body_fixed_frame, relative_body)
+        )
+        # Per-epoch SPICE lookups of the frame, kept by DynamicalUtils.
+        self._frame_memo = {}
 
         self._beta_map: dict[int, np.ndarray] = {}
         self._a0_map: dict[int, np.ndarray] = {}
@@ -135,7 +167,6 @@ class FirstOrderGaussMarkov(DynamicModel):
             else np.ones(3, dtype=float)
         )
 
-        self._initialize_maps(state_array)
 
     @property
     def origin(self) -> Body:
@@ -153,6 +184,32 @@ class FirstOrderGaussMarkov(DynamicModel):
         return self._ref_frame
 
     @property
+    def frame(self) -> str:
+        """Frame the Gauss-Markov components are expressed in."""
+        return self._frame
+
+    @property
+    def body_fixed_frame(self) -> str | None:
+        """Body-fixed frame the components are expressed in, if any."""
+        return self._body_fixed_frame
+
+    @property
+    def relative_body(self) -> str | None:
+        """Body the RTN triad is referred to, if any."""
+        return self._relative_body
+
+    @property
+    def depends_on_velocity(self) -> bool:
+        """
+        Whether the applied acceleration is a function of velocity.
+
+        True for the RTN frame, whose triad is built from the velocity. The
+        force model reads this to decide whether a
+        :math:`\\partial \\mathbf a / \\partial \\mathbf v` block is needed.
+        """
+        return self._frame == "RTN"
+
+    @property
     def default_beta(self) -> np.ndarray:
         """Default inverse correlation coefficients used when not specified in state."""
         return self._default_beta
@@ -161,44 +218,6 @@ class FirstOrderGaussMarkov(DynamicModel):
     def default_beta(self, input_val):
         """Set the default inverse correlation coefficients."""
         self._default_beta = input_val
-
-    def _initialize_maps(self, state_array: StateArray) -> None:
-        """
-        Scan the StateArray and cache initial GM acceleration and beta coefficients
-        per body, identified by spice_id.
-
-        Recognized names:
-        - a_fogm
-        - beta_fogm
-        """
-        tmp_a = {}
-        tmp_b = {}
-
-        for entry in state_array.state:
-            if len(entry) < 6:
-                continue
-
-            name, _, _, _, owner, raw_val = entry
-            spice_id = getattr(owner, "spice_id", None)
-            if spice_id is None:
-                continue
-
-            if hasattr(raw_val, "quantity"):
-                vals = raw_val.quantity.values
-            elif hasattr(raw_val, "values"):
-                vals = raw_val.values
-            else:
-                vals = raw_val
-
-            vals = np.atleast_1d(vals).astype(float)
-
-            if name == "a_fogm":
-                tmp_a[spice_id] = vals[:3]
-            elif name == "beta_fogm":
-                tmp_b[spice_id] = vals[:3]
-
-        self._a0_map = tmp_a
-        self._beta_map = tmp_b
 
     def _get_a_fogm(self, current_state: dict, body: Body) -> np.ndarray:
         """
@@ -260,13 +279,13 @@ class FirstOrderGaussMarkov(DynamicModel):
         Parameters
         ----------
         position : np.ndarray
-            Spacecraft position vector, unused in this model but kept for API consistency.
+            Spacecraft position vector, used by the RTN triad.
 
         current_state : dict
             Dictionary containing the propagated state.
 
         epoch : float
-            Current epoch, unused in this model but kept for API consistency.
+            Current epoch, used by the body-fixed rotation.
 
         body : Body
             Body for which the acceleration is evaluated.
@@ -274,9 +293,13 @@ class FirstOrderGaussMarkov(DynamicModel):
         Returns
         -------
         np.ndarray
-            Current acceleration vector :math:`\\mathbf a_{gm}` in km/s^2.
+            Current acceleration :math:`\\mathbf T\\,\\mathbf a_{gm}` in the
+            propagation frame, km/s^2.
         """
-        return self._get_a_fogm(current_state, body)
+        a_gm = self._get_a_fogm(current_state, body)
+        return DynamicalUtils.from_frame(
+            self, a_gm, position, current_state, epoch, body
+        )
 
     def _compute_partial_by_position(
         self,
@@ -288,19 +311,28 @@ class FirstOrderGaussMarkov(DynamicModel):
         """
         Partial derivative of the applied acceleration with respect to position.
 
-        Since the empirical GM acceleration is an independent augmented state,
-        it does not directly depend on position.
+        The empirical GM acceleration is an independent augmented state, so
+        only the frame it is expressed in can depend on position: the RTN
+        triad does, the inertial and body-fixed frames do not.
 
         Returns
         -------
         np.ndarray
-            Zero 3x3 matrix:
+            3x3 matrix,
 
             .. math::
 
-                \\frac{\\partial \\mathbf a_{gm}}{\\partial \\mathbf r} = \\mathbf 0
+                \\frac{\\partial (\\mathbf T\\,\\mathbf a_{gm})}
+                     {\\partial \\mathbf r}
+                = \\sum_j a_{gm,j}\\,
+                  \\frac{\\partial \\hat{\\mathbf e}_j}{\\partial \\mathbf r},
+
+            which is zero outside the RTN frame.
         """
-        return np.zeros((3, 3))
+        a_gm = self._get_a_fogm(current_state, body)
+        return DynamicalUtils.frame_partials(
+            self, a_gm, position, current_state, epoch, body
+        )[0]
 
     def _compute_partial_by_velocity(
         self,
@@ -315,13 +347,21 @@ class FirstOrderGaussMarkov(DynamicModel):
         Returns
         -------
         np.ndarray
-            Zero 3x3 matrix:
+            3x3 matrix,
 
             .. math::
 
-                \\frac{\\partial \\mathbf a_{gm}}{\\partial \\mathbf v} = \\mathbf 0
+                \\frac{\\partial (\\mathbf T\\,\\mathbf a_{gm})}
+                     {\\partial \\mathbf v}
+                = \\sum_j a_{gm,j}\\,
+                  \\frac{\\partial \\hat{\\mathbf e}_j}{\\partial \\mathbf v},
+
+            which is zero outside the RTN frame.
         """
-        return np.zeros((3, 3))
+        a_gm = self._get_a_fogm(current_state, body)
+        return DynamicalUtils.frame_partials(
+            self, a_gm, position, current_state, epoch, body
+        )[1]
 
     def _compute_partial_by_acceleration_state(
         self,
@@ -334,24 +374,27 @@ class FirstOrderGaussMarkov(DynamicModel):
         Partial derivative of the applied acceleration with respect to the
         Gauss-Markov acceleration state itself.
 
-        Since the translational acceleration is exactly the GM state,
+        Since the translational acceleration is the GM state rotated out of its
+        frame,
 
         .. math::
 
-            \\mathbf a = \\mathbf a_{gm}
+            \\mathbf a = \\mathbf T\\,\\mathbf a_{gm}
 
         therefore
 
         .. math::
 
-            \\frac{\\partial \\mathbf a}{\\partial \\mathbf a_{gm}} = \\mathbf I
+            \\frac{\\partial \\mathbf a}{\\partial \\mathbf a_{gm}} = \\mathbf T
 
         Returns
         -------
         np.ndarray
-            3x3 identity matrix.
+            3x3 rotation, the identity in the inertial frame.
         """
-        return np.eye(3)
+        return DynamicalUtils.from_frame(
+            self, np.eye(3), position, current_state, epoch, body
+        )
 
     def _compute_acceleration_state_derivative(
         self,

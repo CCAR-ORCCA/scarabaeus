@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Orbital Research Cluster for Celestial Applications (ORCCA) Lab, University of Colorado at Boulder
 # SPDX-License-Identifier: ISC
 from scarabaeus import (
+    CelestialBody,
     Body,
     EpochArray,
     StateArray,
@@ -12,8 +13,11 @@ from scarabaeus import (
     Units,
 )
 from scarabaeus import constants
+from scarabaeus.utils.EphemerisCache import build_ephemeris_cache
 import scarabaeus.utils.NumpyWrapper as np
 kg, km, sec, N, unitless = Units.get_units(["kg", "km", "sec", "N", "unitless"])
+
+_SUN_SPICE_ID = 10
 
 
 # --------------------#
@@ -48,8 +52,9 @@ class CannonballSRP(DynamicModel):
 
     Parameters
     ----------
-    state_array : StateArray
-        The state vector of the spacecraft containing position, velocity, and other estimated parameters.
+    origin : CelestialBody
+        Propagation origin. Used for the Sun-relative geometry; the estimable
+        ``eta_srp`` is read from the propagated state at evaluation time.
 
     spacecraft : Spacecraft
         The spacecraft object with defined mass, cross-sectional area, and reflectivity coefficient.
@@ -71,7 +76,7 @@ class CannonballSRP(DynamicModel):
 
     References
     ----------
-    Montenbruck, O., & Gill, E. (2000). Satellite Orbits: Models, Methods, and Applications.
+    .. [1] Montenbruck, O., & Gill, E. (2000). Satellite Orbits: Models, Methods, and Applications.
 
     Examples
     --------
@@ -121,10 +126,15 @@ class CannonballSRP(DynamicModel):
     # region Constructor #
     # --------------------#
     def __init__(
-        self, state_array: StateArray, spacecraft: Spacecraft, base_frame: Frame
+        self,
+        origin: CelestialBody,
+        spacecraft: Spacecraft,
+        base_frame: Frame,
+        t0: float = None,
+        tf: float = None,
     ):
         # Origin and reference frame
-        self._origin = state_array.origin
+        self._origin = origin
         self._origin_name = self._origin.name
         self._spacecraft = spacecraft
         self._ref_frame = base_frame
@@ -143,9 +153,67 @@ class CannonballSRP(DynamicModel):
         # Precompute constant scale factor (without eta_srp, without mass)
         self._const_scale_factor = self._p_srp * self._ref_coeff * self._area
 
-        # Cache eta_srp per body (spice_id -> float)
+        # eta_srp is read from the propagated state on every evaluation (see
+        # _get_eta_srp). The map is kept only so callers that poke a value in
+        # directly — the partial-derivative diagnostics do — still work.
         self._eta_srp_map: dict[int, float] = {}
-        self._initialize_eta_srp_map(state_array)
+
+        # Sun-position source. When the origin IS the Sun the vector is
+        # identically zero. Otherwise, if the propagation span is known and
+        # the frame is the SPK-native J2000, cache the Chebyshev records so
+        # _sun_to_origin avoids the per-step spkpos; SPICE stays the fallback.
+        self._origin_spice_id = getattr(self._origin, "spice_id", None)
+        self._origin_is_sun = self._origin_spice_id == _SUN_SPICE_ID
+        self._sun_eph = None
+        self._sun_eph_span = None
+        frame_name = getattr(base_frame, "name", str(base_frame))
+        if (
+            t0 is not None
+            and tf is not None
+            and self._origin_spice_id is not None
+            and not self._origin_is_sun
+            and frame_name.upper() == "J2000"
+        ):
+            self._sun_eph_span = (t0 - 86400.0, tf + 86400.0)
+            self._sun_eph = self._build_sun_ephemeris()
+
+    def __getstate__(self):
+        """
+        Copy the attributes, leaving out the Rust Sun ephemeris cache.
+
+        ``copy.deepcopy`` and ``pickle`` both call this. ``SolutionOD``
+        deep-copies the propagator, and so this model, in
+        ``_integrate_reference`` and ``propagate_covariance``. The compiled
+        cache cannot be copied, so it is dropped here and rebuilt in
+        :meth:`__setstate__`.
+        """
+        state = self.__dict__.copy()
+        state["_sun_eph"] = None
+        return state
+
+    def __setstate__(self, state):
+        """Restore the copied attributes and rebuild the Sun ephemeris cache
+        from the loaded SPKs."""
+        self.__dict__.update(state)
+        if self.__dict__.get("_sun_eph_span") is not None:
+            self._sun_eph = self._build_sun_ephemeris()
+
+    def _build_sun_ephemeris(self):
+        """
+        Cache the origin and Sun Chebyshev records over ``_sun_eph_span``.
+
+        Returns
+        -------
+        EphemerisCache or None
+            The cache, or ``None`` when the loaded SPKs do not cover the span;
+            the Sun position then falls back to SPICE.
+        """
+        try:
+            return build_ephemeris_cache(
+                [self._origin_spice_id, _SUN_SPICE_ID], *self._sun_eph_span
+            )
+        except Exception:
+            return None  # no/partial SPK coverage -> SPICE fallback
 
     # -------------------------#
     # region ====> Properties #
@@ -214,7 +282,7 @@ class CannonballSRP(DynamicModel):
     @property
     def p_srp(self) -> float:
         """
-        Solar radiation pressure constant at 1 AU, in units of kg·km·s⁻².
+        Solar radiation pressure constant at 1 AU, in kg km/s^2.
 
         Converted at construction time from the ``"srpP_constant"`` entry in
         ``scarabaeus.Constants.CONSTANTS``.
@@ -254,62 +322,81 @@ class CannonballSRP(DynamicModel):
     # region Methods #
     # ----------------#
 
-    def _initialize_eta_srp_map(self, state_array: StateArray) -> None:
-        """
-        Scan the StateArray and store eta_srp per body (by spice_id).
-
-        Expects entries of the form:
-            ('eta_srp', dim, est, dyn, owner, value)
-
-        Only the first value is used if an array is provided.
-        """
-        for entry in state_array.state:
-            if len(entry) < 6:
-                continue
-
-            name, _, _, _, owner, raw_val = entry
-            if name != "eta_srp":
-                continue
-
-            spice_id = getattr(owner, "spice_id", None)
-            if spice_id is None:
-                raise ValueError(
-                    "CannonballSRP: 'eta_srp' entry requires an owner with 'spice_id'. "
-                    f"Got owner={owner!r}."
-                )
-
-            # Extract numeric value robustly
-            if hasattr(raw_val, "quantity"):
-                vals = raw_val.quantity.values
-            elif hasattr(raw_val, "values"):
-                vals = raw_val.values
-            else:
-                vals = raw_val
-
-            eta = float(np.atleast_1d(vals)[0])
-            self._eta_srp_map[spice_id] = eta
-
     def _get_eta_srp(self, current_state: dict, body: Body) -> float:
         """
         Resolve eta_srp for the given body.
 
         Priority:
-        1. Cached from StateArray (self._eta_srp_map[spice_id])
-        2. Dynamic from current_state[("eta_srp", spice_id)] if present
+        1. The propagated state, ``current_state[("eta_srp", spice_id)]``
+        2. Any value pushed into ``self._eta_srp_map`` by a caller
         3. Fallback: 1.0
+
+        The state comes first so that an estimated eta_srp takes effect, which
+        also matches how every other model resolves its parameters.
         """
         spice_id = getattr(body, "spice_id", None)
 
         if spice_id is not None:
-            if spice_id in self._eta_srp_map:
-                return self._eta_srp_map[spice_id]
-
             key = ("eta_srp", spice_id)
             if key in current_state:
                 val = current_state[key]
-                return float(val.values if hasattr(val, "values") else val)
+                return self._scalar_from_state(val)
+
+            if spice_id in self._eta_srp_map:
+                return self._eta_srp_map[spice_id]
 
         return 1.0
+
+    def _sun_to_origin(self, epoch: float) -> np.ndarray:
+        """
+        Sun->origin position (km, raw numpy), memoized per epoch.
+
+        Both :meth:`compute_acceleration` and :meth:`_compute_partial_by_position`
+        need this at the same epoch within one RHS step, so it is cached to avoid
+        the duplicate SPICE call. The origin's SPICE name is constant and resolved
+        once.
+
+        Parameters
+        ----------
+        epoch : float
+            TDB epoch (seconds past J2000).
+
+        Returns
+        -------
+        numpy.ndarray
+            ``(3,)`` Sun->origin position in km.
+        """
+        if self.__dict__.get("_s2o_epoch") != epoch:
+            self._s2o_cache = self._lookup_sun_to_origin(epoch)
+            self._s2o_epoch = epoch
+        return self._s2o_cache
+
+    def _lookup_sun_to_origin(self, epoch: float) -> np.ndarray:
+        """
+        Uncached Sun->origin lookup: identically zero for a heliocentric
+        origin; Chebyshev ephemeris cache when available (falling back to
+        SPICE for epochs outside the cached span); SPICE otherwise.
+        """
+        if self._origin_is_sun:
+            return np.zeros(3)
+        if self._sun_eph is not None:
+            try:
+                return np.asarray(
+                    self._sun_eph.get_relative_position(
+                        self._origin_spice_id, _SUN_SPICE_ID, epoch
+                    ),
+                    dtype=float,
+                )
+            except Exception:
+                pass  # epoch outside the cached span -> SPICE fallback
+        spice_name = self.__dict__.get("_origin_spice_name")
+        if spice_name is None:
+            spice_name = self._origin_spice_name = getattr(
+                constants, self.origin_name.upper()
+            ).spice_name
+        return SpiceManager.get_pos_values(
+            spice_name, epoch, self.ref_frame, "SUN"
+        )
 
     def compute_acceleration(
         self, position: np.ndarray, current_state: dict, epoch: float, body: Body
@@ -343,13 +430,8 @@ class CannonballSRP(DynamicModel):
         # Initialize acceleration
         cannonball_srp_acceleration = np.array([0, 0, 0])
 
-        # Compute the Sun-to-Origin vector from a Spice call
-        sun2origin = SpiceManager.get_pos(
-            eval(f'constants.{self.origin_name.upper()}.spice_name'),
-            epoch,
-            self.ref_frame,
-            "SUN",
-        ).values  # Assumed in km
+        # Compute the Sun-to-Origin vector (raw km, memoized per epoch)
+        sun2origin = self._sun_to_origin(epoch)
         # Compute the Sun-to-Body vector and its norm
         sun2body = sun2origin + position
         sun2body_norm = np.linalg.norm(sun2body)
@@ -402,13 +484,8 @@ class CannonballSRP(DynamicModel):
         # Identity matrix
         identity_matrix = np.eye(3)
 
-        # Compute the Sun-to-Origin vector
-        sun2origin = SpiceManager.get_pos(
-            eval(f'constants.{self.origin_name.upper()}.spice_name'),
-            epoch,
-            self.ref_frame,
-            "SUN",
-        ).values
+        # Compute the Sun-to-Origin vector (raw km, memoized per epoch)
+        sun2origin = self._sun_to_origin(epoch)
         # Compute the Body-to-Sun vector
         body2sun = sun2origin + position
         body2sun_norm = np.linalg.norm(body2sun)
@@ -452,19 +529,33 @@ class CannonballSRP(DynamicModel):
         body : Body
             The spacecraft affected by SRP.
 
-            Returns
-            -------
-            partial : np.ndarray
-                The 3x1 partial derivative vector of SRP acceleration with respect to `eta_srp`.
-                Assumed in units of :math:`\\frac{km}{s^2}`.
+        Returns
+        -------
+        partial : np.ndarray
+            The (3, 1) partial derivative vector of SRP acceleration with respect to `eta_srp`.
+            Assumed in units of :math:`\\frac{km}{s^2}`.
+
+        Notes
+        -----
+        The acceleration scales linearly with ``eta_srp``, so the partial is
+        the acceleration at unit scale and is well defined at
+        ``eta_srp = 0`` — which is a natural initial guess when the factor
+        is being estimated as a correction.
         """
-        # Get the SRP scale factor
-        eta_srp = self._get_eta_srp(current_state, body)
+        # The acceleration is linear in the scale factor, a = eta * a_unit, so
+        # the partial is a_unit. Evaluating it directly rather than dividing the
+        # acceleration by eta keeps the partial defined at eta = 0 — a natural
+        # starting guess, and one that otherwise raises ZeroDivisionError.
+        spice_id = getattr(body, "spice_id", None)
+        if spice_id is None:
+            # eta cannot be addressed per body here, so fall back to scaling the
+            # acceleration; _get_eta_srp returns 1.0 in this case, making the
+            # division a no-op.
+            return self._get_eta_srp(current_state, body) ** -1 * (
+                self.compute_acceleration(position, current_state, epoch, body)
+            )
 
-        # Compute the partial derivative
-        partial_a_by_eta = eta_srp**-1 * (
-            self.compute_acceleration(position, current_state, epoch, body)
-        )
+        unit_state = dict(current_state or {})
+        unit_state[("eta_srp", spice_id)] = 1.0
 
-        # Return the transposed result
-        return partial_a_by_eta#.transpose()
+        return self.compute_acceleration(position, unit_state, epoch, body)

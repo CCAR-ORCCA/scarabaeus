@@ -5,11 +5,17 @@ from scarabaeus import (
     EpochArray,
     ImpulsiveBurn,
     StateArray,
+    StateDefinition,
     Propagator,
-    Body
+    Body,
+    Units,
 )
 
 import scarabaeus.utils.NumpyWrapper as np
+from scarabaeus.utils.Utils import Utils
+
+# generate units
+sec = Units.get_units("sec")
 
 
 # ----------------------------------#
@@ -78,6 +84,23 @@ class MissionSequence:
     ----------
     name : str
         Human-readable identifier for the mission sequence.
+    grid_bound_tol : float, optional
+        Tolerance, in TDB seconds, on the bounds of a grid chosen by the
+        integrator (see :attr:`grid_bound_tol`). Defaults to ``1e-6``.
+
+    Attributes
+    ----------
+    grid_bound_tol : float
+        How far, in TDB seconds, an integrator-chosen grid may sit from the
+        bounds its segment declared. Settable at any time.
+    deferred_grids : list of bool
+        Which segments take their grid from the integrator.
+
+    See Also
+    --------
+    scarabaeus.Propagator : Numerical propagator used by each leg.
+    scarabaeus.ScenarioSetup : Executes a MissionSequence leg by leg.
+    scarabaeus.StateArray : State vector definition for each leg.
 
     Notes
     -----
@@ -109,20 +132,28 @@ class MissionSequence:
             prop=prop1,
             dt=ArrayWUnits(60, "s"),
         )
-
-    See Also
-    --------
-    scarabaeus.Propagator : Numerical propagator used by each leg.
-    scarabaeus.ScenarioSetup : Executes a MissionSequence leg by leg.
-    scarabaeus.StateArray : State vector definition for each leg.
     """
+
+    # ------------------#
+    # region   Errors  #
+    # ------------------#
+    class TimeSpanError(ValueError):
+        """Raised when a segment's time span does not define an output grid."""
+
+    class GridToleranceError(ValueError):
+        """Raised when the tolerance on an integrator-chosen grid is not a
+        non-negative number of seconds."""
+
+    # endregion Errors #
+    # ------------------#
 
     # --------------------#
     # region Constructor #
     # --------------------#
-    def __init__(self, name: str):
+    def __init__(self, name: str, grid_bound_tol: float = 1e-6):
         self._name = name
         self._primary_body = None
+        self.grid_bound_tol = grid_bound_tol
 
         self._types = []
         self._names = []
@@ -135,6 +166,10 @@ class MissionSequence:
         self._num_steps = []
         self._last_idx = []
         self._epochs_vec = []
+        self._deferred_grids = []
+        # (carrying model, declared model, carried keys) per segment that
+        # carries static parameters; see carry_static_parameters().
+        self._carry_records = []
 
     # ----------------------#
     # region    Properties #
@@ -164,7 +199,9 @@ class MissionSequence:
     @property
     def periods(self) -> list[ArrayWUnits] | list[None]:
         """
-        List of time durations for each leg in the sequence, or None for impulsive burns.
+        Duration of each segment, in seconds, for legs and finite burns;
+        ``None`` for impulsive burns and a :class:`_NodeSentinel` for the
+        boundary nodes inserted between consecutive propagated segments.
         """
         return self._periods
 
@@ -227,6 +264,49 @@ class MissionSequence:
     @epochs_vec.setter
     def epochs_vec(self, input_val):
         self._epochs_vec = input_val
+
+    @property
+    def deferred_grids(self) -> list[bool]:
+        """
+        Per-segment flag marking the legs whose output grid is chosen by the
+        integrator rather than declared up front (a ``(t0, tf)`` tuple
+        ``tspan``).  Until :meth:`propagate` runs, those segments hold only
+        their two bounds in :attr:`epochs_vec`; the propagated grid replaces
+        them through :meth:`adopt_propagated_grid`.
+        """
+        return self._deferred_grids
+
+    @property
+    def grid_bound_tol(self) -> float:
+        """
+        Tolerance, in TDB seconds, on the bounds of an integrator-chosen grid.
+
+        :meth:`adopt_propagated_grid` rejects a propagated grid whose first or
+        last epoch sits further than this from the bounds the segment declared,
+        because that gap or overlap would break epoch continuity with the
+        neighbouring segments.  The default of ``1e-6`` is about a decimal
+        digit above the float64 resolution of an ephemeris epoch, so it
+        absorbs rounding without hiding a grid that genuinely stops short.
+
+        Raises
+        ------
+        GridToleranceError
+            If set to something other than a non-negative real number.
+        """
+        return self._grid_bound_tol
+
+    @grid_bound_tol.setter
+    def grid_bound_tol(self, value: float):
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            raise self.GridToleranceError(
+                f"grid_bound_tol must be a number of TDB seconds, got "
+                f"{type(value).__name__}."
+            )
+        if not np.isfinite(value) or value < 0.0:
+            raise self.GridToleranceError(
+                f"grid_bound_tol must be finite and non-negative, got {value}."
+            )
+        self._grid_bound_tol = float(value)
 
     # endregion Properties #
     # ----------------------#
@@ -311,37 +391,52 @@ class MissionSequence:
         2. ``period`` + ``dt`` — build a uniform grid.
         3. ``prop.tspan`` — use the propagator's own time span.
 
+        A ``(t0, tf)`` tuple ``tspan`` declares no grid: the segment holds its
+        two bounds and is flagged as deferred, so that :class:`ScenarioSetup`
+        integrates between the bounds and adopts the grid the integrator picks
+        (see :meth:`adopt_propagated_grid`).  Both DOP853 and IAS15 place their
+        own output times, so either can carry such a segment.
+
         Returns
         -------
         epoch_vec : EpochArray
-        period    : ArrayWUnits
+            Epochs of the segment.
+        period : ArrayWUnits
+            Time span of the segment, in seconds.
         num_steps : int
+            Number of epochs in ``epoch_vec``.
+        deferred : bool
+            ``True`` when ``epoch_vec`` holds bounds awaiting the integrator's
+            own grid.
         """
         if epochs is not None:
             if dt is not None:
                 raise ValueError(
                     f"Segment '{seg_name}': provide either `epochs` or `dt`, not both."
                 )
-            t_vals = epochs.times.values
+            t_vals = epochs.et  # raw ET seconds, rep-independent
             if period is None:
-                period = ArrayWUnits(
-                    float(t_vals[-1]) - float(t_vals[0]), epochs.times.units
-                )
-            return epochs, period, len(t_vals)
+                period = ArrayWUnits(float(t_vals[-1]) - float(t_vals[0]), sec)
+            else:
+                period = self._to_seconds(period, "period", seg_name)
+            return epochs, period, len(t_vals), False
 
         if period is not None and dt is not None:
+            # The grid is built on TDB seconds, so a period or step given in
+            # another time unit (days, hours) is converted first.
+            period = self._to_seconds(period, "period", seg_name)
+            dt = self._to_seconds(dt, "dt", seg_name)
             if not self.epochs_vec:
-                t = state_vector.epoch.to(sys = 'TDB', rep = 'AWU')
-                start_epoch = t.times.values
+                start_epoch = float(state_vector.epoch.et)
             else:
-                start_epoch = self.epochs_vec[-1][-1].times.values
+                start_epoch = float(self.epochs_vec[-1][-1].et)
             t_arr = np.append(
                 np.arange(start_epoch, start_epoch + period.values, dt.values),
                 start_epoch + period.values,
             )
             epoch_vec = EpochArray(t_arr, sys = "TDB", rep = 'AWU')
             num_steps = np.arange(0, period.values, dt.values).size
-            return epoch_vec, period, num_steps
+            return epoch_vec, period, num_steps, False
 
         # fall back to prop.tspan
         tspan = getattr(prop, "tspan", None) if prop is not None else None
@@ -350,11 +445,103 @@ class MissionSequence:
                 f"Segment '{seg_name}': no `epochs`, no `period`+`dt` provided, "
                 "and the propagator has no `tspan`. Supply at least one of these."
             )
-        t_vals = tspan.times.values
-        derived_period = ArrayWUnits(
-            float(t_vals[-1]) - float(t_vals[0]), tspan.times.units
+        # A (t0, tf) tuple carries no inner grid: keep the bounds and let the
+        # integrator fill in between them at propagation time.
+        if isinstance(tspan, tuple):
+            bounds = EpochArray(
+                np.array([float(tspan[0].et), float(tspan[1].et)]),
+                sys="TDB",
+                rep="AWU",
+            )
+            derived_period = ArrayWUnits(
+                float(bounds.et[-1]) - float(bounds.et[0]), sec
+            )
+            return bounds, derived_period, len(bounds), True
+
+        t_vals = tspan.et  # raw ET seconds, rep-independent
+        derived_period = ArrayWUnits(float(t_vals[-1]) - float(t_vals[0]), sec)
+        return tspan, derived_period, len(t_vals), False
+
+    def _to_seconds(
+        self, duration: ArrayWUnits, label: str, seg_name: str
+    ) -> ArrayWUnits:
+        """
+        Return a segment's ``period`` or ``dt`` converted to seconds.
+
+        Raises
+        ------
+        TimeSpanError
+            If ``duration`` is not a time.
+        """
+        if duration.units.dimensions != sec.dimensions:
+            raise self.TimeSpanError(
+                f"Segment '{seg_name}': `{label}` must be a time, got {duration} "
+                f"with dimensions {duration.units.dimensions}."
+            )
+        return duration.convert_to(sec)
+
+    def adopt_propagated_grid(self, index: int, epochs: EpochArray) -> None:
+        """
+        Replace a deferred segment's bounds with the grid the integrator used.
+
+        Called by :class:`~scarabaeus.ScenarioSetup` right after a segment whose
+        ``tspan`` was a ``(t0, tf)`` tuple has been propagated, so that the rest
+        of the framework — SPK writing, measurement mapping, process noise,
+        filter leg boundaries — sees the epochs the states actually sit on.
+        ``num_steps`` and ``last_idx`` are refreshed to match.
+
+        Parameters
+        ----------
+        index : int
+            Index of the segment in the sequence.
+        epochs : EpochArray
+            Epochs of the propagated states, in ascending order.
+
+        Raises
+        ------
+        TimeSpanError
+            If the propagated grid does not start and end at the segment's
+            declared bounds, to within :attr:`grid_bound_tol`, which would
+            break epoch continuity with the neighbouring segments.
+        """
+        bounds = self._epochs_vec[index]
+        for label, declared, obtained in (
+            ("start", float(bounds[0].et), float(epochs[0].et)),
+            ("end", float(bounds[-1].et), float(epochs[-1].et)),
+        ):
+            if abs(declared - obtained) > self._grid_bound_tol:
+                raise self.TimeSpanError(
+                    f"Segment '{self._names[index]}': the propagated grid does not "
+                    f"reach its declared {label} epoch ({obtained} vs {declared} "
+                    f"TDB, off by {abs(declared - obtained):.3e} s against a "
+                    f"grid_bound_tol of {self._grid_bound_tol:.3e} s), which would "
+                    "break continuity with the adjacent segments."
+                )
+
+        self._epochs_vec[index] = epochs
+        self._num_steps[index] = len(epochs)
+        self._periods[index] = ArrayWUnits(
+            float(epochs[-1].et) - float(epochs[0].et), sec
         )
-        return tspan, derived_period, len(t_vals)
+        self._rebuild_last_idx()
+
+    def _rebuild_last_idx(self) -> None:
+        """
+        Recompute the cumulative ``last_idx`` chain from the current
+        ``num_steps``, replaying the rule the ``add*`` methods apply: each
+        propagated segment advances the count by its number of steps, and each
+        node or impulsive burn overlaps the previous segment's endpoint.
+        """
+        last_idx = []
+        for i, seg_type in enumerate(self._types):
+            if seg_type in ("Leg", "Finite Burn"):
+                steps = self._num_steps[i]
+                last_idx.append(last_idx[-1] + steps if last_idx else steps)
+            else:
+                if last_idx:
+                    last_idx[-1] -= 1
+                last_idx.append(last_idx[-1] if last_idx else 0)
+        self._last_idx = last_idx
 
     def addLeg(
         self,
@@ -378,10 +565,21 @@ class MissionSequence:
 
         Resolution order:
 
-        * ``state_vector``: explicit arg → ``prop.state_vector``
-        * epoch grid: explicit ``epochs`` → ``period``+``dt`` uniform grid →
-          ``prop.tspan``
+        * ``state_vector``: explicit arg, then ``prop.state_vector``
+        * epoch grid: explicit ``epochs``, then a uniform ``period`` + ``dt``
+          grid, then ``prop.tspan``
         * ``period``: derived from whichever epoch source is used.
+
+        When ``prop.tspan`` is a ``(t0, tf)`` tuple the leg declares no grid of
+        its own: it holds the two bounds, and :meth:`propagate` adopts the
+        epochs the integrator's own steps landed on (see
+        :meth:`adopt_propagated_grid`).  Both integrators do this — DOP853
+        through ``t_eval=None``, IAS15 through its adaptive steps.  How fine
+        the resulting grid is, is the error control's call — on slow dynamics
+        it can be the two bounds alone.  A default degree-3 type-13 SPK segment
+        still writes from two nodes, but one cubic then spans the whole leg;
+        give the leg ``epochs`` or ``period`` + ``dt`` when the output density
+        matters.
 
         If the immediately preceding segment is a ``"Finite Burn"``, a boundary
         node is inserted automatically before this leg.
@@ -391,8 +589,8 @@ class MissionSequence:
         name : str
             The name of the leg.
         period : ArrayWUnits, optional
-            Duration of the leg.  Derived from ``epochs`` or ``prop.tspan``
-            when not provided.
+            Duration of the leg, in any time unit (stored in seconds).
+            Derived from ``epochs`` or ``prop.tspan`` when not provided.
         state_vector : StateArray, optional
             State schema for this leg.  Derived from ``prop.state_vector``
             when not provided.
@@ -400,7 +598,8 @@ class MissionSequence:
             Propagator for this leg.  Its ``tspan`` and ``state_vector`` are
             used as fallbacks when the explicit arguments are absent.
         dt : ArrayWUnits, optional
-            Output sampling interval (used with ``period`` for a uniform grid).
+            Output sampling interval, in any time unit (used with ``period``
+            for a uniform grid).
         epochs : EpochArray, optional
             Explicit epoch grid.  Takes priority over all other epoch sources.
 
@@ -414,7 +613,7 @@ class MissionSequence:
         self._validate_leg(name, period, dt, state_vector, prop, epochs)
         self._enforce_primary_body(prop)
 
-        epoch_vec, period, num_steps = self._resolve_epochs(
+        epoch_vec, period, num_steps, deferred = self._resolve_epochs(
             prop, period, dt, epochs, state_vector, name
         )
 
@@ -440,6 +639,7 @@ class MissionSequence:
         )
         self.num_steps.append(num_steps)
         self.epochs_vec.append(epoch_vec)
+        self.deferred_grids.append(deferred)
 
         # Check consistency of the sequence
         if len(self.types) > 1:
@@ -468,6 +668,9 @@ class MissionSequence:
 
             MS.addFiniteBurn("burn 1", prop=prop_fb)
 
+        A ``(t0, tf)`` tuple ``tspan`` defers the grid to the integrator, as in
+        :meth:`addLeg`.
+
         A boundary node is automatically inserted before the burn unless this
         is the very first segment in the sequence.
 
@@ -476,14 +679,15 @@ class MissionSequence:
         name : str
             Name of this finite burn segment.
         period : ArrayWUnits, optional
-            Duration of the burn arc.  Derived automatically when not given.
+            Duration of the burn arc, in any time unit (stored in seconds).
+            Derived automatically when not given.
         state_vector : StateArray, optional
             State schema (position/velocity + burn parameters).  Derived from
             ``prop.state_vector`` when not provided.
         prop : Propagator, optional
             Propagator for this burn arc.
         dt : ArrayWUnits, optional
-            Output sampling interval (uniform grid only).
+            Output sampling interval, in any time unit (uniform grid only).
         epochs : EpochArray, optional
             Explicit epoch grid.  Takes priority over everything else.
         initial_node_name : str, optional
@@ -502,7 +706,7 @@ class MissionSequence:
 
         self._enforce_primary_body(prop)
 
-        epoch_vec, period, num_steps = self._resolve_epochs(
+        epoch_vec, period, num_steps, deferred = self._resolve_epochs(
             prop, period, dt, epochs, state_vector, name
         )
 
@@ -525,6 +729,7 @@ class MissionSequence:
         )
         self.num_steps.append(num_steps)
         self.epochs_vec.append(epoch_vec)
+        self.deferred_grids.append(deferred)
 
         # Check consistency of the sequence
         if len(self.types) > 1:
@@ -587,10 +792,11 @@ class MissionSequence:
 
         # Create epochs vector
         epoch_vec = EpochArray(
-            np.array([self.epochs_vec[-1][-1].times.values]),
+            np.array([float(self.epochs_vec[-1][-1].et)]),
             sys="TDB",
         )
         self.epochs_vec.append(epoch_vec)
+        self.deferred_grids.append(False)
 
     def addNode(
         self,
@@ -642,7 +848,7 @@ class MissionSequence:
         # Decrease the size of the last leg (node is overlapped with leg endpoint)
         self.last_idx[-1] -= 1
 
-        boundary_epoch = self.epochs_vec[-1][-1].times.values
+        boundary_epoch = float(self.epochs_vec[-1][-1].et)
         sentinel = _NodeSentinel(name, boundary_epoch)
 
         # Append to the lists — sentinel in slots where None used to live
@@ -660,6 +866,7 @@ class MissionSequence:
         # Create epochs vector
         epoch_vec = EpochArray(np.array([boundary_epoch]), sys = 'TDB')
         self.epochs_vec.append(epoch_vec)
+        self.deferred_grids.append(False)
 
     def _validate_leg(
         self,
@@ -674,6 +881,7 @@ class MissionSequence:
         Validate a propagation leg before adding it to the mission sequence.
 
         NaN-free semantics:
+
         - For the first leg: epoch + full initial state must be defined.
         - For subsequent legs: epoch/pos/vel values are allowed but will be
           ignored by ScenarioSetup, which inherits values structurally from
@@ -808,10 +1016,10 @@ class MissionSequence:
             obj.state for obj in self.models if isinstance(obj, StateArray)
         ]
 
-        # 1) epoch continuity between consecutive epochs_vec
+        # 1) epoch continuity between consecutive epochs_vec (raw ET floats)
         for i in range(1, len(self.epochs_vec)):
-            last_epoch_previous_leg = self.epochs_vec[i - 1][-1].times
-            first_epoch_new_leg = self.epochs_vec[i][0].times
+            last_epoch_previous_leg = float(self.epochs_vec[i - 1][-1].et)
+            first_epoch_new_leg = float(self.epochs_vec[i][0].et)
             if last_epoch_previous_leg != first_epoch_new_leg:
                 raise Exception(
                     f"Epoch continuity error: first epoch of segment {i} ({first_epoch_new_leg}) "
@@ -860,6 +1068,146 @@ class MissionSequence:
         # Optional: keep your "implementation limits" checks below (legs/burn counts, etc.)
         leg_count = sum(1 for leg in self.types if leg == "Leg")
         impulsive_burn_count = sum(1 for burn in self.types if burn == "Impulsive Burn")
+
+    def carry_static_parameters(self) -> list[frozenset]:
+        """
+        Carry static parameters through the segments that do not declare them.
+
+        A static parameter declared on two segments with others in between
+        (a thrust group resumed after a coast, a bias observed on alternate
+        arcs) is one parameter of the scenario. Each segment in between gets
+        the parameter added to its state, so its value and covariance flow
+        through that segment instead of being dropped at the first boundary
+        and re-introduced with a fresh a priori at the next one. A carried
+        component is dormant there: the propagator holds it constant and hides
+        it from the force models (``Propagator.reinitialize``).
+
+        Carried estimated components go before the segment's first considered
+        one, as :class:`StateDefinition` requires; carried considered
+        components go last. ``dv_man`` blocks are never carried: they belong
+        to the impulsive burn in front of the segment declaring them.
+
+        The carry is recomputed from the states the segments were declared
+        with, so calling this again is harmless and accounts for segments
+        added in the meantime.
+
+        Returns
+        -------
+        list of frozenset
+            One entry per segment: the ``(name, spice_id)`` of its dormant
+            components; empty for segments carrying nothing, nodes, and
+            impulsive burns.
+        """
+        positions = [
+            i
+            for i, model in enumerate(self._models)
+            if self._types[i] in ("Leg", "Finite Burn")
+            and isinstance(model, StateArray)
+        ]
+
+        # States as declared, i.e. without anything a previous call carried.
+        records = {}
+        declared = {}
+        for i in positions:
+            record = next(
+                (r for r in self._carry_records if r[0] is self._models[i]), None
+            )
+            records[i] = record
+            declared[i] = record[1] if record is not None else self._models[i]
+
+        first_entry = {}
+        seen_in = {}
+        for i in positions:
+            for key, _start, _size, entry in Utils.enumerate_state_blocks(
+                declared[i].state
+            ):
+                first_entry.setdefault(key, entry)
+                seen_in.setdefault(key, []).append(i)
+
+        dormant = [frozenset()] * len(self._models)
+        carry_records = []
+        for i in positions:
+            model = declared[i]
+            present = {
+                key for key, *_ in Utils.enumerate_state_blocks(model.state)
+            }
+            missing = [
+                (key, entry)
+                for key, entry in first_entry.items()
+                if entry[3] == "static"
+                and not entry[0].startswith("dv_man")
+                and key not in present
+                and seen_in[key][0] < i < seen_in[key][-1]
+            ]
+            if not missing:
+                self._models[i] = model
+                self._states_n[i] = sum(int(t[1]) for t in model.state)
+                continue
+
+            carried_keys = tuple(key for key, _entry in missing)
+            record = records[i]
+            if record is not None and record[2] == carried_keys:
+                carrying = record[0]
+            else:
+                components = list(model.state)
+                n_estimated = next(
+                    (k for k, t in enumerate(components) if t[2] == "considered"),
+                    len(components),
+                )
+                components[n_estimated:n_estimated] = [
+                    entry for _key, entry in missing if entry[2] != "considered"
+                ]
+                components.extend(
+                    entry for _key, entry in missing if entry[2] == "considered"
+                )
+                carrying = StateArray(
+                    epoch=model.epoch,
+                    origin=model.origin,
+                    state=StateDefinition.from_components(components),
+                )
+
+            self._models[i] = carrying
+            self._states_n[i] = sum(int(t[1]) for t in carrying.state)
+            carry_records.append((carrying, model, carried_keys))
+            dormant[i] = frozenset(
+                (entry[0], getattr(entry[4], "spice_id", None))
+                for _key, entry in missing
+            )
+
+        self._carry_records = carry_records
+        return dormant
+
+    def list_forces(self) -> dict:
+        """
+        The forces acting on each integrated object, segment by segment.
+
+        Returns
+        -------
+        dict
+            Maps the name of every propagated segment — legs and finite
+            burns, in sequence order — to that segment's
+            :meth:`~scarabaeus.Propagator.list_forces`: a dict from the name
+            of each integrated object to the labels of the forces it feels
+            there.
+            Impulsive burns and nodes are instantaneous, so they have no
+            entry.
+
+        See Also
+        --------
+        scarabaeus.Propagator.list_forces : The listing of one segment.
+        scarabaeus.ForceModelTranslation.list_forces : The labels of one force model.
+
+        Examples
+        --------
+        >>> seq.list_forces()
+        {'Cruise': {'Orbiter': ['ThreeBodyGravity(EARTH, JUPITER)', 'PointMassGravity(SUN)']},
+         'Approach': {'Orbiter': ['ThreeBodyGravity(EARTH, JUPITER)', 'CannonballSRP', 'PointMassGravity(SUN)']}}
+        """
+        return {
+            name: prop.list_forces()
+            for kind, name, prop in zip(self.types, self.names, self.props)
+            if kind in ("Leg", "Finite Burn") and prop is not None
+        }
 
     def propagate(self, map_STM_to_t0: bool = False, verbose: bool = True) -> "ScenarioSetup":
         """
@@ -942,6 +1290,7 @@ class MissionSequence:
             num_steps=self._num_steps[:],
             last_idx=self._last_idx[:],
             epochs_vec=self._epochs_vec[:],
+            deferred_grids=self._deferred_grids[:],
             primary_body=self._primary_body,
         )
 
@@ -957,6 +1306,7 @@ class MissionSequence:
         self._num_steps = []
         self._last_idx = []
         self._epochs_vec = []
+        self._deferred_grids = []
         self._primary_body = None
 
         # Add initial coast first
@@ -982,6 +1332,7 @@ class MissionSequence:
             self._num_steps.append(saved["num_steps"][i])
             self._last_idx.append(saved["last_idx"][i])
             self._epochs_vec.append(saved["epochs_vec"][i])
+            self._deferred_grids.append(saved["deferred_grids"][i])
 
     def addFinalCoast(
         self,

@@ -1,6 +1,5 @@
 # SPDX-FileCopyrightText: 2026 Orbital Research Cluster for Celestial Applications (ORCCA) Lab, University of Colorado at Boulder
 # SPDX-License-Identifier: ISC
-from fileinput import close
 from scarabaeus import (
     constants,
     Measurement,
@@ -13,14 +12,15 @@ from scarabaeus import (
     Spacecraft,
     SpiceManager,
     RampTableManager,
-    StateArray,
     MediaCorrections,
+    Noise,
     StateDefinition,
 )
 from typing import Optional
 
 import scarabaeus.utils.NumpyWrapper as np
 import copy as copy
+import warnings
 
 # ------------------#
 #  Generate Units  #
@@ -92,31 +92,121 @@ class DopplerReal(Measurement):
         Ground station or antenna instrument (e.g. GroundStation).
     sigma : ArrayWUnits, optional
         Measurement standard deviation. Defaults to ``None``.
-    meas_bias : numpy.ndarray, optional
-        Range-rate bias of the ground station. Defaults to ``None``.
+    meas_bias : float or ArrayWUnits, optional
+        Doppler bias of the ground station [Hz], used when the state vector
+        holds no ``rangerate_bias_Hz`` of this station. One value applies to
+        every pass; more hold one per pass, grouped by
+        :meth:`~scarabaeus.Measurement.set_pass_epochs`. The same holds for a
+        ``rangerate_bias_Hz`` state component. Defaults to ``None``.
     state_definition : list, optional
         StateVector definition list. Defaults to ``None``.
-    sequence_definition : list, optional
-        Sequence definition list. Defaults to ``None``.
+    sequence_definition : MissionSequence, optional
+        Mission sequence whose per-leg state definitions replace
+        *state_definition*. Defaults to ``None``.
     epoch_sec : EpochArray, optional
         Epoch expressed in seconds of day. Defaults to ``None``.
     computed_measurements_dict : dict, optional
-        Auxiliary dictionary for computed-measurement generation.
+        Auxiliary tracking-data dictionary required by
+        :meth:`computed_measurements` (only optional when the model is used
+        for observed measurements alone). Holds the TRK-2-34 [1]_ auxiliary
+        quantities of each tracking pass. :meth:`observed_measurements` fills
+        it from the tracking file (each SFDU record aligned to the
+        measurement epochs by time tag), and :meth:`default_doppler_aux`
+        builds one for synthetic measurements. Unless noted otherwise, each
+        key maps to a list/array with one entry per observation epoch (a
+        single value is applied to every epoch):
+
+        * ``'Tc'`` : Doppler count interval [s] (SFDU 16).
+        * ``'M2_num'``, ``'M2_den'`` : numerator and denominator of the
+          spacecraft transponder turn-around ratio ``M2`` (SFDU 16).
+        * ``'ul_freq'`` : uplink frequency at the time tag [Hz]
+          (SFDU 7, TRK-2-34 3-70).
+        * ``'rcv_time_tag_delay'``, ``'transmit_time_tag_delay'`` : receiver
+          and transmitter time-tag delays [s] (TRK-2-34 3-10/3-11); ``-1``
+          marks an invalid entry and is treated as 0.
+        * ``'ul_zheight_corr'``, ``'dl_zheight_corr'`` : uplink and downlink
+          z-height corrections [s] (SFDUs 2 and 3); ``-99.0`` marks an
+          invalid entry and is treated as 0.
+        * ``'ul_stn_cal'``, ``'dl_stn_cal'`` : uplink and downlink
+          ground-station calibrations [RU] (SFDU 7, TRK-2-34 3-68).
+        * ``'scft_transpd_delay'`` : spacecraft transponder delay [RU],
+          scalar (mission constant).
+        * ``'scft_transpd_delay_s'`` : the same transponder delay expressed
+          in seconds, scalar.
+        * ``'array_delay'`` : arraying-equipment path delay [s], optional;
+          ``-1`` / ``-99`` mark invalid entries and are treated as 0.
+        * ``'exc_scalar_num'``, ``'exc_scalar_den'`` : exciter scalar
+          numerator and denominator (SFDU 7), optional. Read only to convert a
+          nonzero ``'scft_transpd_delay'`` to seconds.
+        * ``'ramp_sec'``, ``'ramp_day'``, ``'ramp_freq'``, ``'ramp_rate'``,
+          ``'ramp_type'`` : transmitter frequency ramp table (SFDU 9) —
+          seconds of day, day of year, ramp reference frequency [Hz], ramp
+          rate [Hz/s], and ramp type of each ramp record (one entry per ramp
+          record, not per observation).
+        * ``'ramp_year'`` : year of each ramp record (SFDU 9 ``year``),
+          optional; needed when the ramp table or a round trip crosses a new
+          year.
+
         Defaults to ``None``.
-    partials_finite_diff : bool, optional
-        When ``True``, _partials are computed via finite differences.
-        Defaults to ``False``.
+    partials_method : {"analytical", "fd", "fd_endpoint"}, optional
+        Which H-tilde implementation to use. ``"analytical"`` (the default) uses
+        the Moyer partials, which differentiate the same light-time solution the
+        forward model produced and reuse its cached endpoints, for roughly 50x
+        less cost than ``"fd"`` on this model. ``"fd"`` finite-differences the
+        real forward model -- one full forward run per state component, slow,
+        but it differentiates exactly the observable being fitted.
+        ``"fd_endpoint"`` is the finite-difference reference with the state
+        perturbation mapped to both ends of the count interval, see
+        :meth:`_compute_partials_endpoint_fd`. Defaults to ``None``, i.e.
+        ``"analytical"``.
     eps_dict : dict, optional
-        Perturbation magnitudes for finite-difference _partials.
+        Perturbation magnitudes for finite-difference partials. Spacecraft
+        entries are keyed ``dx`` to ``dvz``; station, Earth-orientation and
+        zenith-delay entries are keyed by StateDefinition parameter kind, e.g.
+        ``gs_delta_location_CYL`` or ``eop_delta_ut1``, and are read only by
+        ``partials_method="fd"`` -- the analytical partials differentiate those
+        parameters in closed form. Omitted keys fall back to the in-code
+        defaults; see :attr:`~scarabaeus.Measurement.station_eps_defaults`.
         Defaults to ``None``.
     media_corrections : MediaCorrections, optional
         Media-correction object (troposphere / ionosphere). Defaults to ``None``.
+    light_time_frame : {"barycentric", "geocentric"}, optional
+        Space-time frame of the round-trip light-time solution. ``"barycentric"``
+        (Moyer 2000, Sec. 8.3.6) is valid for any spacecraft. ``"geocentric"``
+        (Moyer 2000, Sec. 8.3.1) keeps only the Earth's relativistic delay and is
+        meant for spacecraft near the Earth; see
+        :meth:`~scarabaeus.Measurement._compute_geocentric_RTLT` for what it
+        neglects. Defaults to ``"barycentric"``.
+    rlt_bodies : tuple, optional
+        ``(spice_id, GM)`` pairs of the bodies other than the Sun in the
+        relativistic light-time term. Defaults to ``None``, i.e.
+        :attr:`Constants.RLT_BODIES`; an empty tuple leaves only the Sun. The
+        default takes Mars, Jupiter and Saturn at their barycentres, which is
+        not accurate enough for a Jupiter or Saturn orbiter: pass the planet
+        centres instead (see :attr:`Constants.RLT_BODIES`).
+    solar_corona : bool, optional
+        Apply the solar-corona delay to the light time. Defaults to ``True``.
+    electronic_delays : bool, optional
+        Apply the time-tag, z-height, spacecraft transponder and arraying
+        delays of ``computed_measurements_dict``. Defaults to ``True``.
+    light_time_settings : dict, optional
+        Convergence settings of the light-time solution, any of the keys of
+        :attr:`Measurement.LIGHT_TIME_SETTINGS`: ``"tolerance"`` [s],
+        ``"max_iterations"`` per leg and ``"et_tai_iterations"``. Missing keys
+        take the default. Raise the tolerance for a spacecraft beyond about
+        8 AU, where 1e-12 s is below the float spacing of the light time and a
+        leg runs to ``max_iterations``. Defaults to ``None``, i.e. all defaults.
 
     See Also
     --------
     scarabaeus.Measurement : Abstract base class for all measurement models.
     scarabaeus.SequentialRangingReal : Companion real ranging model.
     scarabaeus.MediaCorrections : Tropospheric and ionospheric path-delay model.
+
+    References
+    ----------
+    .. [1] "TRK-2-34, DSN Tracking System Data Archival Format",
+           DSN No. 820-013, TRK-2-34, Rev. N.
     """
 
     # -------------#
@@ -132,9 +222,14 @@ class DopplerReal(Measurement):
         sequence_definition=None,
         epoch_sec=None,
         computed_measurements_dict=None,
-        partials_finite_diff: bool = False,
+        partials_method: str = None,
         eps_dict: dict = None,
         media_corrections: Optional[MediaCorrections] = None,
+        light_time_frame: str = "barycentric",
+        rlt_bodies: tuple = None,
+        solar_corona: bool = True,
+        electronic_delays: bool = True,
+        light_time_settings: dict = None,
     ):
         super().__init__(name, instrument)
 
@@ -146,85 +241,37 @@ class DopplerReal(Measurement):
         self._state_definition = state_definition
         self._sequence_definition = sequence_definition
         self._epoch_sec = epoch_sec
-        self._partials_finite_diff = partials_finite_diff
+        self._partials_method = Measurement._resolve_partials_method(
+            partials_method, supported=type(self).PARTIALS_METHODS
+        )
+        # Reflection-time offsets (t2s - t2_mid, t2e - t2_mid) per epoch [s], set
+        # only while _compute_partials_endpoint_fd is running.
+        self._endpoint_offsets = None
         self.compute_partials = self._compute_partials
         self.eps_dict = eps_dict
         self.computed_measurements = self.computed_measurements
         self._computed_measurements_dict = computed_measurements_dict
         self._measurement_type = "DopplerReal"
-        self._reference_state_vector: StateArray | None = None
+        self._station_override = None
+
+        # Light-time corrections
+        self._rlt_bodies = rlt_bodies
+        self._solar_corona = solar_corona
+        self._electronic_delays = electronic_delays
 
         # Media correction
-        self._media_corrections: Optional[MediaCorrections] = None
         if media_corrections is not None:
             self.media_corrections = media_corrections
 
-    # -------------------------#
-    # region ====> Properties #
-    # -------------------------#
-    @property
-    def sigma(self) -> ArrayWUnits:
-        """
-        The standard deviation of the measurement model.
-        """
-        return self._sigma
-
-    @property
-    def epoch_sec(self) -> EpochArray:
-        """Observation epochs expressed as seconds of day."""
-        return self._epoch_sec
-
-    @property
-    def computed_measurements_dict(self) -> dict:
-        """
-        Auxiliary dictionary needed for the generation of the computed measurements
-        """
-        return self._computed_measurements_dict
-
-    @property
-    def media_corrections(self) -> Optional[MediaCorrections]:
-        """Tropospheric and ionospheric path-delay model, or ``None`` if not set."""
-        return self._media_corrections
-
-    @media_corrections.setter
-    def media_corrections(self, value: MediaCorrections) -> None:
-        if not isinstance(value, MediaCorrections):
-            raise TypeError("media_corrections must be a MediaCorrections object")
-        self._media_corrections = value
-
-    # endregion => Properties #
-    # -------------------------#
+        # Space-time frame of the light-time solution
+        self._light_time_frame = Measurement._resolve_light_time_frame(light_time_frame)
+        self._light_time_settings = Measurement._resolve_light_time_settings(
+            light_time_settings
+        )
 
     # ---------#
     # Methods  #
     # ---------#
-    def _extract_real_range_rate_bias(self) -> ArrayWUnits | None:
-        """
-        Return range rate bias in Hz for THIS station, as stored in the state, if present.
-        """
-        if self._reference_state_vector is None:
-            return self._meas_bias if self._meas_bias is not None else None
-
-        state_allowed = StateDefinition._generate_allowed_state_dictionary()
-
-        # Prefer meas_bias_real_* if available in the allowed dictionary
-        if "rangerate_bias_Hz" not in state_allowed:
-            return None
-
-        for state_entry in self._reference_state_vector.state:
-            component = state_entry[0]
-            body = state_entry[4]
-            value = state_entry[5]  # ArrayWFrame (even for scalar bias)
-
-            if state_allowed["rangerate_bias_Hz"][2].match(component) is None:
-                continue
-
-            body_sid = getattr(body, "spice_id", None)
-            if body_sid == self.instrument.spice_id:
-                return value.quantity
-
-        return None
-
     def computed_measurements(
         self,
         target: Spacecraft,
@@ -260,7 +307,9 @@ class DopplerReal(Measurement):
             The reference frame in which the measurement is generated.
 
         noisy: bool
-            Whether to add noise to the computed range measurement. Defaults to False.
+            Whether to add AWGN at the model's sigma to the computed Doppler
+            measurement. For simulating observations; leave False when computing
+            predicted measurements for a filter. Defaults to False.
 
         eps_override: dict
             Dictionary of delta's to compute the numeric _partials
@@ -272,22 +321,56 @@ class DopplerReal(Measurement):
 
         Raises
         ------
-        TypeError('The noise model can't be used on a computed model of a real measurement.')
-            | Raised when noise is enabled on a computed model of a real measurement type
+        Measurement.AuxDataError
+            If ``computed_measurements_dict`` is missing, lacks a key, or holds
+            a per-epoch entry whose length differs from the epochs.
+        Measurement.MissingSigmaError
+            If ``noisy`` is True and the model has no ``sigma``.
+        Measurement.StationKernelRequiredError
+            If the station is defined by body-fixed coordinates instead of an
+            ephemeris.
+        RuntimeError
+            If a light-time solution fails (e.g. does not converge); it names
+            the epoch and the target, and chains the original error.
+        RampTableManager.RampTableYearError
+            If the ramp table or a round trip crosses a new year and
+            ``computed_measurements_dict`` has no ``'ramp_year'``.
+        MediaCorrections.IncompleteTroposphereError
+            If ``media_corrections`` has only one of the two troposphere files.
+        Measurement.MissingPassIndexError
+            If the bias holds one value per pass (more than one element) and no
+            epoch-to-pass mapping is set.
 
         Notes
         -----
         This model has been developed following the details in Moyer 2000.
         [1]: "TRK-2-34, DSN Tracking System Data Archival Format", DSN No. 820-013, TRK-2-34, Rev. N
 
+        ``noisy=False`` gives the predicted observable, against which real
+        observations are differenced. ``noisy=True`` adds white Gaussian
+        noise of standard deviation ``sigma`` to it, which simulates
+        observations.
+
+        A count interval that starts before the first ramp record has no
+        defined transmit frequency. Its computed value is NaN, with a warning,
+        and :meth:`Measurement.generate_measurement_dataset` flags it as an
+        outlier.
+
         """
 
+        self._require_station_kernel()
+
         # 0. Parameters check
+        # Accept either an explicit epoch_array or the documented
+        # epoch_start/epoch_end/tstep interval form.
+        epoch_array = Measurement._resolve_epoch_array(
+            epoch_array, epoch_start, epoch_end, tstep
+        )
         if epoch_array.system != "TDB":
-            epoch_array.convert_to("TDB")
-        if noisy is True:
-            TypeError(
-                "DopplerReal.py: The noise model can't be used on computed of a real model."
+            epoch_array = epoch_array.to(sys="TDB")
+        if noisy and self.sigma is None:
+            raise self.MissingSigmaError(
+                "DopplerReal: noisy=True needs the measurement sigma."
             )
 
         # 1. Initialization
@@ -296,32 +379,49 @@ class DopplerReal(Measurement):
         )  # Delta dict for _partials
         media_corrections = self.media_corrections  # MediaCorrection object
 
-        # Pull current bias + gs delta from state (if provided)
-        bias_awu = self._extract_real_range_rate_bias()  # ArrayWUnits or None
-        gs_delta_awf = self._extract_gs_delta_location()  # ArrayWFrame or None
+        # Pull current bias + gs delta from state (if provided). The bias holds
+        # one value for every pass or one per pass (see set_pass_epochs).
+        bias = self._extract_bias("rangerate_bias_Hz", 1 / sec)
+        if bias is not None:
+            bias = ArrayWUnits(
+                np.atleast_1d(ArrayWUnits.get_value_in_target_units(bias, 1 / sec)),
+                1 / sec,
+            )
+        bias_Hz = np.array(
+            [
+                0.0 if (b := self._bias_at_epoch(bias, epoch)) is None
+                else float(np.squeeze(b.values))
+                for epoch in epoch_array
+            ]
+        )  # [Hz], one per epoch
+        # Station location, Earth orientation and tides move the station inside
+        # the light-time solution through this correction; the estimated zenith
+        # delays are read once here and handed to the media model.
+        station_correction = self._itrf_station_correction()
+        zt, zi = self._zenith_delays()
 
-        # 2. Extract aux_dictionary quantities of interest
-        aux_dict = self.computed_measurements_dict
-        RU = aux_dict[
-            "RU"
-        ]  # RU conversion factor (pre-frequency multiplication factor)
-        M2_num = np.array(
-            aux_dict["M2_num"]
-        )  # Spacecraft turn-around ration (NUMERATOR)
-        M2_den = np.array(
-            aux_dict["M2_den"]
-        )  # Spacecraft turn-around ration (DENOMINATOR)
-        M2 = M2_num / M2_den  # Spacecraft turn-around ration
-        Tc = aux_dict["Tc"]
-        #
+        # 2. Extract aux_dictionary quantities of interest, one entry per epoch
+        t3_et_all = np.atleast_1d(epoch_array.times.values)
+        aux_dict = self._aux_per_epoch(len(t3_et_all))
+        M2_num = aux_dict["M2_num"]  # Spacecraft turn-around ratio (NUMERATOR)
+        M2_den = aux_dict["M2_den"]  # Spacecraft turn-around ratio (DENOMINATOR)
+        M2 = M2_num / M2_den  # Spacecraft turn-around ratio
+        Tc = aux_dict["Tc"]  # Count interval [s]
 
-        t3s_et_all = epoch_array.times.values - np.array(Tc) / 2
-        t3e_et_all = epoch_array.times.values + np.array(Tc) / 2
-        t3_et_all = epoch_array.times.values
+        t3s_et_all = t3_et_all - Tc / 2
+        t3e_et_all = t3_et_all + Tc / 2
 
-        t3s_year_all, t3s_doy_all, t3s_sec_all = SpiceManager.et2YDS(t3s_et_all)
-        t3e_year_all, t3e_doy_all, t3e_sec_all = SpiceManager.et2YDS(t3e_et_all)
-        _, _, t3_sec_all = SpiceManager.et2YDS(t3_et_all)
+        # Time tags of the count interval for the ramp integration, built from
+        # one conversion of t3. Converting t3s and t3e separately rounds each
+        # to the ET resolution (~1.2e-7 s at 2018 epochs) and TDB->UTC rounds
+        # them differently, so their difference could be off by a count of
+        # f_T*1.2e-7 ~ 860 cycles, i.e. ~17 Hz on 60 s X-band Doppler.
+        t3_year_all, t3_doy_all, t3_sec_all = SpiceManager.et2YDS(t3_et_all)
+        t3_sec_all = np.asarray(t3_sec_all, dtype=float)
+
+        # 3. Group data for the ramp table, read by the corona delay in the
+        # RTLT and by the integration below
+        ramp_data = Measurement._ramp_table(aux_dict)
 
         # 4. Compute precise RTLT
         rtlt_s = []
@@ -329,84 +429,147 @@ class DopplerReal(Measurement):
         t1 = []
         t2 = []
         t3 = epoch_array
+        # Endpoint quantities kept for the analytical (Moyer) partials, which
+        # differentiate this same light-time solution rather than re-solving it.
+        # Recording them is pure observation: nothing below reads these lists, so
+        # the computed measurement is unaffected whichever partials method runs.
+        _gr_s_cache = []   # GR (down, up) delays at start of count interval [s]
+        _gr_e_cache = []   # GR (down, up) delays at end of count interval [s]
+        _sc_s_cache = []   # solar corona (down+up) at start [s]
+        _sc_e_cache = []   # solar corona (down+up) at end [s]
+        _t2s_cache = []    # reflection time at start of count interval [ET s]
+        _t2e_cache = []    # reflection time at end of count interval [ET s]
         print("")
         print("Generating 2W Doppler computed measurements...")
         update, close = Measurement._progress_monitor(len(t3_et_all), desc="2W Doppler")
         # Loop through different t3
         for i in range(len(t3_et_all)):
             # Pack a dictionary for electronic delays
+            # Index by i, not 0. Using 0 applied the first record's electronic
+            # delays to every measurement in the pass, which is wrong whenever
+            # any of them vary. ul_zheight_corr in particular carries the
+            # invalid sentinel -99.0 on some records, mapped to a zero
+            # correction, so a single bad first record zeroed the uplink
+            # zenith-height correction for the whole pass. SequentialRangingReal
+            # has always indexed this by i.
             electronic_delays_dict = Measurement._generate_electronic_delays_dictionary(
-                aux_dict, 0
+                aux_dict, i, enabled=self._electronic_delays
             )
-            # Get tt at start and end of interval count
-            t3s_i = (
-                t3s_et_all[i]
-                - electronic_delays_dict["rcv_tt_dly"]
-                + electronic_delays_dict["trn_tt_dly"]
-            )
-            t3e_i = (
-                t3e_et_all[i]
-                - electronic_delays_dict["rcv_tt_dly"]
-                + electronic_delays_dict["trn_tt_dly"]
-            )
+            # Endpoint-mapped perturbation, when requested. The default rule below
+            # puts the whole velocity displacement dv*Tc on the second endpoint and
+            # leaves the first unperturbed. That is not the derivative the filter
+            # wants: the filter's state is referenced to the reflection midpoint
+            # t2_mid, so a velocity deviation there reaches the endpoints as
+            # dv*(t2x - t2_mid). Those offsets are +/-(t2e - t2s)/2, not +/-Tc/2:
+            # the reflection times are spaced by Tc(1 - rho_dot/c), and using Tc/2
+            # biased the velocity column by rho_dot/c, ~5e-5 on a cruise pass.
+            # This branch applies the mapping. See _compute_partials_endpoint_fd.
+            endpoint_dt = self._endpoint_offsets
+            delta_s = delta
+            if endpoint_dt is not None and eps_override is not None:
+                dt_s = ArrayWUnits(float(endpoint_dt[0][i]), sec)
+                eps_s = dict(eps_override)
+                for a, v in (("dx", "dvx"), ("dy", "dvy"), ("dz", "dvz")):
+                    if v in eps_s:
+                        eps_s[a] = eps_s[v] * dt_s
+                delta_s = self._build_perturbation_vector(eps_s)
+            # Get tt at start and end of interval count, as (high, low) pairs built from t3 so
+            # that the count interval does not round the epoch. The time-tag delays are applied
+            # by the RTLT driver when it forms t3(TAI) -- applying them here as well subjected
+            # every Doppler observation to the correction twice (fixed in 19455f9a).
+            t3s_h, t3s_l = EpochArray._add_duration(t3_et_all[i], 0.0, -Tc[i] / 2)
+            t3e_h, t3e_l = EpochArray._add_duration(t3_et_all[i], 0.0, Tc[i] / 2)
 
-            # Pack a dictionary for Solar Corona delays
+            # Pack a dictionary for Solar Corona delays (a zero uplink
+            # frequency turns the corona delay off; the ramp gives the
+            # frequency at t1)
             solar_corona_dict = {
-                "M2": M2_num[i] / M2_den[i],
-                "ul_freq": aux_dict["ul_freq"][i],
+                "M2": M2[i],
+                "ul_freq": aux_dict["ul_freq"][i] if self._solar_corona else 0.0,
+                "ramp": ramp_data,
             }
 
             # Generate the rtlt's
-
             try:
-                rtlt_s_i, _, t2_s_i, t1_s_i = Measurement._compute_precise_RTLT_light(
+                rtlt_s_i, parts_s_i, t2_s_i, t1_s_i = self._rtlt_solver()(
                     sc_spice_id=str(target.spice_id),
                     gs_spice_id=str(self.instrument.spice_id),
-                    tt_et=t3s_i,
+                    tt_et=t3s_h,
                     electronic_delays_dict=electronic_delays_dict,
                     solar_corona_dict=solar_corona_dict,
-                    delta_partials=delta,
+                    delta_partials=delta_s,
+                    station_correction=station_correction,
+                    tt_et_l=t3s_l,
+                    rlt_bodies=self._rlt_bodies,
+                    light_time_settings=getattr(self, "_light_time_settings", None),
                 )
 
-                # Update perturbation so second time perturbation is correlated with initial one
-                if eps_override is not None:
-                    if "dvx" in eps_override.keys():
-                        eps_override["dx"] = eps_override["dvx"] * ArrayWUnits(
-                            aux_dict["Tc"][i], sec
-                        )
-                    if "dvy" in eps_override.keys():
-                        eps_override["dy"] = eps_override["dvy"] * ArrayWUnits(
-                            aux_dict["Tc"][i], sec
-                        )
-                    if "dvz" in eps_override.keys():
-                        eps_override["dz"] = eps_override["dvz"] * ArrayWUnits(
-                            aux_dict["Tc"][i], sec
-                        )
+                # Update perturbation so second time perturbation is correlated
+                # with initial one. Full Tc in the default (asymmetric) rule,
+                # t2e - t2_mid under the endpoint-mapped rule -- see delta_s above.
+                dt_e = ArrayWUnits(
+                    float(endpoint_dt[1][i]) if endpoint_dt is not None
+                    else aux_dict["Tc"][i],
+                    sec,
+                )
+                eps_e = dict(eps_override) if (
+                    endpoint_dt is not None and eps_override is not None
+                ) else eps_override
+                if eps_e is not None:
+                    if "dvx" in eps_e.keys():
+                        eps_e["dx"] = eps_e["dvx"] * dt_e
+                    if "dvy" in eps_e.keys():
+                        eps_e["dy"] = eps_e["dvy"] * dt_e
+                    if "dvz" in eps_e.keys():
+                        eps_e["dz"] = eps_e["dvz"] * dt_e
                 delta2 = self._build_perturbation_vector(
-                    eps_override
+                    eps_e
                 )  # Delta dict for _partials
 
-                rtlt_e_i, _, t2_e_i, t1_e_i = Measurement._compute_precise_RTLT_light(
+                rtlt_e_i, parts_e_i, t2_e_i, t1_e_i = self._rtlt_solver()(
                     sc_spice_id=str(target.spice_id),
                     gs_spice_id=str(self.instrument.spice_id),
-                    tt_et=t3e_i,
+                    tt_et=t3e_h,
                     electronic_delays_dict=electronic_delays_dict,
                     solar_corona_dict=solar_corona_dict,
                     delta_partials=delta2,
+                    station_correction=station_correction,
+                    tt_et_l=t3e_l,
+                    rlt_bodies=self._rlt_bodies,
+                    light_time_settings=getattr(self, "_light_time_settings", None),
                 )
             #
             except Exception as e:
-                print(f"⚠️ Warning: RTL computation failed at iteration {i}: {e}")
-                rtlt_s_i = 0
-                rtlt_e_i = 0
-                t2_e_i = t3e_i
-                t2_s_i = t3e_i
-                t1_e_i = t3e_i
-                t1_s_i = t3e_i
+                # Previously this substituted rtlt = 0 for both ends of the
+                # count interval and carried on, which produced a computed
+                # Doppler measurement of zero that is indistinguishable
+                # downstream from a real one: it reaches the residuals, the
+                # filter and the solution as though valid.
+                raise RuntimeError(
+                    Measurement._rtlt_failure_message(
+                        model=self,
+                        index=i,
+                        total=len(t3_et_all),
+                        epoch_et=t3_et_all[i],
+                        target=target,
+                        cause=e,
+                    )
+                ) from e
             rtlt_s.append(rtlt_s_i)
             rtlt_e.append(rtlt_e_i)
             t1.append((t1_e_i + t1_s_i) / 2.0)
             t2.append((t2_e_i + t2_s_i) / 2.0)
+            # Endpoint detail for the analytical partials. The parts vector packs
+            # the per-leg delay breakdown: [1] and [3] are the down- and up-leg GR
+            # (Shapiro) delays, [12] and [14] the down- and up-leg solar corona.
+            parts_s_i = np.asarray(parts_s_i).ravel()
+            parts_e_i = np.asarray(parts_e_i).ravel()
+            _gr_s_cache.append((float(parts_s_i[1]), float(parts_s_i[3])))
+            _gr_e_cache.append((float(parts_e_i[1]), float(parts_e_i[3])))
+            _sc_s_cache.append(float(parts_s_i[12]) + float(parts_s_i[14]))
+            _sc_e_cache.append(float(parts_e_i[12]) + float(parts_e_i[14]))
+            _t2s_cache.append(float(t2_s_i))
+            _t2e_cache.append(float(t2_e_i))
             update(i)
         close()
 
@@ -415,49 +578,83 @@ class DopplerReal(Measurement):
         t1 = np.array(t1)
         t2 = np.array(t2)
 
-        # 5. Define begin and end intervals for integration with ramp tables
-        t3s_sec_integration = np.array(t3s_sec_all)
-        t3e_sec_integration = np.array(t3e_sec_all)
-        t1s_sec_integration = t3s_sec_integration - rtlt_s
-        t1e_sec_integration = t3e_sec_integration - rtlt_e
+        # 5. Define begin and end intervals for integration with ramp tables,
+        # t1 = t3 -/+ Tc/2 - RTLT in seconds of day, as (high, low) pairs. A
+        # float second of day resolves only ~7e-12 s at 5e4 s, which rounds
+        # the count by f_T*7e-12 ~ 0.05 cycles, steps of ~0.5-1 mHz on 60 s
+        # X-band Doppler.
+        t1s_sec_integration, t1s_sec_l = EpochArray._add_duration(t3_sec_all, 0.0, -Tc / 2)
+        t1s_sec_integration, t1s_sec_l = EpochArray._add_duration(
+            t1s_sec_integration, t1s_sec_l, -rtlt_s
+        )
+        t1e_sec_integration, t1e_sec_l = EpochArray._add_duration(t3_sec_all, 0.0, Tc / 2)
+        t1e_sec_integration, t1e_sec_l = EpochArray._add_duration(
+            t1e_sec_integration, t1e_sec_l, -rtlt_e
+        )
 
         # Adjust for doy rollover events
-        t1e_doy_integration = np.array(t3e_doy_all)
-        t1s_doy_integration = t1e_doy_integration
-        for ii in range(0, len(t1s_sec_integration)):
-            if t1s_sec_integration[ii] < 0:
-                t1s_doy_integration[ii] = t1s_doy_integration[ii] - 1
-                t1s_sec_integration[ii] = t1s_sec_integration[ii] + 86400
-            if t1e_sec_integration[ii] < 0:
-                t1e_doy_integration[ii] = t1e_doy_integration[ii] - 1
-                t1e_sec_integration[ii] = t1e_sec_integration[ii] + 86400
-
-        # 6. Group data for the ramp table
-        ramp_data = [
-            aux_dict["ramp_sec"],
-            aux_dict["ramp_day"],
-            aux_dict["ramp_freq"],
-            aux_dict["ramp_rate"],
-            aux_dict["ramp_type"],
-        ]
+        # Each end of the count interval carries its own day, brought back
+        # within one day: t1 precedes t3 by the light time, and t3e can
+        # pass midnight. The year is not rolled: the ramp integration counts
+        # days from 1 January of the t3 year, so day 0 or day 366 of a common
+        # year is the neighbouring year.
+        day_shift = np.floor(t1s_sec_integration / constants.day_to_sec)
+        t1s_sec_integration, t1s_sec_l = EpochArray._add_duration(
+            t1s_sec_integration, t1s_sec_l, -day_shift * constants.day_to_sec
+        )
+        t1s_doy_integration = np.asarray(t3_doy_all, dtype=float) + day_shift
+        day_shift = np.floor(t1e_sec_integration / constants.day_to_sec)
+        t1e_sec_integration, t1e_sec_l = EpochArray._add_duration(
+            t1e_sec_integration, t1e_sec_l, -day_shift * constants.day_to_sec
+        )
+        t1e_doy_integration = np.asarray(t3_doy_all, dtype=float) + day_shift
 
         # 7. Generate the computed measurement by integration with the ramp table
         doppler_meas_list = []
+        uncovered = []  # count intervals with no ramp record at the transmit time
+        first_gap = None  # the first such gap's explanation, reported once
         used_tropo_flag = np.zeros(len(rtlt_s))
         used_iono_flag = np.zeros(len(rtlt_s))
+        _f_t1s_cache = []   # transmit frequency at start of count interval [Hz]
+        _f_t1e_cache = []   # transmit frequency at end of count interval [Hz]
         for i in range(len(rtlt_s)):
             # 7.1 Perform the integration between t1 and t3 to generate f_int
-            f_int, aux_int = RampTableManager.integrate(
-                ramp_data,
-                t1s_sec_integration[i],
-                t1e_sec_integration[i],
-                t1s_doy_integration[i],
-                t1e_doy_integration[i],
-            )
-            if bias_awu is not None:
-                doppler_meas = -(M2[i] / Tc[i]) * f_int + bias_awu
-            else:
-                doppler_meas = -(M2[i] / Tc[i]) * f_int
+            try:
+                f_int, aux_int = RampTableManager.integrate(
+                    ramp_data,
+                    t1s_sec_integration[i],
+                    t1e_sec_integration[i],
+                    t1s_doy_integration[i],
+                    t1e_doy_integration[i],
+                    t3_year_all[i],
+                    t3_year_all[i],
+                    t1_q_sec_l=t1s_sec_l[i],
+                    t2_q_sec_l=t1e_sec_l[i],
+                )
+            except RampTableManager.RampCoverageError as e:
+                # No uplink frequency at t1: the observable is undefined. Record
+                # it so generate_measurement_dataset can flag it as an outlier --
+                # the code that detected the problem names the point, rather than
+                # leaving outlier rejection to infer it from a wild residual --
+                # and emit NaN so that if the flag were ever missed the result is
+                # conspicuous instead of a plausible-looking number.
+                if not hasattr(self, "_uncomputable_indices"):
+                    self._uncomputable_indices = []
+                self._uncomputable_indices.append(i)
+                # A coverage gap can span many consecutive observations; the
+                # first explanation is reported once, with the count, below.
+                if not uncovered:
+                    first_gap = str(e)
+                uncovered.append(i)
+                f_int, aux_int = float("nan"), {"f_iq1": float("nan"),
+                                               "f_iq2": float("nan"),
+                                               "n_segments": 0}
+            # Endpoint transmit frequencies for the analytical partials. Taken here
+            # rather than in the media branch below so they are recorded whether or
+            # not media corrections are applied; ul_freq is the unramped fallback.
+            _f_t1s_cache.append(float(aux_int.get("f_iq1", aux_dict["ul_freq"][i])))
+            _f_t1e_cache.append(float(aux_int.get("f_iq2", aux_dict["ul_freq"][i])))
+            doppler_meas = -(M2[i] / Tc[i]) * f_int + bias_Hz[i]
             # 7.2 Add media correction effects
             if media_corrections is None:
                 doppler_meas_list.append(doppler_meas)
@@ -472,29 +669,31 @@ class DopplerReal(Measurement):
                     f_t3_e = f_t1_e * M2[i]  # Moyer 13.2.8, [Hz]
                     # Compute tropo + iono delays
                     p_tropo_t3s, p_iono_t3s = media_corrections.computed_rtlt_delays(
-                        t3s_et_all[i], str(target.spice_id), f_t3_s, gs_delta_awf
+                        t3s_et_all[i], str(target.spice_id), f_t3_s,
+                        tropo_zenith_delay=zt, iono_zenith_delay=zi,
                     )  # [m]
                     p_tropo_t1s, p_iono_t1s = media_corrections.computed_rtlt_delays(
                         t3s_et_all[i] - rtlt_s[i],
                         str(target.spice_id),
                         f_t1_s,
-                        gs_delta_awf,
+                        tropo_zenith_delay=zt, iono_zenith_delay=zi,
                     )  # [m]
                     p_tropo_t3e, p_iono_t3e = media_corrections.computed_rtlt_delays(
-                        t3e_et_all[i], str(target.spice_id), f_t3_e, gs_delta_awf
+                        t3e_et_all[i], str(target.spice_id), f_t3_e,
+                        tropo_zenith_delay=zt, iono_zenith_delay=zi,
                     )  # [m]
                     p_tropo_t1e, p_iono_t1e = media_corrections.computed_rtlt_delays(
                         t3e_et_all[i] - rtlt_e[i],
                         str(target.spice_id),
                         f_t1_e,
-                        gs_delta_awf,
+                        tropo_zenith_delay=zt, iono_zenith_delay=zi,
                     )  # [m]
                     # NOTE: Sign of iono is negative for doppler, positive for sranging
-                    p_total_s = (1 / (constants.c.values)) * (
-                        (p_tropo_t3s - p_iono_t3s + p_tropo_t1s - p_iono_t1s) * 1e-3
+                    p_total_s = MediaCorrections.path_delay_to_light_time(
+                        p_tropo_t3s - p_iono_t3s + p_tropo_t1s - p_iono_t1s
                     )  # Moyer 10-29, [s]
-                    p_total_e = (1 / (constants.c.values)) * (
-                        (p_tropo_t3e - p_iono_t3e + p_tropo_t1e - p_iono_t1e) * 1e-3
+                    p_total_e = MediaCorrections.path_delay_to_light_time(
+                        p_tropo_t3e - p_iono_t3e + p_tropo_t1e - p_iono_t1e
                     )  # Moyer 10-28, [s]
                     # Add delay into measurement
                     p_total_Hz = (M2[i] / Tc[i]) * (
@@ -502,19 +701,21 @@ class DopplerReal(Measurement):
                     )  # Moyer 13-58
                     doppler_meas_media = doppler_meas + p_total_Hz
                     doppler_meas_list.append(doppler_meas_media)
-                    # Keep track of the media correction used
+                    # Keep track of the media correction used. .values because
+                    # the media delays are unit-bearing now; ArrayWUnits refuses
+                    # comparison against a bare number.
                     if (
-                        (p_tropo_t3s != 0.0)
-                        or (p_tropo_t1s != 0.0)
-                        or (p_tropo_t3e != 0.0)
-                        or (p_tropo_t1e != 0.0)
+                        (p_tropo_t3s.values != 0.0)
+                        or (p_tropo_t1s.values != 0.0)
+                        or (p_tropo_t3e.values != 0.0)
+                        or (p_tropo_t1e.values != 0.0)
                     ):
                         used_tropo_flag[i] = 1
                     if (
-                        (p_iono_t3s != 0.0)
-                        or (p_iono_t1s != 0.0)
-                        or (p_iono_t3e != 0.0)
-                        or (p_iono_t1e != 0.0)
+                        (p_iono_t3s.values != 0.0)
+                        or (p_iono_t1s.values != 0.0)
+                        or (p_iono_t3e.values != 0.0)
+                        or (p_iono_t1e.values != 0.0)
                     ):
                         used_iono_flag[i] = 1
                 else:
@@ -531,7 +732,47 @@ class DopplerReal(Measurement):
                 parts.append(f"iono ({n_iono}/{len(used_iono_flag)} measurements)")
             print(f"Applying media corrections: {', '.join(parts)}")
 
-        return t1, t2, t3, ArrayWFrame(ArrayWUnits(doppler_meas_list, 1 / sec), J2000)
+        if uncovered:
+            warnings.warn(
+                f"DopplerReal '{self.name}': {len(uncovered)} of {len(rtlt_s)} "
+                "count intervals have no ramp record at their transmit time "
+                f"(epoch indices {uncovered}); their computed Doppler is NaN and "
+                f"they are flagged as outliers. First: {first_gap}"
+            )
+
+        meas_awu = ArrayWUnits(doppler_meas_list, 1 / sec)
+
+        # Noise, for simulating observations (the sigma was checked on entry).
+        # Predicted measurements for a filter are computed with noisy=False and
+        # are left untouched.
+        if noisy:
+            sigma_Hz = float(
+                np.squeeze(ArrayWUnits.get_value_in_target_units(self.sigma, 1 / sec))
+            )
+            meas_awu = meas_awu + Noise().generate_AWGN_with_units(
+                mu=0.0, sigma=sigma_Hz, units=1 / sec, count=len(doppler_meas_list)
+            )
+
+        # Publish the endpoint cache for the analytical (Moyer 13-59) partials.
+        # Keyed by the reception epochs so the partials can confirm the cache is
+        # current for the epoch_array they are handed (see _cache_matches).
+        self._last_f_t1s = np.array(_f_t1s_cache)   # f_T at start of count interval [Hz]
+        self._last_f_t1e = np.array(_f_t1e_cache)   # f_T at end of count interval [Hz]
+        self._last_t3s_et = np.array(t3s_et_all)    # reception epoch at start [ET s]
+        self._last_t3e_et = np.array(t3e_et_all)    # reception epoch at end [ET s]
+        self._last_rtlt_s = np.array(rtlt_s)        # RTLT at start [s]
+        self._last_rtlt_e = np.array(rtlt_e)        # RTLT at end [s]
+        self._last_gr_s = np.array(_gr_s_cache).reshape(-1, 2)  # GR (dn, up) at start [s]
+        self._last_gr_e = np.array(_gr_e_cache).reshape(-1, 2)  # GR (dn, up) at end [s]
+        self._last_sc_s = np.array(_sc_s_cache)     # solar corona (dn+up) at start [s]
+        self._last_sc_e = np.array(_sc_e_cache)     # solar corona (dn+up) at end [s]
+        self._last_t2s = np.array(_t2s_cache)       # reflection time at start [ET s]
+        self._last_t2e = np.array(_t2e_cache)       # reflection time at end [ET s]
+        self._last_t2_mid = np.array(t2)            # midpoint reflection time = filter t2
+        # Fingerprint of the reception epochs this cache was built for
+        self._partials_cache_key = np.array(t3_et_all)
+
+        return t1, t2, t3, ArrayWFrame(meas_awu, J2000)
 
     def _compute_partials(
         self,
@@ -540,166 +781,582 @@ class DopplerReal(Measurement):
         frame: Frame = J2000,
     ) -> list[np.ndarray]:
         """
-        Dispatches computation of Doppler measurement _partials depending on chosen method.
+        Compute the Doppler partials with the method chosen by ``partials_method``.
+
+        Parameters
+        ----------
+        target : Spacecraft
+            Spacecraft the Doppler data tracks.
+        epoch_array : EpochArray
+            Measurement epochs.
+        frame : Frame, optional
+            Inertial frame the state partials are expressed in. Defaults to
+            ``J2000``.
+
+        Returns
+        -------
+        list of np.ndarray
+            One partial row per epoch, with a column for each state component.
 
         Raises
         ------
-        TypeError if a non-finite differencing method is selected but not implemented.
+        Measurement.SequencePartialsError
+            If a sequence definition is set and ``partials_method`` is
+            ``"fd"``, which builds every column from one state definition.
+        ValueError
+            If ``partials_method`` is not one of :attr:`PARTIALS_METHODS`. The
+            constructor already rejects such a value, so this only fires when the
+            attribute is set directly.
+
+        Notes
+        -----
+        ``"analytical"`` (the default) calls :meth:`_compute_analytical_partials`,
+        ``"fd"`` calls :meth:`_compute_partials_with_fd` and ``"fd_endpoint"`` calls
+        :meth:`_compute_partials_endpoint_fd`.
         """
 
-        if self._sequence_definition is not None:
-            raise NotImplementedError(
-                "Sequence-based state definitions are not implemented."
+        method = self._partials_method
+        if method == "fd" and self._sequence_definition is not None:
+            raise Measurement.SequencePartialsError(
+                f"{type(self).__name__} cannot finite-difference the partials "
+                "across a mission sequence; use partials_method='analytical'."
             )
-
-        if self._partials_finite_diff:
-            return self._compute_partials_with_fd(target, epoch_array, frame)
-        else:
-            print(
-                "Warning: computing idealized partial derivatives of measurement function"
+        if method == "fd":
+            return self._compute_partials_with_fd(
+                target, epoch_array, frame, bias_key="rangerate_bias_Hz"
             )
-            return self._compute_ideal_partials(target, epoch_array, frame)
+        if method == "fd_endpoint":
+            return self._compute_partials_endpoint_fd(target, epoch_array, frame)
+        if method == "analytical":
+            return self._compute_analytical_partials(target, epoch_array, frame)
+        # Unreachable via the constructor, which validates against
+        # PARTIALS_METHODS. Guards against _partials_method being set
+        # directly.
+        raise ValueError(
+            f"{type(self).__name__} has no implementation for "
+            f"partials_method={method!r}. Supported: "
+            f"{', '.join(type(self).PARTIALS_METHODS)}."
+        )
 
-    #
-    def _compute_h_tilde_pos(self, relative_state: ArrayWUnits) -> list:
+    # ---------------------------------------------------------------------#
+    # region   Analytical (Moyer) partials                                #
+    # ---------------------------------------------------------------------#
+    # Ported from giovanni_real_msr_experiments. These differentiate the same
+    # light-time solution the forward model produces, reusing its cached
+    # endpoints rather than re-solving, which is what makes them ~two orders of
+    # magnitude cheaper than the finite-difference path.
+
+    def _h_tilde_tropo_z_dry_doppler(
+        self,
+        R_dry_t3e: float,
+        R_dry_t1e: float,
+        R_dry_t3s: float,
+        R_dry_t1s: float,
+        f_T_e: float,
+        f_T_s: float,
+        M2: float,
+        Tc: float,
+    ) -> float:
         """
-        This method generate the portion in the h_tilde matrix relative to the partial of the ideal rangerate measurement model
-        with respect to the position components.
+        Partial of the two-way Doppler observable with respect to a dry zenith
+        troposphere delay correction.
 
-        Parameters:
-            relative_state (ArrayWUnits) : relative state between self and target
+        Parameters
+        ----------
+        R_dry_t3e, R_dry_t1e : float
+            Chao dry mapping function values [-] on the downleg (reception
+            :math:`t_3`) and the upleg (transmission :math:`t_1`) at the end of the
+            count interval.
+        R_dry_t3s, R_dry_t1s : float
+            The same mapping function values at the start of the count interval.
+        f_T_e, f_T_s : float
+            Transmitter frequency [Hz] at the transmission time of the end and of
+            the start of the count interval.
+        M2 : float
+            Spacecraft transponder turnaround ratio.
+        Tc : float
+            Count interval [s].
 
-        Returns:
-            np.array: The (3,) vector the partial derivatives of the measurement model by the position components
+        Returns
+        -------
+        float
+            :math:`\\partial F / \\partial \\Delta\\rho_{z,dry}` [Hz/m].
+
+        Notes
+        -----
+        The zenith correction maps onto each leg through the Chao mapping function
+        (Moyer eq. 10-7) and enters the Doppler observable through the
+        count-interval difference of Moyer eq. 13-59:
+
+        .. math::
+
+            \\frac{\\partial F}{\\partial \\Delta\\rho_{z,dry}} =
+                \\frac{M_2}{T_c\\,c} \\left[
+                f_{T,e} \\left( R_{dry}(t_{3e}) + R_{dry}(t_{1e}) \\right)
+                - f_{T,s} \\left( R_{dry}(t_{3s}) + R_{dry}(t_{1s}) \\right) \\right]
+
+        with :math:`c` in m/s. For unramped data :math:`f_{T,e} = f_{T,s}`, so the
+        partial is proportional to the rate of change of the mapping function over
+        the count interval and is typically very small. The ionosphere dominates
+        media estimation from Doppler; use ranging data
+        (:class:`SequentialRangingReal`) to estimate zenith delays.
 
         References
         ----------
-        Tapley, B. D., Schutz, B. E., & Born, G. H. (2004). Statistical Orbit Determination. Elsevier Academic Press. ISBN 978-0-12-683630-1 (p. 161, eq. 4.2.6).
-
+        .. [1] Moyer, T. D. (2000). *Formulation for Observed and Computed Values of
+           Deep Space Network Data Types for Navigation*. JPL Monograph 2,
+           eqs. 10-7 and 13-59.
         """
-        range_val = relative_state[0:3].norm()
-        range_rate = (relative_state[0:3] @ relative_state[3:6]) / range_val
-        h_tilde = [
-            (
-                (relative_state[3] / range_val)
-                - (relative_state[0] * range_rate) / (range_val * range_val)
-            ).values,
-            (
-                (relative_state[4] / range_val)
-                - (relative_state[1] * range_rate) / (range_val * range_val)
-            ).values,
-            (
-                (relative_state[5] / range_val)
-                - (relative_state[2] * range_rate) / (range_val * range_val)
-            ).values,
-        ]
-        return np.array(h_tilde)
+        return float(
+            (M2 / Tc)
+            * (f_T_e * (R_dry_t3e + R_dry_t1e) - f_T_s * (R_dry_t3s + R_dry_t1s))
+            / (float(constants.c.values) * constants.km_to_m)
+        )
 
-    # velocity
-    def _compute_h_tilde_vel(self, relative_state: ArrayWUnits) -> list:
+    def _h_tilde_tropo_z_wet_doppler(
+        self,
+        R_wet_t3e: float,
+        R_wet_t1e: float,
+        R_wet_t3s: float,
+        R_wet_t1s: float,
+        f_T_e: float,
+        f_T_s: float,
+        M2: float,
+        Tc: float,
+    ) -> float:
         """
-        This method generate the portion in the h_tilde matrix relative to the partial of the ideal rangerate measurement model
-        with respect to the velocity components.
+        Partial of the two-way Doppler observable with respect to a wet zenith
+        troposphere delay correction.
 
-        Parameters:
-            relative_state (ArrayWUnits) : relative state between self and target
+        Parameters
+        ----------
+        R_wet_t3e, R_wet_t1e : float
+            Chao wet mapping function values [-] on the downleg (reception
+            :math:`t_3`) and the upleg (transmission :math:`t_1`) at the end of the
+            count interval.
+        R_wet_t3s, R_wet_t1s : float
+            The same mapping function values at the start of the count interval.
+        f_T_e, f_T_s : float
+            Transmitter frequency [Hz] at the transmission time of the end and of
+            the start of the count interval.
+        M2 : float
+            Spacecraft transponder turnaround ratio.
+        Tc : float
+            Count interval [s].
 
-        Returns:
-            np.array: The (3,) vector the partial derivatives of the measurement model by the velocity components
+        Returns
+        -------
+        float
+            :math:`\\partial F / \\partial \\Delta\\rho_{z,wet}` [Hz/m].
+
+        Notes
+        -----
+        The same expression as :meth:`_h_tilde_tropo_z_dry_doppler` with the wet
+        mapping function (Moyer eq. 10-10) in place of the dry one:
+
+        .. math::
+
+            \\frac{\\partial F}{\\partial \\Delta\\rho_{z,wet}} =
+                \\frac{M_2}{T_c\\,c} \\left[
+                f_{T,e} \\left( R_{wet}(t_{3e}) + R_{wet}(t_{1e}) \\right)
+                - f_{T,s} \\left( R_{wet}(t_{3s}) + R_{wet}(t_{1s}) \\right) \\right]
 
         References
         ----------
-        Tapley, B. D., Schutz, B. E., & Born, G. H. (2004). Statistical Orbit Determination. Elsevier Academic Press. ISBN 978-0-12-683630-1 (p. 161, eq. 4.2.6).
-
+        .. [1] Moyer, T. D. (2000). *Formulation for Observed and Computed Values of
+           Deep Space Network Data Types for Navigation*. JPL Monograph 2,
+           eqs. 10-7, 10-10 and 13-59.
         """
-        range_val = relative_state[0:3].norm()
-        h_tilde = [
-            (relative_state[0] / range_val).values,
-            (relative_state[1] / range_val).values,
-            (relative_state[2] / range_val).values,
-        ]
-        return np.array(h_tilde)
+        return float(
+            (M2 / Tc)
+            * (f_T_e * (R_wet_t3e + R_wet_t1e) - f_T_s * (R_wet_t3s + R_wet_t1s))
+            / (float(constants.c.values) * constants.km_to_m)
+        )
 
-    #
+    def _h_tilde_iono_bias_doppler(
+        self,
+        p_iono_t3e: float,
+        p_iono_t1e: float,
+        p_iono_t3s: float,
+        p_iono_t1s: float,
+        f_T_e: float,
+        f_T_s: float,
+        M2: float,
+        Tc: float,
+    ) -> float:
+        """
+        Partial of the two-way Doppler observable with respect to the ionosphere
+        scale factor :math:`b_{iono}`.
 
-    def _compute_ideal_partials(
+        Parameters
+        ----------
+        p_iono_t3e, p_iono_t1e : float
+            Nominal ionospheric path delay [m] on the downleg (reception
+            :math:`t_3`) and the upleg (transmission :math:`t_1`) at the end of the
+            count interval, each at its own leg's frequency.
+        p_iono_t3s, p_iono_t1s : float
+            The same path delays at the start of the count interval.
+        f_T_e, f_T_s : float
+            Transmitter frequency [Hz] at the transmission time of the end and of
+            the start of the count interval.
+        M2 : float
+            Spacecraft transponder turnaround ratio.
+        Tc : float
+            Count interval [s].
+
+        Returns
+        -------
+        float
+            :math:`\\partial F / \\partial b_{iono}` [Hz].
+
+        Notes
+        -----
+        :math:`b_{iono}` multiplies the nominal ionospheric correction (nominally 1,
+        Moyer eq. 10-11), so the partial is the nominal correction itself, combined
+        over the count interval through Moyer eq. 13-59:
+
+        .. math::
+
+            \\frac{\\partial F}{\\partial b_{iono}} = -\\frac{M_2}{T_c\\,c} \\left[
+                f_{T,e} \\left( p_{iono}(t_{3e}) + p_{iono}(t_{1e}) \\right)
+                - f_{T,s} \\left( p_{iono}(t_{3s}) + p_{iono}(t_{1s}) \\right) \\right]
+
+        with :math:`c` in m/s. The sign is negative for Doppler, opposite to ranging,
+        because the ionosphere advances the phase and delays the group (Moyer
+        eqs. 10-28 and 10-29).
+
+        References
+        ----------
+        .. [1] Moyer, T. D. (2000). *Formulation for Observed and Computed Values of
+           Deep Space Network Data Types for Navigation*. JPL Monograph 2,
+           eqs. 10-11, 10-28, 10-29 and 13-59.
+        """
+        return float(
+            -(M2 / Tc)
+            * (f_T_e * (p_iono_t3e + p_iono_t1e) - f_T_s * (p_iono_t3s + p_iono_t1s))
+            / (float(constants.c.values) * constants.km_to_m)
+        )
+
+    def _endpoint_light_path(self, target_name: str, t3x: float, frame_name: str, c: float):
+        """
+        Light-path geometry at one count-interval endpoint, received at ``t3x``.
+
+        Parameters
+        ----------
+        target_name : str
+            SPICE name of the spacecraft.
+        t3x : float
+            Reception epoch at the station [ET s].
+        frame_name : str
+            Inertial frame the vectors are expressed in.
+        c : float
+            Speed of light [km/s].
+
+        Returns
+        -------
+        n_dn, n_up : np.ndarray
+            Unit vectors (3,) from the station to the spacecraft on the downleg and
+            on the upleg.
+        v_sc, v_gs : np.ndarray
+            Transmitter velocities (3,) of Moyer eq. 8-60 in the light-time frame
+            [km/s]: the spacecraft at :math:`t_2` and the station at :math:`t_1`, not
+            the station-relative velocity.
+        t2x, t1x : float
+            Reflection and transmission epochs [ET s].
+        """
+        rel_dn = SpiceManager.get_state(target_name, t3x, frame_name, self.instrument.name, "LT")
+        rho_dn = float(rel_dn[0:3].norm().values)
+        n_dn = rel_dn[0:3].values / rho_dn
+        t2x = t3x - rho_dn / c
+        rel_up = SpiceManager.get_state(self.instrument.name, t2x, frame_name, target_name, "LT")
+        rho_up = float(rel_up[0:3].norm().values)
+        n_up = -rel_up[0:3].values / rho_up
+        v_sc = self._light_time_velocity(target_name, t2x, frame_name)
+        t1x = t2x - rho_up / c
+        v_gs = self._light_time_velocity(self.instrument.name, t1x, frame_name)
+        return n_dn, n_up, v_sc, v_gs, t2x, t1x
+
+    def _doppler_state_row_moyer(
+        self,
+        target_name: str,
+        frame_name: str,
+        epoch_idx: int,
+        M2: float,
+        c: float,
+    ) -> np.ndarray:
+        """
+        Pre-scaled state partial row of the two-way Doppler observable, referenced
+        to the spacecraft reflection time :math:`t_{2,mid}`.
+
+        :math:`t_{2,mid}` is the time the OD filter associates with the measurement
+        and maps from with :math:`\\Phi(t_0, t_{2,mid})`.
+
+        Parameters
+        ----------
+        target_name : str
+            SPICE name of the spacecraft.
+        frame_name : str
+            Inertial frame the partials are expressed in.
+        epoch_idx : int
+            Index of the measurement in the light-time cache filled by
+            :meth:`computed_measurements`.
+        M2 : float
+            Spacecraft transponder turnaround ratio.
+        c : float
+            Speed of light [km/s].
+
+        Returns
+        -------
+        np.ndarray
+            Row (6,) holding :math:`\\partial F / \\partial \\mathbf{r}` and
+            :math:`\\partial F / \\partial \\mathbf{v}` at :math:`t_{2,mid}`,
+            pre-scaled by :math:`c / f_{UL}`. The caller's scale factor
+            :math:`f_{UL} / c` recovers Hz/km and Hz/(km/s).
+
+        Notes
+        -----
+        Moyer eq. 13-59 with the count-interval endpoints mapped to
+        :math:`t_{2,mid}` through the real state transition matrix (Moyer ch. 12):
+
+        .. math::
+
+            \\frac{\\partial F}{\\partial \\mathbf{X}(t_{2,mid})} =
+                \\frac{M_2}{T_c} \\left[
+                f_{T,e}\\, \\mathbf{g}^e\\, \\Phi(t_2^e, t_{2,mid})
+                - f_{T,s}\\, \\mathbf{g}^s\\, \\Phi(t_2^s, t_{2,mid}) \\right]
+
+        where :math:`\\mathbf{g}^x = [\\partial\\rho^x / \\partial\\mathbf{r}_{SC}(t_2^x),
+        \\mathbf{0}]` is the geometric light-time gradient of
+        :meth:`Measurement.rtlt_grad_pos_exact` (Moyer eqs. 12-12 and 12-17). It has
+        no velocity part because :math:`\\rho` is geometric in the reflection-time
+        position, so the velocity sensitivity comes entirely from the
+        :math:`\\Phi_{rv}` block and carries the true dynamics. Without a reference
+        trajectory the STM falls back to free flight,
+        :math:`\\Phi_{rr} = I` and :math:`\\Phi_{rv} = (t_2^x - t_{2,mid})\\, I`.
+
+        References
+        ----------
+        .. [1] Moyer, T. D. (2000). *Formulation for Observed and Computed Values of
+           Deep Space Network Data Types for Navigation*. JPL Monograph 2,
+           eqs. 12-12, 12-17 and 13-59.
+        """
+        aux_dict = self.computed_measurements_dict
+        Tc_i = float(aux_dict["Tc"][epoch_idx])
+        ul_freq = float(aux_dict["ul_freq"][epoch_idx])
+
+        f_Te = float(self._last_f_t1e[epoch_idx])
+        f_Ts = float(self._last_f_t1s[epoch_idx])
+        t3e = float(self._last_t3e_et[epoch_idx])
+        t3s = float(self._last_t3s_et[epoch_idx])
+        t2e = float(self._last_t2e[epoch_idx])
+        t2s = float(self._last_t2s[epoch_idx])
+        t2_mid = float(self._last_t2_mid[epoch_idx])
+
+        def _grad_pos(t3x):
+            """Geometric light-time position gradient :math:`\\partial\\rho / \\partial\\mathbf{r}_{SC}(t_2)` [s/km] for reception at ``t3x``."""
+            n_dn, n_up, v_sc, v_gs, *_ = self._endpoint_light_path(target_name, t3x, frame_name, c)
+            return Measurement.rtlt_grad_pos_exact(n_dn, n_up, v_sc, v_gs, c)  # (3,) [s/km]
+
+        def _rho_row6(t3x, t2x):
+            """Row (6,) :math:`\\partial\\rho / \\partial\\mathbf{X}(t_{2,mid})`: the geometric gradient mapped with the real STM :math:`\\Phi(t_2^x, t_{2,mid})`."""
+            if t3x == 0.0:
+                return np.zeros(6)
+            g = _grad_pos(t3x)                                  # (3,) ∂ρ/∂r_SC(t2x)
+            Phi = self._short_arc_stm(t2x, t2_mid)              # (6,6) real STM, or None
+            if Phi is None:
+                # Free-flight fallback: Φ_rr = I, Φ_rv = (t2x − t2_mid)·I
+                row = np.zeros(6)
+                row[0:3] = g
+                row[3:6] = g * (t2x - t2_mid)
+                return row
+            # ρ depends on r_SC(t2x) only → use the position rows (0:3) of Φ
+            return g @ Phi[0:3, 0:6]                            # (6,)
+
+        row_e = _rho_row6(t3e, t2e)
+        row_s = _rho_row6(t3s, t2s)
+
+        # Moyer 13-59, pre-scale (×c/ul_freq so the trailing scale_fac=ul_freq/c gives Hz)
+        return (M2 / Tc_i) * (f_Te * row_e - f_Ts * row_s) * (c / ul_freq)
+
+    def _station_row_doppler(
+        self,
+        component_def,
+        target_name: str,
+        frame_name: str,
+        epoch_idx: int,
+        M2: float,
+        c: float,
+    ) -> list:
+        """
+        Pre-scaled partial of the two-way Doppler observable with respect to one
+        station parameter.
+
+        Parameters
+        ----------
+        component_def : sequence
+            State entry ``(name, dimension, flag, dynamics, owner, ...)``: a
+            location (Cartesian or cylindrical), orientation, EOP or Love/Shida
+            component.
+        target_name : str
+            SPICE name of the spacecraft.
+        frame_name : str
+            Inertial frame of the light-time solution.
+        epoch_idx : int
+            Index of the measurement in the light-time cache.
+        M2 : float
+            Spacecraft transponder turnaround ratio.
+        c : float
+            Speed of light [km/s].
+
+        Returns
+        -------
+        list of float
+            :math:`\\partial F / \\partial p`, one entry per component, pre-scaled
+            by :math:`c / f_{UL}` like :meth:`_doppler_state_row_moyer`; zeros
+            when the component does not move this station.
+
+        Notes
+        -----
+        At each count-interval endpoint :math:`x` the round-trip light time moves
+        with the station at reception and at transmission,
+
+        .. math::
+
+            \\frac{\\partial\\rho^x}{\\partial p} =
+                \\mathbf{g}_3^x J(t_3^x) + \\mathbf{g}_1^x J(t_1^x)
+
+        where :math:`J` is the station Jacobian of
+        :meth:`Measurement._station_state_partials` at the leg epoch (Earth
+        rotation makes :math:`J(t_3) \\neq J(t_1)`), and :math:`\\mathbf{g}_3`,
+        :math:`\\mathbf{g}_1` are the exact per-leg station gradients of
+        :meth:`Measurement.rtlt_grad_station_exact` plus the station's ET - TAI
+        term from :meth:`Measurement._station_clock_gradient` (Moyer eq. 2-23),
+        assembled by :meth:`Measurement._rtlt_station_row`. A static offset has
+        a Doppler signature only because :math:`J` rotates over the count
+        interval; the endpoints are combined through Moyer eq. 13-59:
+
+        .. math::
+
+            \\frac{\\partial F}{\\partial p} = \\frac{M_2}{T_c} \\left[
+                f_{T,e} \\frac{\\partial\\rho^e}{\\partial p}
+                - f_{T,s} \\frac{\\partial\\rho^s}{\\partial p} \\right]
+
+        Checked against a central difference of the forward model, with the
+        parameter perturbed in the reference state.
+
+        References
+        ----------
+        .. [1] Moyer, T. D. (2000). *Formulation for Observed and Computed Values of
+           Deep Space Network Data Types for Navigation*. JPL Monograph 2,
+           eqs. 2-23, 12-12, 12-17 and 13-59.
+        """
+        aux_dict = self.computed_measurements_dict
+        Tc_i = float(aux_dict["Tc"][epoch_idx])
+        ul_freq = float(aux_dict["ul_freq"][epoch_idx])
+        f_Te = float(self._last_f_t1e[epoch_idx])
+        f_Ts = float(self._last_f_t1s[epoch_idx])
+        rows = []
+        for t3x, rtlt_x in ((self._last_t3e_et[epoch_idx], self._last_rtlt_e[epoch_idx]),
+                            (self._last_t3s_et[epoch_idx], self._last_rtlt_s[epoch_idx])):
+            t3x = float(t3x)
+            n_dn, n_up, v_sc, v_gs, *_ = self._endpoint_light_path(target_name, t3x, frame_name, c)
+            rows.append(self._rtlt_station_row(
+                component_def, t3x, t3x - float(rtlt_x), n_dn, n_up, v_sc, v_gs, frame_name, c))
+        row_e, row_s = rows
+        return list((M2 / Tc_i) * (f_Te * row_e - f_Ts * row_s) * (c / ul_freq))
+
+    def _compute_analytical_partials(
         self,
         target: Spacecraft,
         epoch_array: EpochArray,
         frame: Frame = J2000,
     ) -> np.ndarray:
         """
-        This method groups toghether the different components of measurement
-        _partials in the global H-tilde. It returns the H-tilde array for the modelled measurement.
+        Assemble the analytical H-tilde rows for this Doppler model.
 
-        Parameters:
-            target (Body, Spacecraft) : target spacecraft as scb Spacecraft/Body object
-            epoch (Epoch) : epochs as scb Epoch object
-            frame (Frame) : reference frame as scb Frame object
+        Groups together the different components of the measurement partials in
+        the global H-tilde, one row per epoch, ordered by state component. The
+        light-time geometry is evaluated on both legs, so the partials follow the
+        Moyer formulation rather than an instantaneous approximation.
 
-        Returns:
-            list: The H-tilde array with all measurements _partials from this model by component
+        Parameters
+        ----------
+        target : Spacecraft
+            Target spacecraft the observable is computed to.
+        epoch_array : EpochArray
+            Epochs at which the partials are evaluated. These are the receive
+            times ``t3``; the spacecraft transmit time ``t2`` and the station
+            uplink transmit time ``t1`` are recovered from the light-time
+            solution.
+        frame : Frame, optional
+            Reference frame in which the partials are expressed. Defaults to
+            ``J2000``.
+
+        Returns
+        -------
+        list
+            One H-tilde row per epoch, holding the measurement partials by
+            state component.
+
+        Raises
+        ------
+        Measurement.MissingPassIndexError
+            If the state holds a stacked per-pass ``rangerate_bias_Hz`` for
+            this station (dimension > 1) and no epoch-to-pass mapping is set.
+
+        Notes
+        -----
+        The endpoint cache is populated on demand through
+        :meth:`_ensure_partials_cache`, which runs the forward model when the
+        cached ramp frequencies, reflection times and delays do not match
+        ``epoch_array``.
+
+        The per-epoch transponder turnaround ratio :math:`M_2` is taken from the
+        ``M2_num`` / ``M2_den`` entries of ``computed_measurements_dict``.
+
+        With a sequence definition each row takes the state definition of the
+        leg holding its epoch (see :meth:`_use_leg_state_definition`), so rows
+        of different legs can differ in width.
         """
+
+        # Ensure the endpoint cache is present and current for these epochs
+        # (transparently runs the forward model on a cache miss).
+        self._ensure_partials_cache(target, epoch_array, frame)
 
         partials_list = []
 
+        c_val = constants.c.values  # km/s
+        aux_dict = self.computed_measurements_dict
+        M2_num_arr = np.array(aux_dict["M2_num"])
+        M2_den_arr = np.array(aux_dict["M2_den"])
+
+        state_allowed = StateDefinition._generate_allowed_state_dictionary()
+
         for i, epoch in enumerate(epoch_array):
-            #
-            # Get relative state
-            relative_state = SpiceManager.get_state(
-                trgt_bdy=target.name,
-                epoch_time=epoch.times.values,
-                reference_frame=frame.name,
-                obsvr_bdy=self.instrument.name,
-            )
+            # In a sequence each row takes the state definition of its leg
+            self._use_leg_state_definition(epoch)
 
-            # Apply GS delta location from *state* (if present) by perturbing 3D relative pos
-            gs_delta_awf = (
-                self._extract_gs_delta_location()
-            )  # returns ArrayWFrame or None
-            if gs_delta_awf is not None:
-                A = SpiceManager.get_xfrm(
-                    frame_from=gs_delta_awf.frame.name,
-                    frame_to=frame.name,
-                    epoch=epoch.times.values,
-                )
-                delta_in_frame_vals = (
-                    A
-                    @ gs_delta_awf.quantity.values.reshape(
-                        3,
-                    )
-                ).reshape(
-                    3,
-                )
-                delta_in_frame = ArrayWUnits(
-                    delta_in_frame_vals, gs_delta_awf.quantity.units
-                )
+            # Every row below evaluates its own endpoint geometry (t3e/t3s and
+            # their reflection times) from the forward-model cache.
 
-                # Update relative position in-place (relative_state is ArrayWUnits)
-                # Convention: r_rel = r_trg - r_obs, so observer correction enters with minus sign
-                relative_state = ArrayWUnits(
-                    np.hstack(
-                        [
-                            relative_state[0:3].values - delta_in_frame.values,
-                            relative_state[3:6].values,
-                        ]
-                    ),
-                    relative_state.units,
-                )
+            # Per-epoch transponder ratio M₂
+            idx = min(i, len(M2_num_arr) - 1)
+            M2_i = float(M2_num_arr[idx]) / float(M2_den_arr[idx])
 
-            # Generate the dictionary of allowed StateVector component from the StateArray class
-            state_allowed = StateDefinition._generate_allowed_state_dictionary()
+            # The position and velocity blocks are the two halves of one Moyer
+            # row, computed on first use within the epoch
+            state_row = None
 
             # Stack h_tilde based on StateVector components
             h_tilde = []
             target_sid = getattr(target, "spice_id", None)
 
-            if (
-                self._state_definition is None
-            ):  # Assumes that in the nominal case only position and velocity are StateVector components
-                h_tilde.extend(self._compute_h_tilde_pos(relative_state))
-                h_tilde.extend(self._compute_h_tilde_vel(relative_state))
-            else:  # When extra parameters other than position and velocity are part of the StateVector
+            if self._state_definition is None:
+                state_row = self._doppler_state_row_moyer(
+                    target.name, frame.name, idx, M2_i, c_val
+                )
+                h_tilde.extend(list(state_row))
+            else:
                 for component_def in self._state_definition:
                     component = component_def[0]
                     comp_body = component_def[4] if len(component_def) > 4 else None
@@ -707,288 +1364,354 @@ class DopplerReal(Measurement):
 
                     if state_allowed["position"][2].match(component):
                         if comp_body_sid == target_sid:
-                            # Position of the target spacecraft
-                            h_tilde.extend(self._compute_h_tilde_pos(relative_state))
+                            if state_row is None:
+                                state_row = self._doppler_state_row_moyer(
+                                    target.name, frame.name, idx, M2_i, c_val
+                                )
+                            h_tilde.extend(list(state_row[0:3]))
                         else:
-                            # Position of another body → no sensitivity
                             h_tilde.extend([0.0] * 3)
 
                     elif state_allowed["velocity"][2].match(component):
+                        # Velocity sensitivity from the Phi_rv block of the real
+                        # STM, not the free-flight dt*I, whenever a reference
+                        # trajectory is present
                         if comp_body_sid == target_sid:
-                            # Velocity of the target spacecraft
-                            h_tilde.extend(self._compute_h_tilde_vel(relative_state))
+                            if state_row is None:
+                                state_row = self._doppler_state_row_moyer(
+                                    target.name, frame.name, idx, M2_i, c_val
+                                )
+                            h_tilde.extend(list(state_row[3:6]))
                         else:
-                            # Velocity of another body → no sensitivity
                             h_tilde.extend([0.0] * 3)
+
                     elif state_allowed["eta_srp"][2].match(component):
-                        # eta_srp
-                        h_tilde.extend(self._compute_h_tilde_eta_srp())
-                    elif state_allowed["gs_delta_location_ECEF"][2].match(component):
-                        # NOTE: idealized formula does not account for full RTLT sensitivity;
-                        # scaling by ul_freq/c at end of this method is also approximate.
-                        # Use partials_finite_diff=True or validate before enabling.
-                        raise NotImplementedError(
-                            "DopplerReal: gs_delta_location_ECEF partial not verified or finished."
-                        )
-                        # --- unverified implementation (kept for reference) ---
-                        # if self.instrument.spice_id == comp_body.spice_id:
-                        #     A_ei = SpiceManager.get_xfrm(
-                        #         frame_from="IAU_EARTH", frame_to="J2000", epoch=epoch.times.values,
-                        #     )
-                        #     h_tilde_frame_from = self._compute_h_tilde_gs_delta_location(relative_state)
-                        #     h_tilde_frame_to = h_tilde_frame_from @ A_ei
-                        #     h_tilde.extend(h_tilde_frame_to)
-                        # else:
-                        #     h_tilde.extend([0.0, 0.0, 0.0])
+                        # No direct sensitivity: SRP moves the light time only through
+                        # the trajectory, which the filter maps through the STM.
+                        h_tilde.extend([0.0])
+
+                    elif self._is_station_parameter(component):
+                        # Location (Cartesian or cylindrical), orientation, EOP
+                        # and Love/Shida numbers move the station inside the
+                        # light-time solution at t1 and t3 of both endpoints.
+                        # rtlt_parts[10] stays zero: adding it as well would
+                        # double-count the geometric term.
+                        h_tilde.extend(self._station_row_doppler(
+                            component_def, target.name, frame.name, i, M2_i, c_val
+                        ))
+
                     elif "rangerate_bias_Hz" in state_allowed and state_allowed[
                         "rangerate_bias_Hz"
                     ][2].match(component):
-                        # NOTE: ul_freq/c scaling applied at end of this method does not
-                        # correctly propagate through the ramp-table integration for a
-                        # frequency bias. Use partials_finite_diff=True or validate before enabling.
-                        raise NotImplementedError(
-                            "DopplerReal: rangerate_bias_Hz partial not verified or finished."
+                        # F = F_geom + bias_Hz  ⇒  ∂F/∂bias = 1 for THIS station, else 0,
+                        # in the slot of the epoch's pass for one bias per pass.
+                        # Stored pre-scaled (×c/ul_freq) so the trailing scale_fac=ul_freq/c
+                        # yields exactly 1.
+                        bias_partials = self._bias_partials(
+                            component, component_def[1], comp_body, epoch
                         )
-                        # --- unverified implementation (kept for reference) ---
-                        # if self.instrument.spice_id == comp_body.spice_id:
-                        #     h_tilde.extend(self._compute_h_tilde_range_bias())
-                        # else:
-                        #     h_tilde.extend([0.0])
+                        if any(bias_partials):
+                            ul_freq_i = float(aux_dict["ul_freq"][idx])
+                            bias_partials = [p * c_val / ul_freq_i for p in bias_partials]
+                        h_tilde.extend(bias_partials)
+
                     elif state_allowed["dv_man"][2].match(component):
-                        # dv maneuver
-                        h_tilde.extend(self._compute_h_tilde_dv_man(relative_state))
-                    else:  # If the component is not above, we add zeros by default.
+                        # No direct sensitivity: the maneuver moves the light time only
+                        # through the trajectory, which the filter maps through the STM.
+                        h_tilde.extend([0.0] * 3)
+                    # ---------------------------------------------------- #
+                    # Moyer correction partials (Eqs. 10-28/29 + 13-59)     #
+                    # ---------------------------------------------------- #
+                    elif state_allowed["tropo_z_dry"][2].match(component):
+                        # ∂F/∂(Δρ_z_dry), Moyer 10-54 + 13-59, each leg at its own
+                        # elevation: downleg at t3 (reception), upleg at t1 (transmit).
+                        if (
+                            self._media_corrections is not None
+                            and comp_body is not None
+                            and self.instrument.spice_id == comp_body.spice_id
+                        ):
+                            mc = self._media_corrections
+                            sc_id = str(target.spice_id)
+                            Tc_i = float(aux_dict["Tc"][idx])
+                            ul_freq_i = float(aux_dict["ul_freq"][idx])
+                            # Per-leg epochs and frequencies (from forward-model cache)
+                            t3e = float(self._last_t3e_et[i]); t3s = float(self._last_t3s_et[i])
+                            t1e = t3e - float(self._last_rtlt_e[i])
+                            t1s = t3s - float(self._last_rtlt_s[i])
+                            f_t1e = float(self._last_f_t1e[i]); f_t1s = float(self._last_f_t1s[i])
+                            Rd_t3e, _ = mc.chao_mapping_at_epoch(t3e, sc_id)
+                            Rd_t1e, _ = mc.chao_mapping_at_epoch(t1e, sc_id)
+                            Rd_t3s, _ = mc.chao_mapping_at_epoch(t3s, sc_id)
+                            Rd_t1s, _ = mc.chao_mapping_at_epoch(t1s, sc_id)
+                            h_val = self._h_tilde_tropo_z_dry_doppler(
+                                Rd_t3e, Rd_t1e, Rd_t3s, Rd_t1s, f_t1e, f_t1s, M2_i, Tc_i
+                            )
+                            h_tilde.extend([h_val * c_val / ul_freq_i])  # undo trailing scale_fac
+                        else:
+                            h_tilde.extend([0.0])
+
+                    elif state_allowed["tropo_z_wet"][2].match(component):
+                        if (
+                            self._media_corrections is not None
+                            and comp_body is not None
+                            and self.instrument.spice_id == comp_body.spice_id
+                        ):
+                            mc = self._media_corrections
+                            sc_id = str(target.spice_id)
+                            Tc_i = float(aux_dict["Tc"][idx])
+                            ul_freq_i = float(aux_dict["ul_freq"][idx])
+                            t3e = float(self._last_t3e_et[i]); t3s = float(self._last_t3s_et[i])
+                            t1e = t3e - float(self._last_rtlt_e[i])
+                            t1s = t3s - float(self._last_rtlt_s[i])
+                            f_t1e = float(self._last_f_t1e[i]); f_t1s = float(self._last_f_t1s[i])
+                            _, Rw_t3e = mc.chao_mapping_at_epoch(t3e, sc_id)
+                            _, Rw_t1e = mc.chao_mapping_at_epoch(t1e, sc_id)
+                            _, Rw_t3s = mc.chao_mapping_at_epoch(t3s, sc_id)
+                            _, Rw_t1s = mc.chao_mapping_at_epoch(t1s, sc_id)
+                            h_val = self._h_tilde_tropo_z_wet_doppler(
+                                Rw_t3e, Rw_t1e, Rw_t3s, Rw_t1s, f_t1e, f_t1s, M2_i, Tc_i
+                            )
+                            h_tilde.extend([h_val * c_val / ul_freq_i])
+                        else:
+                            h_tilde.extend([0.0])
+
+                    elif state_allowed["iono_delay_bias"][2].match(component):
+                        # ∂F/∂b_iono, per leg (downleg freq f_t3=f_t1·M2, upleg freq f_t1);
+                        # negative sign for Doppler (Moyer 10-28/29 + 13-59).
+                        if (
+                            self._media_corrections is not None
+                            and comp_body is not None
+                            and self.instrument.spice_id == comp_body.spice_id
+                        ):
+                            mc = self._media_corrections
+                            sc_id = str(target.spice_id)
+                            Tc_i = float(aux_dict["Tc"][idx])
+                            ul_freq_i = float(aux_dict["ul_freq"][idx])
+                            t3e = float(self._last_t3e_et[i]); t3s = float(self._last_t3s_et[i])
+                            t1e = t3e - float(self._last_rtlt_e[i])
+                            t1s = t3s - float(self._last_rtlt_s[i])
+                            f_t1e = float(self._last_f_t1e[i]); f_t1s = float(self._last_f_t1s[i])
+                            f_t3e = f_t1e * M2_i; f_t3s = f_t1s * M2_i
+                            # .values: the delays come back unit-bearing, and
+                            # _h_tilde_iono_bias_doppler works in bare metres.
+                            _, pI_t3e = mc.computed_rtlt_delays(t3e, sc_id, f_t3e)
+                            _, pI_t1e = mc.computed_rtlt_delays(t1e, sc_id, f_t1e)
+                            _, pI_t3s = mc.computed_rtlt_delays(t3s, sc_id, f_t3s)
+                            _, pI_t1s = mc.computed_rtlt_delays(t1s, sc_id, f_t1s)
+                            pI_t3e, pI_t1e = pI_t3e.values, pI_t1e.values
+                            pI_t3s, pI_t1s = pI_t3s.values, pI_t1s.values
+                            h_val = self._h_tilde_iono_bias_doppler(
+                                pI_t3e, pI_t1e, pI_t3s, pI_t1s, f_t1e, f_t1s, M2_i, Tc_i
+                            )
+                            h_tilde.extend([h_val * c_val / ul_freq_i])
+                        else:
+                            h_tilde.extend([0.0])
+
+                    elif state_allowed["gamma_rel"][2].match(component):
+                        # ∂F/∂γ = (M₂/Tc)[f_Te·∂ρe/∂γ − f_Ts·∂ρs/∂γ]   [Moyer 8-55, 13-59]
+                        # with each leg's RLT/(1+γ) weighted by its Moyer 12-12/12-17
+                        # factor, since the Shapiro delay sits inside the light-time
+                        # solution, plus the γ in the eq. 4-10 space-time transform of
+                        # the station (barycentric) or spacecraft (geocentric). The
+                        # station term follows Earth rotation, and without it this
+                        # row was 2.4% off. γ is a global PPN parameter.
+                        gamma = float(constants.gamma_GR.values)  # what the light time used
+                        Tc_i = float(aux_dict["Tc"][idx])
+                        ul_freq_i = float(aux_dict["ul_freq"][idx])
+                        f_Te = float(self._last_f_t1e[i])
+                        f_Ts = float(self._last_f_t1s[i])
+                        drho = []
+                        for t3x, gr in ((self._last_t3e_et[i], self._last_gr_e[i]),
+                                        (self._last_t3s_et[i], self._last_gr_s[i])):
+                            t3x = float(t3x)
+                            n_dn, n_up, v_sc, v_gs, t2x, t1x = self._endpoint_light_path(
+                                target.name, t3x, frame.name, c_val
+                            )
+                            w_dn, w_up = Measurement.rtlt_leg_weights(n_dn, n_up, v_sc, v_gs, c_val)
+                            g_sc = Measurement.rtlt_grad_pos_exact(n_dn, n_up, v_sc, v_gs, c_val)
+                            g3, g1 = Measurement.rtlt_grad_station_exact(n_dn, n_up, v_sc, v_gs, c_val)
+                            gs_name = self.instrument.name
+                            drho.append(
+                                (w_dn * gr[0] + w_up * gr[1]) / (1.0 + gamma)
+                                + g_sc @ self._gamma_position_shift(target.name, t2x, frame.name)
+                                + g3 @ self._gamma_position_shift(gs_name, t3x, frame.name)
+                                + g1 @ self._gamma_position_shift(gs_name, t1x, frame.name)
+                            )
+                        drho_e, drho_s = drho
+                        dF_dgamma = (M2_i / Tc_i) * (f_Te * drho_e - f_Ts * drho_s)
+                        # Pre-scale: ×(c/ul_freq) so final ×scale_fac(=ul_freq/c) recovers Hz
+                        h_tilde.extend([dF_dgamma * c_val / ul_freq_i])
+
+                    elif state_allowed["solar_corona_scale"][2].match(component):
+                        # ∂F/∂κ_SC = (M₂/Tc)[f_Te·∆SC_e − f_Ts·∆SC_s]   [Moyer 10-76, 13-59]
+                        # SC enters ρ directly (it is part of the light-time solution,
+                        # not an after-the-fact media correction). κ scales the model (κ=1).
+                        Tc_i = float(aux_dict["Tc"][idx])
+                        ul_freq_i = float(aux_dict["ul_freq"][idx])
+                        f_Te = float(self._last_f_t1e[i])
+                        f_Ts = float(self._last_f_t1s[i])
+                        dF_dkappa = (M2_i / Tc_i) * (
+                            f_Te * float(self._last_sc_e[i]) - f_Ts * float(self._last_sc_s[i])
+                        )
+                        h_tilde.extend([dF_dkappa * c_val / ul_freq_i])
+
+                    elif self._is_media_parameter(component):
+                        # ∂F/∂ρ_z, Moyer 10-28/29 + 13-59: the zenith delay mapped on
+                        # every leg at its own elevation and, for the ionosphere, its
+                        # own frequency. Negative for the ionosphere, as in the
+                        # forward model.
+                        parameter = next((p for p in self._media_parameters()
+                                          if p["name"] == component), None)
+                        if self._media_corrections is None or parameter is None:
+                            h_tilde.extend([0.0] * component_def[1])
+                        else:
+                            mc = self._media_corrections
+                            sc_id = str(target.spice_id)
+                            Tc_i = float(aux_dict["Tc"][idx])
+                            ul_freq_i = float(aux_dict["ul_freq"][idx])
+                            t3e = float(self._last_t3e_et[i]); t3s = float(self._last_t3s_et[i])
+                            t1e = t3e - float(self._last_rtlt_e[i])
+                            t1s = t3s - float(self._last_rtlt_s[i])
+                            f_t1e = float(self._last_f_t1e[i]); f_t1s = float(self._last_f_t1s[i])
+                            column = 0 if parameter["kind"] == "tropo_zenith_delay" else 1
+                            a_t3e, a_t1e, a_t3s, a_t1s = (
+                                mc.zenith_delay_partials(t, sc_id, f)[column]
+                                for t, f in ((t3e, f_t1e * M2_i), (t1e, f_t1e),
+                                             (t3s, f_t1s * M2_i), (t1s, f_t1s)))
+                            h_leg = (self._h_tilde_tropo_z_wet_doppler if column == 0
+                                     else self._h_tilde_iono_bias_doppler)
+                            h_val = h_leg(a_t3e, a_t1e, a_t3s, a_t1s, f_t1e, f_t1s, M2_i, Tc_i)
+                            h_tilde.extend(list(h_val * parameter["scale"] * c_val / ul_freq_i))
+
+                    else:
                         h_tilde.extend([0.0 for _ in range(component_def[1])])
-                    #
-                #
-            #
-            h_tilde[0:3] = np.zeros(3)
+
             partials_list.append(h_tilde)
             #
         #
+        # Every entry above is pre-scaled by c/ul_freq of its own epoch, so the
+        # trailing factor has to use that same epoch's ul_freq. A single
+        # ul_freq[0] left every row whose uplink differs from the first epoch's
+        # off by ul_freq[0]/ul_freq[i].
         aux_dict = self.computed_measurements_dict
-        ul_freq = aux_dict["ul_freq"][0]
+        ul_freq_arr = aux_dict["ul_freq"]
         c = constants.c.values
-        scale_fac = ul_freq / c
-        #
-        return [
-            scale_fac * np.array(partials_list[ii]) for ii in range(len(partials_list))
-        ]
-        #
+        out = []
+        for ii in range(len(partials_list)):
+            ul_freq_i = float(ul_freq_arr[min(ii, len(ul_freq_arr) - 1)])
+            out.append((ul_freq_i / c) * np.array(partials_list[ii]))
+        return out
 
-    #
+    # endregion Analytical (Moyer) partials #
+    # ---------------------------------------------------------------------#
 
-    def _compute_partials_with_fd(
+    # This model differences a count interval, so the endpoint-mapped FD
+    # reference is meaningful here (and only here).
+    PARTIALS_METHODS = ("fd", "fd_endpoint", "analytical")
+
+    AUX_KEYS = Measurement.TrackingAuxKeys(
+        required=(
+            "Tc", "M2_num", "M2_den", "ul_freq",
+            "rcv_time_tag_delay", "transmit_time_tag_delay",
+            "ul_zheight_corr", "dl_zheight_corr", "ul_stn_cal", "dl_stn_cal",
+        ),
+        optional=("array_delay", "exc_scalar_num", "exc_scalar_den"),
+        record_fields={
+            "cnt_time": "Tc",
+            "scft_transpd_turn_num": "M2_num",
+            "scft_transpd_turn_den": "M2_den",
+        },
+        outlier_flag="outlier_flag_doppler",
+    )
+    """Auxiliary-data layout of this model."""
+
+    def _compute_partials_endpoint_fd(
         self,
         target: Spacecraft,
         epoch_array: EpochArray,
         frame: Frame = J2000,
-    ) -> np.ndarray:
+    ) -> list:
         """
-        Compute Doppler _partials w.r.t. state vector using batched finite differencing.
+        Endpoint-mapped central-difference partials, through the full forward model.
 
-        Returns a list of (1xn) Jacobians per epoch.
+        The plain finite-difference path (:meth:`_compute_partials_with_fd`) is not
+        a valid reference for two-way Doppler. The observable is a difference
+        between the two ends of a count interval, so where a state perturbation
+        lands is part of the derivative's definition, not an implementation
+        detail. That path perturbs once and puts the entire velocity displacement
+        ``dv*Tc`` on the second endpoint, leaving the first unperturbed, because
+        its ``delta`` is built once before the epoch loop.
+
+        The filter's state is referenced to the reflection midpoint ``t2_mid``, so
+        a velocity deviation there reaches the endpoints as ``dv*(t2x - t2_mid)``,
+        with ``t2x`` the reflection times of an unperturbed solution:
+        ``-(t2e - t2s)/2`` at the start and ``+(t2e - t2s)/2`` at the end. That is
+        ``Tc(1 - rho_dot/c)/2``, not ``Tc/2``; the reflection times are closer
+        together than the reception times by the downleg range rate. This method
+        applies that mapping and central-differences the result, which makes it
+        comparable to :meth:`_compute_analytical_partials` -- the analytical row
+        maps the same way, through ``Phi(t2x, t2_mid)``.
+
+        Everything else runs unchanged, so this differences the real observable:
+        Shapiro, solar corona, media, ramped frequencies and station electronics
+        all participate. That is the difference from the reduced reference used
+        during the original verification, which re-solved a geometric light time
+        of its own and dropped the Shapiro term.
+
+        Parameters
+        ----------
+        target : Spacecraft
+            The observed spacecraft.
+        epoch_array : EpochArray
+            Epochs to evaluate.
+        frame : Frame, optional
+            Reference frame.
+
+        Returns
+        -------
+        list of numpy.ndarray
+            One 1x6 Jacobian row per epoch, ``[d/dr, d/dv]``.
         """
+        eps_dict = self._fd_step_sizes()
 
-        # 1. Compute adaptive FD steps from relative state (if not provided)
-        if self.eps_dict is None:
-            eps_dict = {
-                "dx": ArrayWUnits(1e1, km),
-                "dy": ArrayWUnits(1e1, km),
-                "dz": ArrayWUnits(1e1, km),
-                "dvx": ArrayWUnits(1e-2, km / sec),
-                "dvy": ArrayWUnits(1e-2, km / sec),
-                "dvz": ArrayWUnits(1e-2, km / sec),
-            }
+        comps = ["dx", "dy", "dz", "dvx", "dvy", "dvz"]
+        N = epoch_array.size
+        H = np.zeros((N, 6))
 
-        # 2. Nominal measurement
-        _, _, _, meas_nom_out = self.computed_measurements(
-            target=target,
-            epoch_array=epoch_array,
-            frame=frame,
-            noisy=False,
-            eps_override=None,
+        # A fresh dict per evaluation: the forward model inserts a position entry
+        # derived from the velocity step, so a reused dict would leak one
+        # endpoint's displacement into the next call.
+        def observable(comp, step):
+            _, _, _, out = self.computed_measurements(
+                target=target,
+                epoch_array=epoch_array,
+                frame=frame,
+                noisy=False,
+                eps_override={comp: step},
+            )
+            return np.asarray(out.quantity.values, dtype=float).ravel()
+
+        # An unperturbed solution first, for the reflection times the velocity
+        # step is mapped through. The perturbed calls overwrite the cache, so the
+        # offsets are copied out before they run.
+        self.computed_measurements(
+            target=target, epoch_array=epoch_array, frame=frame, noisy=False
         )
-        meas_nom = meas_nom_out.quantity.values
+        was = self._endpoint_offsets
+        self._endpoint_offsets = (
+            np.array(self._last_t2s - self._last_t2_mid),
+            np.array(self._last_t2e - self._last_t2_mid),
+        )
+        try:
+            for j, comp in enumerate(comps):
+                eps = eps_dict[comp]
+                plus = observable(comp, eps)
+                minus = observable(comp, ArrayWUnits(-eps.values, eps.units))
+                H[:, j] = (plus - minus) / (2.0 * float(eps.values))
+        finally:
+            self._endpoint_offsets = was
 
-        N = epoch_array.size
-        H_blocks = []
-
-        # 3. If no state_definition, default to pos + vel
-        if self._state_definition is None:
-            H_blocks.append(
-                self._batched_component_partials(
-                    ["dx", "dy", "dz"], eps_dict, target, epoch_array, frame, meas_nom
-                )
-            )
-            H_blocks.append(
-                self._batched_component_partials(
-                    ["dvx", "dvy", "dvz"],
-                    eps_dict,
-                    target,
-                    epoch_array,
-                    frame,
-                    meas_nom,
-                )
-            )
-            return [np.hstack(H_blocks)[i, :] for i in range(N)]
-
-        # 4. State-definition driven parsing
-        state_allowed = StateDefinition._generate_allowed_state_dictionary()
-
-        for comp_def in self._state_definition:
-            comp_name = comp_def[0]
-            comp_dim = comp_def[1]
-            comp_body = comp_def[4] if len(comp_def) > 4 else None
-
-            if state_allowed["position"][2].match(comp_name):
-                H_blocks.append(
-                    self._batched_component_partials(
-                        ["dx", "dy", "dz"],
-                        eps_dict,
-                        target,
-                        epoch_array,
-                        frame,
-                        meas_nom,
-                    )
-                )
-
-            elif state_allowed["velocity"][2].match(comp_name):
-                H_blocks.append(
-                    self._batched_component_partials(
-                        ["dvx", "dvy", "dvz"],
-                        eps_dict,
-                        target,
-                        epoch_array,
-                        frame,
-                        meas_nom,
-                    )
-                )
-
-            elif state_allowed["eta_srp"][2].match(comp_name):
-                H_blocks.append(np.zeros((N, 1)))
-
-            elif any(
-                state_allowed[k][2].match(comp_name)
-                for k in ["dv_man", "dv_man1", "dv_man2"]
-            ):
-                H_blocks.append(np.zeros((N, 3)))
-
-            elif state_allowed["rangerate_bias_Hz"][2].match(comp_name):
-                if self.instrument.spice_id == comp_body.spice_id:
-                    H_blocks.append(np.ones((N, 1)))
-                else:
-                    H_blocks.append(np.zeros((N, 1)))
-
-            elif state_allowed["gs_delta_location"][2].match(comp_name):
-                # NOTE: implementation below contains a variable-name bug — the regex
-                # match result shadows the 'frame' parameter, breaking the
-                # _batched_component_partials call. Fix before enabling.
-                raise NotImplementedError(
-                    "DopplerReal: gs_delta_location partial (FD path) not verified or finished."
-                )
-                # --- unverified implementation (kept for reference; contains frame-shadow bug) ---
-                # _, _frame_str, _ = state_allowed["gs_delta_location"][2].match(comp_name).groups()
-                # if self.instrument.spice_id == comp_body.spice_id and _frame_str == "ECEF":
-                #     h_tilde_to = np.zeros((N, 3))
-                #     h_tilde_from = -self._batched_component_partials(
-                #         ["dx", "dy", "dz"], eps_dict, target, epoch_array, frame, meas_nom,
-                #     )  # shape (N,3)
-                #     for i, et in enumerate(epoch_array):
-                #         A_ei = SpiceManager.get_xfrm(
-                #             frame_from="IAU_EARTH", frame_to="J2000", epoch=et.times.values,
-                #         )
-                #         h_tilde_to[i] = h_tilde_from[i] @ A_ei
-                #     H_blocks.append(h_tilde_to)
-                # else:
-                #     H_blocks.append(np.zeros((N, 3)))
-
-            else:
-                H_blocks.append(np.zeros((N, comp_dim)))
-
-        return [np.hstack(H_blocks)[i, :] for i in range(N)]
-
-    def _batched_component_partials(
-        self,
-        components: list[str],
-        eps_dict: dict,
-        target: Spacecraft,
-        epoch_array: EpochArray,
-        frame: Frame,
-        meas_nom: np.ndarray,
-    ) -> np.ndarray:
-        """
-        Compute batched finite-difference _partials for selected components.
-
-        Returns
-        -------
-        np.ndarray : shape (N, len(components))
-        """
-        N = epoch_array.size
-        H = np.zeros((N, len(components)))
-
-        # desc_str = f"FD Partials: [{', '.join(components)}]"
-        for j, comp in enumerate(components):
-            _, _, _, meas_pert_out = self.computed_measurements(
-                target=target,
-                epoch_array=epoch_array,
-                frame=frame,
-                noisy=False,
-                eps_override={comp: eps_dict[comp]},
-            )
-            meas_pert = meas_pert_out.quantity.values
-            H[:, j] = (meas_pert - meas_nom) / eps_dict[comp].values
-        #
-        return H
-
-    '''
-    def _batched_component_partials_cd(
-        self,
-        components: list[str],
-        eps_dict: dict,
-        target: Spacecraft,
-        epoch_array: EpochArray,
-        frame: Frame,
-        meas_nom: np.ndarray,
-    ) -> np.ndarray:
-        """
-        Compute batched central finite-difference _partials for selected components.
-
-        Returns
-        -------
-        np.ndarray : shape (N, len(components))
-        """
-        N = epoch_array.size
-        H = np.zeros((N, len(components)))
-
-        for j, comp in enumerate(components):
-            eps = eps_dict[comp]
-
-            # Forward perturbation
-            _, _, _, meas_plus_out= self.computed_measurements(
-                target=target,
-                epoch_array=epoch_array,
-                frame=frame,
-                noisy=False,
-                eps_override={comp: eps},
-            )
-            meas_plus = meas_plus_out.quantity.values
-
-            # Backward perturbation
-            _, _, _, meas_minus_out = self.computed_measurements(
-                target=target,
-                epoch_array=epoch_array,
-                frame=frame,
-                noisy=False,
-                eps_override={comp: -eps},
-            )
-            meas_minus = meas_minus_out.quantity.values
-
-            # Central difference
-            H[:, j] = (meas_plus - meas_minus) / (2 * eps.values)
-
-        return H
-    '''
+        return [H[i, :] for i in range(N)]
 
     @staticmethod
     def compress_doppler_to_60s(
@@ -1044,20 +1767,21 @@ class DopplerReal(Measurement):
             sample_dt = 1.0
 
         # === Check if already at ~60-s cadence ===
-        if np.isclose(sample_dt, 60.0, rtol=0.05, atol=1.0):
+        dt = float(constants.DOPPLER_COUNT_INTERVAL_DEFAULT.values)
+        if np.isclose(sample_dt, dt, rtol=0.05, atol=1.0):
             print("⚠️ Input Doppler already at ~60-s cadence, no compression applied.")
             return t, v, np.ones_like(t, dtype=int)
 
         # Bin alignment
         if t0 is None:
-            t0 = np.floor(t.min() / 60.0) * 60.0
+            t0 = np.floor(t.min() / dt) * dt
 
         # Bin index per sample
-        bin_idx = np.floor((t - t0) / 60.0).astype(int)
+        bin_idx = np.floor((t - t0) / dt).astype(int)
         uniq = np.unique(bin_idx)
 
         # Expected samples per bin (for coverage check)
-        exp_per_bin = max(1, int(round(60.0 / float(sample_dt))))
+        exp_per_bin = max(1, int(round(dt / float(sample_dt))))
         need = int(np.ceil(min_coverage * exp_per_bin))
 
         # Choose aggregator
@@ -1081,8 +1805,8 @@ class DopplerReal(Measurement):
             vb = v[sel]
             nb = vb.size
 
-            bin_start = t0 + 60.0 * b
-            bin_end = bin_start + 60.0
+            bin_start = t0 + dt * b
+            bin_end = bin_start + dt
             t_mid = 0.5 * (bin_start + bin_end)
 
             if nb >= need:
@@ -1095,3 +1819,367 @@ class DopplerReal(Measurement):
             n_used.append(nb)
 
         return np.array(t60_mid), np.array(y60), np.array(n_used)
+    
+    @staticmethod
+    def default_doppler_aux(
+        tstart: EpochArray,
+        tend: EpochArray,
+        N: int = None,
+        ramp_margin: float = None,
+        n_ramp: int = None,
+        band: str = "X",
+    ) -> dict:
+        """
+        Default ``computed_measurements_dict`` for synthetic two-way Doppler.
+
+        Every per-observation array is ``N`` long, including year/doy/sec, and every
+        ramp array is ``n_ramp`` long. See :meth:`Measurement._default_aux_grids` for
+        ``ramp_margin`` and ``n_ramp`` and for why the two groups are sized from one
+        place.
+
+        Parameters
+        ----------
+        tstart, tend : EpochArray
+            Span the simulated data covers. Only the first epoch of each is used.
+        N : int, optional
+            Number of data points the aux data describes. By default the span is
+            filled with as many whole count intervals of
+            :attr:`Constants.DOPPLER_COUNT_INTERVAL_DEFAULT` as fit, and a value that
+            does not fit the span is reduced to that number.
+        ramp_margin : float, optional
+            Seconds the ramp grid extends beyond the span at each end. Defaults to
+            :attr:`Constants.RAMP_MARGIN_DEFAULT`.
+        n_ramp : int, optional
+            Number of ramp-table entries. Defaults to
+            :attr:`Constants.RAMP_ENTRIES_DEFAULT`.
+        band : str, optional
+            DSN band letter, ``"X"`` or ``"S"`` (case-insensitive), resolved by
+            :meth:`Measurement._resolve_dsn_band`. It sets the uplink frequency,
+            turnaround ratio, exciter scalar and range unit. Defaults to ``"X"``.
+
+        Returns
+        -------
+        Doppler_aux_data : dict
+            Auxiliary values needed for computing measurements: the
+            per-observation Doppler and delay entries, each ``N`` long, and the
+            ramp-table entries, each ``n_ramp`` long.
+        """
+        
+        # Tc, the Doppler count interval, is the DSN standard 60 s and stays
+        # fixed. It also has to equal the sample spacing, or the simulated counts
+        # would overlap or leave gaps -- so the grid is built on a 60 s step and
+        # N gives way when it does not fit the span, rather than Tc being
+        # stretched to accommodate it.
+        COUNT_INTERVAL = float(constants.DOPPLER_COUNT_INTERVAL_DEFAULT.values)
+        t_0 = float(np.atleast_1d(tstart.et)[0])
+        t_f = float(np.atleast_1d(tend.et)[0])
+        if N is None:
+            N = max(int(np.floor((t_f - t_0) / COUNT_INTERVAL)), 1)
+
+        obs, ramp = DopplerReal._default_aux_grids(
+            tstart,
+            tend,
+            N,
+            ramp_margin=ramp_margin,
+            n_ramp=n_ramp,
+            dt_obs=COUNT_INTERVAL,
+        )
+        # year/doy/sec describe the same N observations as every other
+        # per-observation array, so every column of the dict has one length.
+        N = obs["n"]  # reduced if N count intervals did not fit the span
+        (year, day, sec) = (obs["year"], obs["doy"], obs["sec"])
+        ramp_day, ramp_sec, ramp_year = ramp["day"], ramp["sec"], ramp["year"]
+        n_ramp = len(ramp_sec)
+        # Constant-rate ramp referenced to the first entry, so the
+        # piecewise-linear interpolant integrate() builds is continuous.
+        band_spec = Measurement._resolve_dsn_band(band)
+        ramp_f0 = band_spec.uplink_frequency.values
+        ramp_rate = constants.RAMP_RATE_DEFAULT.values
+        ramp_freq = (ramp_f0 + ramp_rate * (ramp["et"] - ramp["et"][0])).tolist()
+        rcv_time_tag_delay = float(constants.RCV_TIME_TAG_DELAY_DEFAULT.values)
+
+        Doppler_aux_data = {
+            #
+            # Doppler auxiliary data (from 2W_doppler, SFDU_16)
+            #
+            "Tc": [COUNT_INTERVAL for _ in range(N)],
+            "M2_num": [band_spec.turnaround_num for _ in range(N)],
+            "M2_den": [band_spec.turnaround_den for _ in range(N)],
+            "outlier_flag_doppler": [0 for _ in range(N)],
+            "year_SFDU16": year,
+            "doy_SFDU16": day,
+            "sec_SFDU16": sec,
+            #
+            # Delays auxiliary data (from 2W_doppler, SFDU_16)
+            #
+            "ul_zheight_corr": [0.0 for _ in range(N)],
+            "dl_zheight_corr": [0.0 for _ in range(N)],
+            "scft_transpd_delay": constants.TRANSPONDER_DELAY_DEFAULT, # [RU]
+            "scft_transpd_delay_s": Measurement.transponder_delay_seconds(
+                constants.TRANSPONDER_DELAY_DEFAULT,
+                band_spec.ru_reference_frequency.values,
+                band_spec.range_unit),
+            "transmit_time_tag_delay": [0.0 for _ in range(N)],
+            "rcv_time_tag_delay": [rcv_time_tag_delay for _ in range(N)],
+            "array_delay": [0.0 for _ in range(N)],
+            #
+            "ul_freq": [band_spec.uplink_frequency.values for _ in range(N)],       
+            "ul_stn_cal": [constants.UL_STATION_CAL_DEFAULT for _ in range(N)],
+            "dl_stn_cal": [constants.DL_STATION_CAL_DEFAULT for _ in range(N)],
+            "exc_scalar_num": [band_spec.exciter_scalar_num for _ in range(N)],
+            "exc_scalar_den": [band_spec.exciter_scalar_den for _ in range(N)],
+            "RU": [band_spec.range_unit for _ in range(N)],
+            #
+            # Ramp table auxiliary data (from SFDU_9)
+            #
+            "ramp_sec": ramp_sec,
+            "ramp_day": ramp_day,
+            "ramp_freq": ramp_freq,
+            "ramp_rate": [ramp_rate for _ in range(n_ramp)],
+            "ramp_type": [constants.RAMP_TYPE_DEFAULT for _ in range(n_ramp)],
+            # Year of each ramp record, so the table may cross a new year
+            "ramp_year": ramp_year,
+        }
+
+        Measurement.validate_aux(Doppler_aux_data, label="default_doppler_aux")
+        return Doppler_aux_data
+
+    def _write_aux_data(self, dict_DB, dict_meas):
+        """
+        Add this model's auxiliary data to a file being written.
+
+        Called by :meth:`~scarabaeus.Measurement.write_observed_measurements`
+        once it has built the measurement block, to fill in the fields that are
+        specific to two-way Doppler. Everything written comes from the model's
+        ``computed_measurements_dict``, filled either by ``_read_aux`` from a
+        real pass or by
+        :meth:`~scarabaeus.DopplerReal.default_doppler_aux` for a simulated
+        one.
+
+        Both arguments are modified in place.
+
+        Parameters
+        ----------
+        dict_DB : dict
+            The top-level file dictionary. Gains three blocks, none of which is
+            one row per Doppler observation:
+
+            * ``"aux_SFDU_16"`` -- the count interval, the transponder
+              turnaround ratio, the outlier flags and the observation time
+              tags.
+            * ``"aux_SFDU_9"`` -- the uplink ramp table, one row per ramp
+              segment, with the year of each record when the aux data has
+              ``ramp_year``.
+            * ``"2W_sranging"`` -- the uplink frequency, the station
+              calibrations and the exciter scalars, with the observation time
+              tags. See the note at the code below for why a Doppler file
+              carries a block under this name.
+        dict_meas : dict
+            The measurement block, one value per observation. Gains the zenith
+            height corrections, the time-tag delays, the array delay and the
+            spacecraft transponder delay.
+
+        Raises
+        ------
+        TypeError
+            If the model has no auxiliary data, via
+            :meth:`~scarabaeus.Measurement.validate_aux`. Raised here rather
+            than surfacing as a less obvious error from the first key read.
+        ValueError
+            If the auxiliary data is ragged, via the same check.
+
+        Notes
+        -----
+        Unlike sequential ranging, Doppler has its own ``"aux_SFDU_16"`` block,
+        so the observation time tags are written there rather than being left
+        to the caller. Sequential ranging has nowhere to put them but the
+        measurement block, which the caller has already filled, which is why
+        the two models differ on this point.
+
+        Each per-observation value describes one row of the measurement block,
+        so the ``"aux_SFDU_16"`` and ``"2W_sranging"`` blocks carry that
+        block's time tags: :meth:`_read_aux` samples every auxiliary record at
+        the measurement epochs by time tag, as it does for a real TRK-2-34
+        file whose records each have their own cadence.
+
+        The five fields in the ``"2W_sranging"`` block are normalised through
+        ``numpy.asarray`` before being written, because the two producers of an
+        auxiliary dict disagree on their type: ``_read_aux`` builds them as
+        arrays and
+        :meth:`~scarabaeus.DopplerReal.default_doppler_aux` as plain lists.
+        """
+        # Reported here rather than as 'NoneType is not subscriptable' from
+        # the first key read below.
+        Measurement.validate_aux(
+            self._computed_measurements_dict, label=self.name
+        )
+
+        dict_meas["ul_zheight_corr"] = self._computed_measurements_dict["ul_zheight_corr"]
+        dict_meas["dl_zheight_corr"] = self._computed_measurements_dict["dl_zheight_corr"]
+        dict_meas["transmit_time_tag_delay"] = self._computed_measurements_dict["transmit_time_tag_delay"]
+        dict_meas["rcv_time_tag_delay"] = self._computed_measurements_dict["rcv_time_tag_delay"]
+        dict_meas["array_delay"] = self._computed_measurements_dict["array_delay"]
+        # The transponder delay is a mission constant; a TRK-2-34 measurement
+        # record carries it on every row, and _read_aux reads it back from there.
+        if "scft_transpd_delay" in self._computed_measurements_dict:
+            dict_meas["scft_transpd_delay"] = [
+                float(np.squeeze(self._computed_measurements_dict["scft_transpd_delay"]))
+            ] * len(dict_meas["sec"])
+
+        # np.asarray(...).tolist(), not .tolist() on the stored value: _read_aux
+        # builds these five as ndarrays (``[...] + np.max(...)`` broadcasts),
+        # but default_doppler_aux builds them as plain lists, which have no
+        # .tolist() -- so writing simulated Doppler from the default aux dict
+        # died with AttributeError before reaching the file.
+        twowaysrange = {
+            key: np.asarray(self._computed_measurements_dict[key]).tolist()
+            for key in (
+                "ul_freq",
+                "ul_stn_cal",
+                "dl_stn_cal",
+                "exc_scalar_num",
+                "exc_scalar_den",
+            )
+        }
+        # Time tags of the rows these values describe, so _read_aux can align
+        # the block to the measurement epochs as it does any auxiliary record
+        for key in ("year", "doy", "sec"):
+            twowaysrange[key] = np.asarray(dict_meas[key]).tolist()
+
+        # Yes, a Doppler file gets a block named "2W_sranging", and that is on
+        # purpose: it is what DopplerReal._read_aux reads these five fields back
+        # out of. A real TRK-2-34 pass file carries both data types, and the
+        # uplink frequency and the station calibrations live in the ranging
+        # records, so _read_aux learned to look there (see the "Method (1)"
+        # comment beside it) and the writer has to mirror that for a simulated
+        # file to be reloadable. Dropping the block makes the Doppler read fail
+        # with KeyError: '2W_sranging'.
+        #
+        # It holds only those five uplink/calibration fields -- no ranging
+        # observations -- so it is misnamed rather than wrong. Pointing
+        # SequentialRangingReal at it raises KeyError: 'outlier_flag', i.e. the
+        # mistake is loud, not silent. Renaming it would mean a key alias on
+        # both sides (as _resolve_meas_key does for meas_sim/meas_ideal), since
+        # real files will always say "2W_sranging"; deliberately not done here.
+        dict_DB["2W_sranging"] = twowaysrange
+
+        aux_SFDU16 = {
+            "Tc" : self._computed_measurements_dict["Tc"],
+            "M2_num" : self._computed_measurements_dict["M2_num"],
+            "M2_den" : self._computed_measurements_dict["M2_den"],
+            "outlier_flag" : self._computed_measurements_dict[
+                self.AUX_KEYS.outlier_flag
+            ],
+            # The rows of the measurement block: the per-observation values
+            # above describe those, whatever epochs the aux dict was built for
+            "year" : np.asarray(dict_meas["year"]).tolist(),
+            "doy" : np.asarray(dict_meas["doy"]).tolist(),
+            "sec" : np.asarray(dict_meas["sec"]).tolist(),
+        }
+
+        dict_DB["aux_SFDU_16"] = aux_SFDU16
+
+        aux_SFDU9 = {
+            "sec" : self._computed_measurements_dict["ramp_sec"],
+            "doy" : self._computed_measurements_dict["ramp_day"],
+            "ramp_freq" : self._computed_measurements_dict["ramp_freq"],
+            "ramp_rate" : self._computed_measurements_dict["ramp_rate"],
+            "ramp_type" :  self._computed_measurements_dict["ramp_type"]
+        }
+        if self._computed_measurements_dict.get(self.RAMP_YEAR_KEY) is not None:
+            aux_SFDU9["year"] = self._computed_measurements_dict[self.RAMP_YEAR_KEY]
+
+        dict_DB["aux_SFDU_9"] = aux_SFDU9
+
+    def _read_aux(self, trk_data, meas_name, sc_transponder_delay_RU=0.0,
+                  band: str = "X"):
+        """
+        Collect the auxiliary data a two-way Doppler pass needs.
+
+        Called by :meth:`~scarabaeus.Measurement.observed_measurements` on an
+        already-loaded tracking file. The returned dict is both handed back as
+        ``ObsData.aux_dict`` and installed on the model as its
+        ``computed_measurements_dict``, which is what the forward model reads,
+        so the two cannot fall out of step.
+
+        The observable cannot be reconstructed from the observations alone: the
+        count interval, the transponder turnaround ratio, the station delays
+        and the uplink ramp table are all needed to form a computed Doppler
+        shift.
+
+        Parameters
+        ----------
+        trk_data : dict
+            A loaded tracking-data file. Each quantity is read from the block
+            named by *meas_name* when it is there, and otherwise from the
+            auxiliary SFDU record that carries it (see
+            :meth:`~scarabaeus.Measurement._read_dsn_aux`): ``"aux_SFDU_16"``
+            for the count interval, turnaround ratio and outlier flags,
+            ``"aux_SFDU_7"`` or ``"2W_sranging"`` for the uplink frequency,
+            station calibrations and exciter scalars, ``"aux_SFDU_2"`` and
+            ``"aux_SFDU_3"`` for the zenith height corrections and time-tag
+            delays, and ``"aux_SFDU_9"`` for the uplink ramp table.
+        meas_name : str
+            Key of the Doppler measurement block, normally ``"2W_doppler"``.
+        sc_transponder_delay_RU : float, optional
+            The spacecraft transponder delay in range units. Defaults to
+            ``0.0``, which takes the delay the measurement block carries
+            (``scft_transpd_delay``), or no delay when it has none.
+        band : str, optional
+            DSN band whose reference frequency converts the transponder delay
+            to seconds, and whose range unit stands in when the file has no
+            exciter scalars. Defaults to ``"X"``.
+
+        Returns
+        -------
+        dict
+            The auxiliary data: one entry per Doppler observation for the
+            per-observation values, one per segment for the ramp table.
+
+        Raises
+        ------
+        Measurement.AuxDataError
+            If a required field is in no block, the ramp table is missing, or
+            the transponder delay varies within the pass (see
+            :meth:`~scarabaeus.Measurement._read_dsn_aux`).
+        ValueError
+            If *band* is not one of the supported letters, or if the
+            per-observation fields and the ramp table are not each internally
+            consistent in length, via
+            :meth:`~scarabaeus.Measurement.validate_aux`.
+
+        Notes
+        -----
+        Each SFDU record of a TRK-2-34 file has its own cadence and time tags
+        (``"aux_SFDU_2"`` every second, the ranging records at the ranging
+        cadence), so its rows do not correspond to the Doppler rows. Every
+        value is therefore sampled at the Doppler epochs by time tag, taking
+        the entry in force at each (see
+        :meth:`~scarabaeus.Measurement.align_aux_to_epochs`), rather than
+        taken row by row or as one representative value for the pass.
+
+        The range unit returned under ``"RU"`` is derived from the exciter
+        scalars recorded in the file, so it follows the pass's own band rather
+        than being assumed.
+        """
+        aux = Measurement._read_dsn_aux(
+            trk_data, meas_name, sc_transponder_delay_RU, band
+        )
+        for record_field, key in self.AUX_KEYS.record_fields.items():
+            aux[key] = Measurement._aux_field(
+                trk_data, meas_name, [(None, record_field), ("aux_SFDU_16", key)]
+            )
+        aux[self.AUX_KEYS.outlier_flag] = Measurement._aux_field(
+            trk_data,
+            meas_name,
+            [("aux_SFDU_16", "outlier_flag"), (None, "outlier_flag")],
+            default=0,
+        )
+        # The values above are aligned to the Doppler epochs, so they carry
+        # the Doppler block's time tags
+        record = trk_data[meas_name]
+        aux["year_SFDU16"] = record["year"]
+        aux["doy_SFDU16"] = record["doy"]
+        aux["sec_SFDU16"] = record["sec"]
+        Measurement.validate_aux(aux, label="_read_aux")
+        return aux

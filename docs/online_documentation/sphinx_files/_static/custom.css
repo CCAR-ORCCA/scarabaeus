@@ -263,3 +263,45 @@ html[data-theme="light"] {
 .sphinx-tabs-tab:hover {
     background-color: var(--pst-color-on-surface) !important;
 }
+
+/* dropwdown style */
+sd-card.note-style-dropdown {
+    border-left: 4px solid var(--pst-color-info) !important; /* Thick gold accent bar */
+    border-top: none !important;
+    border-right: none !important;
+    border-bottom: none !important;
+    border-radius: 4px !important;
+    box-shadow: none !important;
+    margin-top: 1rem;
+    margin-bottom: 1rem;
+}
+
+/* Light theme color variables context matching */
+html[data-theme="light"] .sd-card.note-style-dropdown {
+    background-color: rgba(207, 184, 124, 0.1) !important; /* Gentle 10% Gold tint */
+}
+
+/* Dark theme color variables context matching */
+html[data-theme="dark"] .sd-card.note-style-dropdown {
+    background-color: rgba(207, 184, 124, 0.05) !important; /* Muted 5% Gold tint */
+}
+
+/* Format the header row area text and icon */
+.note-style-dropdown .sd-card-header {
+    background-color: transparent !important;
+    border-bottom: none !important;
+    padding-top: 0.75rem;
+    padding-bottom: 0.5rem;
+}
+
+/* Bold the collapsible click target label text */
+.note-style-dropdown .sd-card-header .sd-card-title {
+    font-weight: 700 !important;
+    color: var(--pst-color-text-base) !important;
+}
+
+/* Transparent wrapper background for the internal code area */
+.note-style-dropdown .sd-card-body {
+    background-color: transparent !important;
+    padding-top: 0rem;
+}
