@@ -1,0 +1,13 @@
+Third-party files
+
+The files marked LicenseRef-ThirdParty in REUSE.toml are not covered by the
+ISC license of Scarabaeus. They are data products or logos owned by the
+party named in each file's SPDX-FileCopyrightText entry, and they are
+included in this repository only so that the tutorials, tests and
+documentation work out of the box.
+
+Each file remains subject to the terms of its owner. Before reusing,
+modifying or redistributing one of these files outside Scarabaeus, check
+those terms with the named owner. The logos of the University of Colorado
+Boulder and its units are trademarks and may not be used to suggest
+endorsement.

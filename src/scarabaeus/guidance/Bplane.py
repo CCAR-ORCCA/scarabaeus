@@ -40,7 +40,7 @@ class Bplane:
     perpendicular to the incoming hyperbolic asymptote of the approach
     trajectory.  The B-vector is the vector from the target-body centre
     to the point where the asymptote pierces that plane, and its components
-    ``B·T`` and ``B·R`` are the primary targeting parameters used in
+    :math:`B \\cdot T` and :math:`B \\cdot R` are the primary targeting parameters used in
     planetary-flyby and encounter design.
 
     **B-plane geometry**
@@ -106,7 +106,7 @@ class Bplane:
         the file is created here; otherwise it is loaded from this path.
     v_hat : bool, optional
         When ``True`` (default) the secondary axis of the B-plane frame is
-        aligned with the +Y direction; ``False`` flips it to −Y.
+        aligned with the +Y direction; ``False`` flips it to -Y.
     new_bplane : bool, optional
         ``True`` (default) creates and furnishes a new FK file.
         ``False`` loads an existing kernel from *fk_file*.
@@ -117,14 +117,14 @@ class Bplane:
     Attributes
     ----------
     bt_ref, br_ref : ArrayWUnits
-        Reference B-plane targeting parameters ``B·T`` and ``B·R`` [km].
+        Reference B-plane targeting parameters :math:`B \\cdot T` and :math:`B \\cdot R` [km].
     ltof_ref : ArrayWUnits
         Linearised time-of-flight from the reference epoch to close
         approach [s].
     time_close_approach_ref : ArrayWUnits
         Estimated close-approach epoch expressed as ET seconds.
     bpar_ref : ArrayWUnits
-        Concatenated reference vector ``[B·T, B·R, ltof]``.
+        Concatenated reference vector :math:`[B \\cdot T, B \\cdot R, \\mathrm{ltof}]`.
 
     See Also
     --------
@@ -251,7 +251,7 @@ class Bplane:
 
     @property
     def v_hat(self) -> bool:
-        """Secondary-axis orientation flag (``True`` → +Y, ``False`` → −Y)."""
+        """Secondary-axis orientation flag (``True`` gives +Y, ``False`` gives -Y)."""
         return self._v_hat
 
     @property
@@ -287,12 +287,12 @@ class Bplane:
 
     @property
     def bt_ref(self) -> ArrayWUnits:
-        """Reference ``B·T`` component of the B-vector [km]."""
+        """Reference :math:`B \\cdot T` component of the B-vector [km]."""
         return self._bt_ref
 
     @property
     def br_ref(self) -> ArrayWUnits:
-        """Reference ``B·R`` component of the B-vector [km]."""
+        """Reference :math:`B \\cdot R` component of the B-vector [km]."""
         return self._br_ref
 
     @property
@@ -477,7 +477,7 @@ class Bplane:
         Returns
         -------
         bpar : ArrayWUnits, shape (3,)
-            ``[B·T, B·R, ltof]`` where B·T and B·R are in km and ltof is in
+            :math:`[B \\cdot T, B \\cdot R, \\mathrm{ltof}]` where :math:`B \\cdot T` and :math:`B \\cdot R` are in km and ltof is in
             seconds.
         """
         R = self._rot_to_bplane.values
@@ -502,7 +502,7 @@ class Bplane:
         Compute classical hyperbolic B-plane parameters from a Cartesian state.
 
         This routine evaluates the full conic geometry of the approach
-        trajectory and derives the B-vector components ``B·T`` and ``B·R``
+        trajectory and derives the B-vector components :math:`B \\cdot T` and :math:`B \\cdot R`
         from the asymptote direction and the orbit's semi-latus rectum.  For
         elliptic trajectories (eccentricity < 1) the B-plane is undefined and
         the corresponding output entries are set to ``NaN``.
@@ -510,12 +510,27 @@ class Bplane:
         Parameters
         ----------
         sc_rel_state_j2000 : ArrayWUnits, shape (6,) or (N, 6)
-            Relative state(s) in J2000 with units convertible to km / km·s⁻¹.
+            Relative state(s) in J2000 with units convertible to km and km/s.
 
         Returns
         -------
         ArrayWUnits, shape (3,) or (N, 3)
-            ``[B·T [km], B·R [km], ltof [s]]``.
+            :math:`[B \\cdot T, B \\cdot R, \\mathrm{ltof}]`, in km, km and s.
+
+        Warnings
+        --------
+        The T-vector construction becomes degenerate when S is nearly
+        parallel to the z-axis (i.e. the approach asymptote nearly coincides
+        with the north pole direction).
+
+        - The computation of ``beta = arccos(1/ecc)`` is only valid for
+          hyperbolic or parabolic cases.
+        - The construction of ``Tvec`` as [-Sy, Sx, 0] becomes degenerate
+          when the projection of ``Svec`` onto the xy-plane is near zero.
+        - If ``ecc == 1`` exactly, the semimajor/seminor-axis expressions
+          may become numerically delicate.
+        - ``gm`` is retrieved from ``scarabaeus.constants`` using
+          ``self.target_name``.
 
         Notes
         -----
@@ -524,22 +539,8 @@ class Bplane:
         * **S** – unit vector along the incoming asymptote.
         * **T** – perpendicular to S lying in the target equatorial plane
           (constructed as ``T = [-Sy, Sx, 0] / |[-Sy, Sx, 0]|``).
-        * **R = S × T**.
-        * **B** = semi-minor axis × (S × ĥ).
-
-        Warnings
-        --------
-        The T-vector construction becomes degenerate when S is nearly
-        parallel to the z-axis (i.e. the approach asymptote nearly coincides
-        with the north pole direction).
-        - The computation of ``beta = arccos(1/ecc)`` is only valid for
-        hyperbolic or parabolic cases.
-        - The construction of ``Tvec`` as [-Sy, Sx, 0] becomes degenerate
-        when the projection of ``Svec`` onto the xy-plane is near zero.
-        - If ``ecc == 1`` exactly, the semimajor/seminor-axis expressions
-        may become numerically delicate.
-        - ``gm`` is retrieved from :class:`~scarabaeus.units.constants` using 
-          ``self.target_name``.
+        * :math:`\\mathbf{R} = \\mathbf{S} \\times \\mathbf{T}`.
+        * :math:`\\mathbf{B} = b\\,(\\mathbf{S} \\times \\hat{\\mathbf{h}})`, with :math:`b` the semi-minor axis.
         """
         if self.target_name.upper().endswith('BARYCENTER'):
             cnstnts_name = self.target_name.upper().removesuffix('_BARYCENTER').removesuffix(' BARYCENTER').removesuffix('BARYCENTER')
@@ -612,14 +613,24 @@ class Bplane:
             bdotr[hyp] = np.sum(B * R, axis=1)
             bdott[hyp] = np.sum(B * T, axis=1)
 
-        ltof = self.compute_parameters(sc_rel_state_j2000)[2]  # ArrayWUnits [s]
+        # ltof via linear propagation to the B-plane (z = 0), computed directly
+        # (rather than via compute_parameters, which only accepts a single
+        # (6,) state) so this also works for batched (N, 6) input.
+        rotmat = self._rot_to_bplane.values
+        rel_pos_bp = (rotmat @ r_vec.T).T  # (N, 3)
+        rel_vel_bp = (rotmat @ v_vec.T).T  # (N, 3)
+        ltof_vals = rel_pos_bp[:, 2] / rel_vel_bp[:, 2]  # (N,)
 
         if scalar_input:
             out = ArrayWUnits([bdott[0], bdotr[0]], [km, km])
-        else:
-            out = ArrayWUnits(np.column_stack([bdott, bdotr]), [km, km])
+            ltof = ArrayWUnits(ltof_vals[0], sec)
+            return out.append(ltof)
 
-        return out.append(ltof)
+        # Batch case: append as a column so the result stays (N, 3) rather
+        # than being flattened to (3*N,) by the default flat append().
+        out = ArrayWUnits(np.column_stack([bdott, bdotr]), [km, km])
+        ltof = ArrayWUnits(ltof_vals[:, np.newaxis], sec)
+        return out.append(ltof, axis=1)
 
     # -------------------------------------------------------------------------
     # Jacobian
@@ -629,7 +640,7 @@ class Bplane:
         """
         Finite-difference Jacobian of the B-plane parameters w.r.t. velocity.
 
-        Computes the 3×3 matrix  ``d[B·T, B·R, ltof] / d[vx, vy, vz]``  via
+        Computes the (3, 3) matrix  :math:`\\partial [B \\cdot T, B \\cdot R, \\mathrm{ltof}] / \\partial [v_x, v_y, v_z]`  via
         forward finite differences with perturbation size chosen as
         ``sqrt(eps_machine) * max(1, |v_i|)``.
 
@@ -642,7 +653,7 @@ class Bplane:
         -------
         jacobian : ArrayWUnits, shape (3, 3)
             Jacobian matrix with units ``[km/(km/s), km/(km/s), s/(km/s)]``
-            i.e. ``[s, s, s²/km]`` per column.
+            i.e. ``[s, s, s^2/km]`` per column.
         """
         vel = sc_rel_state_j2000[3:6].values
         n_in = len(vel)
@@ -697,7 +708,7 @@ class Bplane:
         Returns
         -------
         DV_tot : ArrayWUnits, shape (3,)
-            Velocity increment vector ``[ΔVx, ΔVy, ΔVz]`` in km/s.
+            Velocity increment vector :math:`[\\Delta V_x, \\Delta V_y, \\Delta V_z]` in km/s.
 
         Raises
         ------
@@ -754,7 +765,7 @@ class Bplane:
         Compute a TCM via nonlinear optimisation (Nelder-Mead).
 
         Minimises the squared L2 norm of the B-plane residual
-        ``‖[B·T, B·R, ltof]_ref − [B·T, B·R, ltof]‖²`` over the three
+        :math:`\\lVert [B \\cdot T, B \\cdot R, \\mathrm{ltof}]_{\\mathrm{ref}} - [B \\cdot T, B \\cdot R, \\mathrm{ltof}] \\rVert^2` over the three
         velocity components at the manoeuvre epoch.
 
         Parameters
@@ -767,7 +778,7 @@ class Bplane:
         Returns
         -------
         DV_tot : ArrayWUnits, shape (3,)
-            Velocity increment vector ``[ΔVx, ΔVy, ΔVz]`` in km/s.
+            Velocity increment vector :math:`[\\Delta V_x, \\Delta V_y, \\Delta V_z]` in km/s.
         """
         sc_units = [km, km, km, km / sec, km / sec, km / sec]
         bpar_ref_val = np.array(
@@ -814,9 +825,9 @@ class Bplane:
         The algorithm proceeds segment-by-segment:
 
         1. Evaluate the current relative state at *tcm_epoch[i]*.
-        2. Solve for the ΔV that corrects the B-plane parameters to the
+        2. Solve for the :math:`\\Delta V` that corrects the B-plane parameters to the
            reference values using the chosen *method*.
-        3. Apply the ΔV to the state, propagate to the next TCM epoch (or to
+        3. Apply the :math:`\\Delta V` to the state, propagate to the next TCM epoch (or to
            close approach for the last segment), and write the resulting arc to
            the SPK file.
 
@@ -825,10 +836,10 @@ class Bplane:
         trajectory : Trajectory
             A ``scarabaeus.Trajectory`` object that exposes at minimum:
 
-            * ``get_state(epoch)`` → ``ArrayWUnits`` relative state in J2000.
+            * ``get_state(epoch)`` returns the ``ArrayWUnits`` relative state in J2000.
             * ``propagate(state, epoch_start, epoch_end)``
-              → updated ``Trajectory`` segment.
-            * ``write_spk(filepath)`` → generate a SPICE SPK kernel.
+              returns the updated ``Trajectory`` segment.
+            * ``write_spk(filepath)`` generates a SPICE SPK kernel.
 
         tcm_epochs : list of EpochArray | datetime | float
             Ordered sequence of epochs at which TCMs are to be computed.
@@ -853,7 +864,7 @@ class Bplane:
         Returns
         -------
         dv_list : list of ArrayWUnits
-            ΔV vectors ``[ΔVx, ΔVy, ΔVz]`` [km/s] at each TCM epoch.
+            :math:`\\Delta V` vectors :math:`[\\Delta V_x, \\Delta V_y, \\Delta V_z]` [km/s] at each TCM epoch.
 
         Raises
         ------
@@ -922,8 +933,8 @@ class Bplane:
         Map a spacecraft state covariance to B-plane parameter covariance.
 
         Uses the analytical linearisation of the B-plane projection to
-        propagate a 6×6 Cartesian covariance (in J2000) into the 3×3 space
-        ``[B·T, B·R, ltof]``.
+        propagate a (6, 6) Cartesian covariance (in J2000) into the (3, 3) space
+        :math:`[B \\cdot T, B \\cdot R, \\mathrm{ltof}]`.
 
         Assumes no cross-correlation between the B-plane position components
         and the linearised time-of-flight.
@@ -940,7 +951,7 @@ class Bplane:
         -------
         P_bplane : ArrayWUnits, shape (3, 3)
             B-plane parameter covariance with units
-            ``[[km², km², km·s], [km², km², km·s], [km·s, km·s, s²]]``.
+            ``[[km^2, km^2, km*s], [km^2, km^2, km*s], [km*s, km*s, s^2]]``.
         """
         return self._map_covariance(sc_cov, sc_rel_state_j2000)
 
@@ -953,7 +964,7 @@ class Bplane:
         Map a joint spacecraft-and-target covariance to B-plane parameter covariance.
 
         Accounts for uncertainty in both the spacecraft and the target body
-        by first forming the relative covariance via the 6×12 subtraction
+        by first forming the relative covariance via the (6, 12) subtraction
         matrix, then propagating as in :meth:`target_covariance`.
 
         Parameters
@@ -962,7 +973,7 @@ class Bplane:
             Joint covariance matrix of the spacecraft and target states in
             J2000, ordered as ``[sc_pos, sc_vel, tgt_pos, tgt_vel]``.
         sc_rel_state_j2000 : ArrayWUnits, shape (6,)
-            Relative Cartesian state ``sc − target`` in J2000 at close approach.
+            Relative Cartesian state ``sc - target`` in J2000 at close approach.
 
         Returns
         -------
@@ -992,10 +1003,10 @@ class Bplane:
 
         .. note::
             Not yet implemented.  A correct implementation requires a state
-            transition matrix (STM) Φ from the manoeuvre epoch to close
+            transition matrix (STM) :math:`\\Phi` from the manoeuvre epoch to close
             approach, so that::
 
-                P_ca = Φ @ P @ Φ.T + Q
+                P_ca = Phi @ P @ Phi.T + Q
 
             where Q is the process-noise covariance.  The mapped B-plane
             covariance is then obtained via :meth:`_map_covariance` evaluated
@@ -1023,7 +1034,7 @@ class Bplane:
         sc_rel_state_j2000: ArrayWUnits,
     ) -> ArrayWUnits:
         """
-        Core routine: map a 6×6 relative Cartesian covariance to B-plane space.
+        Core routine: map a (6, 6) relative Cartesian covariance to B-plane space.
 
         Parameters
         ----------

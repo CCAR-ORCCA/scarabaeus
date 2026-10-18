@@ -16,6 +16,11 @@ import numpy
 import re
 import copy
 
+# Shared serialization primitives (owner/ArrayWUnits <-> dict) live in the
+# central Serialization module so every class's to_dict/from_dict agrees on the
+# on-disk convention.
+from scarabaeus.utils.Serialization import owner_to_dict, owner_from_dict
+
 
 class StateArray:
     """ Container for an estimation state vector at a given epoch and origin.
@@ -65,6 +70,12 @@ class StateArray:
           - ``value``: initial value, typically an :class:`~scarabaeus.ArrayWUnits`
             (vector of size ``dim`` for vector components; scalar for ``dim == 1``).
 
+    Raises
+    ------
+    ValueError
+        If the builder emits an unsupported token for ``estimation``/``dynamics``,
+        or if a vector ``value`` length is inconsistent with ``dim`` (when validated).
+
     See Also
     --------
     scarabaeus.StateDefinition : Fluent builder for constructing valid state components.
@@ -76,8 +87,8 @@ class StateArray:
     - **Units**: supply ``value`` with units via :class:`~scarabaeus.ArrayWUnits` (e.g., km, km/s, rad).
     - **Dimensions**: reserved kinematic components use ``dim = 3``; scalar parameters default to ``dim = 1``.
     - **Allowed tokens** (case-sensitive):
-        ``estimation ∈ {"estimated","considered"}``,
-        ``dynamics ∈ {"dynamic","static"}``.
+        ``estimation``: ``"estimated"`` or ``"considered"``;
+        ``dynamics``: ``"dynamic"`` or ``"static"``.
     - :class:`~scarabaeus.StateDefinition` performs light validation (e.g., ``len(value) == dim`` when vector-like).
 
     Examples
@@ -124,13 +135,6 @@ class StateArray:
         )
 
         state_vec = scb.StateArray(epoch=epoch_array[0], origin=Vesta, state=state_def)
-
-    Raises
-    ------
-    ValueError
-        If the builder emits an unsupported token for ``estimation``/``dynamics``,
-        or if a vector ``value`` length is inconsistent with ``dim`` (when validated).
-
     """
 
     # --------------------#
@@ -223,6 +227,74 @@ class StateArray:
     # ----------------#
     # region Methods #
     # ----------------#
+
+    def to_dict(self) -> dict:
+        """
+        Serialize the StateArray to a JSON-friendly dict.
+
+        Captures the epoch, origin, and every state component (name, dimension,
+        estimation/dynamics modes, owner, values, units, and frame) so the state
+        can be reconstructed by :meth:`from_dict`. Supports the position /
+        velocity / dynamic+static parameter components used by the propagator;
+        each component's values must be an ``ArrayWFrame``.
+        """
+        components = []
+        for entry in self._state:
+            name, dim, est, dyn, owner, awf = entry
+            q = awf.quantity
+            components.append(
+                {
+                    "name": name,
+                    "dim": dim,
+                    "estimation": est,
+                    "dynamics": dyn,
+                    "owner": owner_to_dict(owner),
+                    "values": numpy.asarray(q.values).tolist(),
+                    "units": q.units.to_dict(),
+                    "frame": awf.frame.name,
+                }
+            )
+        return {
+            "epoch": self._epoch.to_dict(),
+            "origin": owner_to_dict(self._origin),
+            "components": components,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict, owner_overrides: dict = None) -> "StateArray":
+        """
+        Reconstruct a StateArray from a dict produced by :meth:`to_dict`.
+
+        Parameters
+        ----------
+        data : dict
+            Serialized state.
+        owner_overrides : dict, optional
+            Mapping ``spice_id -> Body`` used to substitute pre-built owners
+            (e.g. so a Propagator reuses its ``primary_body`` instance instead
+            of constructing a duplicate). Components whose owner ``spice_id`` is
+            present here use the supplied object.
+        """
+        from scarabaeus.timeAndFrame.Frame import Frame
+        from scarabaeus.units.Units import Units
+
+        owner_overrides = owner_overrides or {}
+        epoch = EpochArray.from_dict(data["epoch"])
+        origin = owner_from_dict(data["origin"])
+
+        components = []
+        for c in data["components"]:
+            sid = c["owner"].get("spice_id")
+            owner = owner_overrides.get(sid) or owner_from_dict(c["owner"])
+            units = Units.from_dict(c["units"])
+            frame = Frame(c["frame"])
+            awf = ArrayWFrame(numpy.array(c["values"]), units, frame)
+            components.append(
+                (c["name"], c["dim"], c["estimation"], c["dynamics"], owner, awf)
+            )
+
+        state_def = StateDefinition.from_components(components)
+        return cls(epoch=epoch, origin=origin, state=state_def)
 
     def _extract_state_definition(self) -> list:
         """
@@ -317,12 +389,19 @@ class StateArray:
 
                 # Case 1: looks like a single vector (e.g. (3,) or (dim,))
                 # -> treat as initial condition only, no epoch-size check.
-                if vals_arr.ndim == 1 and vals_arr.size == dim:
+                # ArrayWUnits collapses a one-element array to a 0-d value, so a
+                # scalar dynamic component (dim == 1) arrives with ndim == 0.
+                if vals_arr.ndim <= 1 and vals_arr.size == dim:
                     pass
 
                 # Case 2: looks like time history (N, dim) or (N,) with N != dim
                 else:
                     # Interpret first axis as time samples
+                    if vals_arr.ndim == 0:
+                        raise ValueError(
+                            f"Dynamic parameter '{name}' is declared with size "
+                            f"{dim} but was given a single scalar value."
+                        )
                     if vals_arr.ndim == 1:
                         N = vals_arr.size
                     else:
@@ -481,47 +560,50 @@ class StateArray:
         Parameters
         ----------
         y : np.ndarray, optional
-            Flat state vector at the current step. If None, uses ``self.values``.
+            Flat state vector at the current step. If None, uses ``self.values0``.
 
         Returns
         -------
         dict
-            Mapping from (name, spice_id) → np.ndarray or scalar.
+            Mapping from ``(name, spice_id)`` to an ``np.ndarray`` or scalar.
         """
         if y is None:
-            y = self.values
+            y = self.values0.values
 
+        # The (key, start, end, dim) layout depends only on the state definition,
+        # not on ``y``; build it once and reuse across the many per-RHS calls
+        # during propagation. Invalidated by :meth:`reinitialize`.
+        layout = getattr(self, "_direct_rep_layout", None)
+        if layout is None:
+            layout = []
+            idx = 0
+            for entry in self.state:
+                if len(entry) < 5:
+                    raise ValueError(
+                        f"Invalid state entry format: {entry!r}. "
+                        "Expected at least (name, dim, est, dyn, owner, ...)."
+                    )
+                name = entry[0]
+                dim = entry[1]
+                spice_id = getattr(entry[4], "spice_id", None)
+                if spice_id is None:
+                    raise ValueError(
+                        f"Owner {entry[4]} has no 'spice_id'. "
+                        "All propagated bodies must define one."
+                    )
+                layout.append(((name, spice_id), idx, idx + dim, dim))
+                idx += dim
+            self._direct_rep_layout = layout
+
+        n = len(y)
         direct_rep: dict = {}
-        idx = 0
-
-        for entry in self.state:
-            if len(entry) < 5:
+        for key, start, end, dim in layout:
+            if end > n:
                 raise ValueError(
-                    f"Invalid state entry format: {entry!r}. "
-                    "Expected at least (name, dim, est, dyn, owner, ...)."
+                    f"Inconsistent StateArray layout: {key[0]} needs [{start}:{end}] "
+                    f"but y has length {n}."
                 )
-
-            name = entry[0]
-            dim = entry[1]
-            owner = entry[4]
-
-            spice_id = getattr(owner, "spice_id", None)
-            if spice_id is None:
-                raise ValueError(
-                    f"Owner {owner} has no 'spice_id'. "
-                    "All propagated bodies must define one."
-                )
-
-            start, end = idx, idx + dim
-            if end > len(y):
-                raise ValueError(
-                    f"Inconsistent StateArray layout: {name} needs [{start}:{end}] "
-                    f"but y has length {len(y)}."
-                )
-
-            values = y[start:end] if dim > 1 else y[start]
-            direct_rep[(name, spice_id)] = values
-            idx = end
+            direct_rep[key] = y[start:end] if dim > 1 else y[start]
 
         return direct_rep
 
@@ -531,17 +613,16 @@ class StateArray:
 
         Parameters
         ----------
-        **kwargs :
-            Keyword arguments representing the new attribute values.
-                - epoch (EpochArray, optional): New epoch array
-                - origin (Body, optional): New origin body
-                - state (StateDefinition or list, optional): New state definition
+        **kwargs
+            Keyword arguments representing the new attribute values:
 
-        Modifies:
-            Updates the existing instance (`self`) instead of creating a new one.
+            - epoch (EpochArray, optional): New epoch array
+            - origin (Body, optional): New origin body
+            - state (StateDefinition or list, optional): New state definition
 
         Notes
         -----
+        Updates the existing instance (``self``) instead of creating a new one.
         If 'state' is provided as a raw list of tuples, it will be automatically
         converted to a StateDefinition object for compatibility.
         """
@@ -559,6 +640,8 @@ class StateArray:
                     "state must be either a StateDefinition instance or a list of component tuples"
                 )
             self._state = new_state.components
+            # State layout changed -> drop the cached _make_direct_representation plan.
+            self._direct_rep_layout = None
 
         # Recompute dependent attributes
         self._state_definition = self._extract_state_definition()

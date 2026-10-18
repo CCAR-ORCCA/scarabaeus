@@ -2,12 +2,12 @@
 # SPDX-License-Identifier: ISC
 from scarabaeus import (
     FilterOD,
-    CovarianceMatrix,
     SolutionOD,
     Propagator,
     FilterSettings,
     MissionSequence,
     MeasurementSpec,
+    ProcessNoise,
 )
 from typing import List, Dict, Optional, Tuple
 import scarabaeus.utils.NumpyWrapper as np
@@ -67,32 +67,50 @@ class LKF(FilterOD):
 
         \\hat{P}_k = (I - K_k H_k)\\,\\bar{P}_k\\,(I - K_k H_k)^T + K_k R_k K_k^T
 
-    The last line uses the Joseph-stabilized form, which preserves symmetry and
-    positive definiteness of the covariance regardless of numerical rounding.
+    The last line uses the Joseph-stabilized form, which keeps the covariance
+    positive definite under rounding better than :math:`(I - K_k H_k)\\bar{P}_k`.
+    The result is symmetrized after each update: rounding leaves the product
+    slightly asymmetric, and the next gain amplifies the asymmetry when the
+    data are much more precise than :math:`\\bar{P}_k` (Doppler).
 
-    **Schmidt consider parameters**
+    **Consider parameters**
 
-    When consider parameters :math:`c` are present, the innovation covariance
-    is inflated by their uncertainty before computing the Kalman gain:
+    When consider parameters :math:`c` are present, the filter runs a consider
+    analysis, the same estimator as :class:`~scarabaeus.SRIF`,
+    :class:`~scarabaeus.SRIFB` and :class:`~scarabaeus.LSB` ([1]_, Ch. 6). The
+    estimate is conditioned on :math:`c = \\bar{c}`, so the gain uses
+    :math:`\\bar{P}_{xx}`, the covariance with the considered states known:
 
     .. math::
 
-        S_k = H_{x,k}\\,\\bar{P}_{xx,k}\\,H_{x,k}^T
-              + H_{c,k}\\,P_{cc}\\,H_{c,k}^T + R_k
-
+        S_k = H_{x,k}\\,\\bar{P}_{xx,k}\\,H_{x,k}^T + R_k, \\quad
         K_k = \\bar{P}_{xx,k}\\,H_{x,k}^T S_k^{-1}
 
-    The posterior covariance carries an additional consider contribution:
+        \\hat{P}_{xx,k} = (I - K_k H_{x,k})\\,\\bar{P}_{xx,k}\\,
+                          (I - K_k H_{x,k})^T + K_k R_k K_k^T
+
+    The sensitivity :math:`S_x` carries the error in :math:`c` into the
+    estimate:
 
     .. math::
 
-        \\hat{P}_{xx,k} = (I - K_k H_{x,k})\\,\\bar{P}_{xx,k}\\,
-                          (I - K_k H_{x,k})^T
-                        + K_k R_k K_k^T
-                        + K_k H_{c,k}\\,P_{cc}\\,H_{c,k}^T K_k^T
+        \\bar{S}_{x,k} = (\\Phi_{x}\\,\\hat{S}_{x,k-1} + \\Psi)\\,\\Phi_{c}^{-1},
+        \\quad
+        \\hat{S}_{x,k} = (I - K_k H_{x,k})\\,\\bar{S}_{x,k} - K_k H_{c,k}
 
-    The state deviation :math:`\\hat{x}_k` is **not** updated for consider
-    parameters; only the covariance is inflated.
+    and the consider covariance is
+
+    .. math::
+
+        \\hat{P}_{c,k} = \\hat{P}_{xx,k} + \\hat{S}_{x,k}\\,P_{cc}\\,\\hat{S}_{x,k}^T,
+        \\quad
+        \\hat{P}_{xc,k} = \\hat{S}_{x,k}\\,P_{cc}
+
+    At the first epoch and at sequence nodes,
+    :math:`S_x = P_{xc} P_{cc}^{-1}` and :math:`P_{xx} = P_c - S_x P_{xc}^T`,
+    so an a-priori correlation between :math:`x` and :math:`c` is kept.
+    Process noise enters :math:`P_{xx}` only. The state deviation
+    :math:`\\hat{x}_k` is **not** updated for consider parameters.
 
     **Smoother (Rauch–Tung–Striebel)**
 
@@ -131,14 +149,9 @@ class LKF(FilterOD):
         Directory for the trajectory BSP file.
     overwrite_traj : bool, optional
         If ``True``, overwrite any existing trajectory file.
-
-    Notes
-    -----
-    For dense tracking or when superior numerical conditioning is required,
-    prefer :class:`~scarabaeus.SRIF`, which delivers the same solution with
-    roughly double the effective floating-point precision.  When process noise
-    is not needed, the batch estimators :class:`~scarabaeus.LSB` and
-    :class:`~scarabaeus.SRIFB` are simpler alternatives.
+    verbose : bool, optional
+        If ``False``, silence the printout of the propagation run at
+        construction. Defaults to ``True``.
 
     See Also
     --------
@@ -147,68 +160,34 @@ class LKF(FilterOD):
     scarabaeus.FilterOD : Base class providing trajectory and measurement handling.
     scarabaeus.SolutionOD : Container for the estimated state history and covariance.
 
+    Notes
+    -----
+    For dense tracking or when superior numerical conditioning is required,
+    prefer :class:`~scarabaeus.SRIF`, which delivers the same solution with
+    roughly double the effective floating-point precision.  When the data are
+    much more precise than the a-priori (:math:`H\\bar{P}H^T/R \\gtrsim 10^8`,
+    typical for Doppler), the covariance form can use up most of the float64
+    digits, and the LKF covariances may then differ from the SRIF ones by a
+    few percent.  When process noise
+    is not needed, the batch estimators :class:`~scarabaeus.LSB` and
+    :class:`~scarabaeus.SRIFB` are simpler alternatives.
+
     References
     ----------
-    Tapley, B. D., Schutz, B. E., & Born, G. H. (2004). Statistical Orbit Determination. Elsevier Academic Press. ISBN 978-0-12-683630-1.
+    .. [1] Tapley, B. D., Schutz, B. E., & Born, G. H. (2004). *Statistical Orbit
+       Determination*. Elsevier Academic Press. ISBN 978-0-12-683630-1.
     """
 
     # ------------------------------------------------------------------
     # Properties
     # ------------------------------------------------------------------
-
-    @property
-    def covariance_history(self) -> list:
-        """Posterior covariance :math:`\\hat{P}_k` at each measurement epoch.
-        Populated after calling :meth:`~FilterOD.fit`."""
-        return self._covariance_history
-
-    @covariance_history.setter
-    def covariance_history(self, value):
-        self._covariance_history = value
-
-    @property
-    def covariance_consider_history(self) -> list:
-        """Consider-parameter covariance block at each epoch.
-        Empty list when no consider parameters are active."""
-        return self._covariance_consider_history
-
-    @covariance_consider_history.setter
-    def covariance_consider_history(self, value):
-        self._covariance_consider_history = value
-
-    @property
-    def state_deviation_history(self) -> list:
-        """Posterior state deviation :math:`\\hat{x}_k` at each measurement epoch.
-        Populated after calling :meth:`~FilterOD.fit`."""
-        return self._state_deviation_history
-
-    @state_deviation_history.setter
-    def state_deviation_history(self, value):
-        self._state_deviation_history = value
-
-    @property
-    def prefit_residuals(self) -> dict:
-        """Pre-update residuals :math:`y_k = z_k - h(\\bar{x}_k^*)`, keyed by dataset name.
-        Populated after calling :meth:`~FilterOD.fit`."""
-        return self._prefit_residuals
-
-    @prefit_residuals.setter
-    def prefit_residuals(self, value):
-        self._prefit_residuals = value
-
-    @property
-    def postfit_residuals(self) -> dict:
-        """Post-update residuals, keyed by dataset name.
-        Populated after calling :meth:`~FilterOD.fit`."""
-        return self._postfit_residuals
-
-    @postfit_residuals.setter
-    def postfit_residuals(self, value):
-        self._postfit_residuals = value
+    # The shared history/residual properties (covariance_history,
+    # covariance_consider_history, state_deviation_history, prefit_residuals,
+    # postfit_residuals) are defined on FilterOD. Only LKF-specific ones below.
 
     @property
     def kalman_gains(self) -> list:
-        """Kalman gain :math:`K_k` at each measurement epoch.
+        """Kalman gain :math:`K_k` at each measurement update.
         Populated when ``settings.output.save_kalman_gains`` is ``True``."""
         return self._kalman_gains
 
@@ -218,13 +197,28 @@ class LKF(FilterOD):
 
     @property
     def innovation_covariances(self) -> list:
-        """Innovation covariance :math:`S_k = H_k \\bar{P}_k H_k^T + R_k` at each epoch.
-        Populated when ``settings.output.save_innovation_covariances`` is ``True``."""
+        """Innovation covariance :math:`S_k = H_k \\bar{P}_k H_k^T + R_k` at each
+        measurement update. With consider parameters it also holds their
+        contribution :math:`H_y P_{cc} H_y^T`, :math:`H_y = H_x S_x + H_c`.
+        Populated when ``settings.output.save_innovation_covariances``
+        or ``settings.output.save_nis_statistics`` is ``True``."""
         return self._innovation_covariances
 
     @innovation_covariances.setter
     def innovation_covariances(self, value):
         self._innovation_covariances = value
+
+    @property
+    def innovations(self) -> list:
+        """Pre-update innovation :math:`\\nu_k = y_k - H_k \\bar{x}_k` at each
+        measurement update, paired with :attr:`innovation_covariances`. Populated
+        when ``settings.output.save_nis_statistics`` is ``True`` (not in covariance
+        analysis)."""
+        return self._innovations
+
+    @innovations.setter
+    def innovations(self, value):
+        self._innovations = value
 
     def __init__(
         self,
@@ -234,32 +228,31 @@ class LKF(FilterOD):
         traj_name: Optional[str] = None,
         traj_dir: Optional[str] = None,
         overwrite_traj: bool = True,
+        verbose: bool = True,
     ):
         # Initialize base FilterOD class
         super().__init__(
-            propagator, measurements, settings, traj_name, traj_dir, overwrite_traj
+            propagator,
+            measurements,
+            settings,
+            traj_name,
+            traj_dir,
+            overwrite_traj,
+            verbose=verbose,
         )
 
-        # Initialize output containers
-        self._covariance_history = []
-        self._covariance_consider_history = []
-        self._state_deviation_history = []
-        self._prefit_residuals = {}
-        self._postfit_residuals = {}
+        # LKF-specific output containers (shared ones live on FilterOD).
         self._kalman_gains = []
         self._innovation_covariances = []
-
-        # Initialize process noise from settings if provided
-        if self.settings.process_noise is not None:
-            self._initialize_process_noise_from_settings()
+        self._innovations = []
 
         ## Print
         print("")
         print("=" * 80)
         print("Initializing Linearized Kalman Filter (LKF)")
         print("=" * 80)
-        if hasattr(self, "process_noise"):
-            print(f"Process Noise Model: {self.settings.process_noise.type}")
+        if self.process_noise is not None:
+            print(f"Process Noise Model: {self._process_noise_description()}")
         print("=" * 80)
 
     # -----------------------------------
@@ -278,41 +271,6 @@ class LKF(FilterOD):
         Iterates over all measurement epochs (and any intervening event epochs
         for sequence trajectories), alternating between a **time update** and a
         **measurement update** at each step.
-
-        Time update (covariance prediction)
-        ------------------------------------
-        .. math::
-
-            \\bar{P}_k = \\Phi_{k,k-1}\\, \\hat{P}_{k-1}\\, \\Phi_{k,k-1}^T + Q_k
-
-        where :math:`\\Phi_{k,k-1} = \\Phi_k \\Phi_{k-1}^{-1}` is the one-step
-        STM and :math:`Q_k` is the discrete process noise (SNC or DMC, if active).
-
-        Measurement update
-        ------------------
-        Innovation covariance and Kalman gain:
-
-        .. math::
-
-            S_k = H_x \\bar{P}_k H_x^T + R_k, \\quad
-            K_k = \\bar{P}_k H_x^T S_k^{-1}
-
-        State correction:
-
-        .. math::
-
-            \\hat{x}_k = \\bar{x}_k + K_k (y_k - H_x \\bar{x}_k)
-
-        Covariance correction (Joseph stabilised form):
-
-        .. math::
-
-            \\hat{P}_k = (I - K_k H_x)\\, \\bar{P}_k\\, (I - K_k H_x)^T
-                       + K_k R_k K_k^T
-
-        When **consider parameters** are active, the Schmidt-Kalman extension
-        is applied: the full covariance is inflated by the consider covariance
-        ``Pcc`` via the Schmidt sensitivity matrix ``Sx``.
 
         Parameters
         ----------
@@ -333,6 +291,43 @@ class LKF(FilterOD):
             Solution object containing state deviation history, covariance
             history, prefit and postfit residuals, and optional debug quantities
             as configured by :class:`~scarabaeus.OutputSettings`.
+
+        Notes
+        -----
+        The time update predicts the covariance as
+
+        .. math::
+
+            \\bar{P}_k = \\Phi_{k,k-1}\\, \\hat{P}_{k-1}\\, \\Phi_{k,k-1}^T + Q_k
+
+        where :math:`\\Phi_{k,k-1} = \\Phi_k \\Phi_{k-1}^{-1}` is the one-step
+        STM and :math:`Q_k` is the discrete process noise (SNC or DMC, if active).
+
+        The measurement update forms the innovation covariance and the Kalman
+        gain,
+
+        .. math::
+
+            S_k = H_x \\bar{P}_k H_x^T + R_k, \\quad
+            K_k = \\bar{P}_k H_x^T S_k^{-1}
+
+        State correction:
+
+        .. math::
+
+            \\hat{x}_k = \\bar{x}_k + K_k (y_k - H_x \\bar{x}_k)
+
+        Covariance correction (Joseph stabilised form, then symmetrized):
+
+        .. math::
+
+            \\hat{P}_k = (I - K_k H_x)\\, \\bar{P}_k\\, (I - K_k H_x)^T
+                       + K_k R_k K_k^T
+
+        When **consider parameters** are active, the same
+        gain uses ``Pxx``, the covariance with the considered states known,
+        and the sensitivity ``Sx`` carries their error:
+        ``Pc = Pxx + Sx Pcc Sx^T`` (consider analysis, as in the SRIF).
         """
 
         # Initialize state length if sequence
@@ -341,11 +336,13 @@ class LKF(FilterOD):
 
         # Initialize covariance and deviation
         P0 = self.initial_covariance.matrix_without_units()
-        if hasattr(self, "flag_MTM") and self.flag_MTM is True:
+        dx_bar_0 = self._apriori_deviation(0)
+        if self.flag_MTM:
             MTM = self.trajectory._STMs[0].reshape(
                 int(np.sqrt(len(self.trajectory._STMs[0]))), -1
             )
             P0 = MTM @ P0 @ MTM.T
+            dx_bar_0 = MTM @ dx_bar_0
             self.flag_MTM = False
 
         # Extract blocks if consider parameters are used
@@ -355,35 +352,20 @@ class LKF(FilterOD):
         else:
             Pxx_hat_k1 = P0
 
-        dx_hat_k1 = np.zeros((self.n_est if self.has_consider else self.n, 1))
+        dx_hat_k1 = dx_bar_0[self.idx_est] if self.has_consider else dx_bar_0
         STM_k1 = np.eye(self.n)
 
         # Extract spacecraft times
-        measurement_times = np.asarray(
-            self.measurement_data.get_spacecraft_times(), dtype=float
-        )
-        if self.flag_sequence:
-            event_times = np.asarray(self.events_epochs, dtype=float)
-            timeline_times = np.unique(np.concatenate((measurement_times, event_times)))
-        else:
-            event_times = np.array([])
-            timeline_times = measurement_times
+        measurement_times, event_times, timeline_times = self._build_timeline()
 
-        # Initialize Schmidt matrix Sx from first measurement at t0
+        # Initialize Schmidt matrix Sx from the a-priori covariance, as at the
+        # sequence nodes: Pc is the estimated block and Pxx = Pc - Sx Pxc^T the
+        # part of it the considered states do not explain. The first
+        # measurement is processed by the loop below, like every other one.
         if self.has_consider:
-            block0 = self.measurement_data.get_combined_for_t2(measurement_times[0])
-            block0 = block0[measurement_times[0]]
-            sig0 = block0["sigma"]
-            part0 = block0["partials"]
-            Hx0, Hc0 = self._split_partials_hx_hc(part0)
-            R0 = underweighting_factor * np.array(
-                CovarianceMatrix(
-                    sig0, measurement_times[0], from_list=True, corr_factors=meas_corr
-                ).matrix
-            )
-            Sy0 = Hx0 @ Pxx_hat_k1 @ Hx0.T + R0
-            K0 = Pxx_hat_k1 @ Hx0.T @ self._safe_inv(Sy0)
-            Sx_hat_k1 = -K0 @ Hc0
+            Pxc_0 = P0[np.ix_(self.idx_est, self.idx_con)]
+            Sx_hat_k1 = Pxc_0 @ self._safe_inv(Pcc_bar_k1)
+            Pxx_hat_k1 = Pxx_hat_k1 - Sx_hat_k1 @ Pxc_0.T
 
         # Initialize storage arrays (these will be extracted by SolutionOD)
         self.covariance_history = []
@@ -391,10 +373,21 @@ class LKF(FilterOD):
         self.state_deviation_history = []
         self.prefit_residuals = []
         self.postfit_residuals = []
+        # Forward solution at each sequence node, in the previous leg's definition
+        self._node_deviations = []
+        self._node_covariances = []
 
-        # Optional: Initialize debug storage if output_settings requires it
-        if hasattr(self.settings, "output") and self.settings.output.save_kalman_gains:
-            self.kalman_gains = []
+        # Debug storage, one entry per measurement update. Reset on every pass
+        # so the histories of earlier iterations do not pile up.
+        output = getattr(self.settings, "output", None)
+        save_gains = bool(output is not None and output.save_kalman_gains)
+        save_nis = bool(output is not None and output.save_nis_statistics)
+        save_Sy = save_nis or bool(
+            output is not None and output.save_innovation_covariances
+        )
+        self.kalman_gains = []
+        self.innovation_covariances = []
+        self.innovations = []
         counter_events = 0
         self.update_flag = True
 
@@ -420,8 +413,7 @@ class LKF(FilterOD):
             #### Extract Measurement Data for Epoch t2 ####
             block = None
             if self.update_flag:
-                block = self.measurement_data.get_combined_for_t2(current_time)
-                block = block[current_time]
+                block = self._epoch_measurement_block(current_time)
                 sigmas = block["sigma"]
                 partials = block["partials"][:, : self.n]
                 residuals = block["residuals"]
@@ -448,7 +440,7 @@ class LKF(FilterOD):
                 STM_k = self.trajectory.get_STM(epoch=current_time, idx=k)
 
             # Compute STM
-            if hasattr(self, "flag_node") and self.flag_node is True:
+            if self.flag_node:
                 prev_n = self.legs_n[counter_events - 1]
                 STM_k_prev_leg = self.trajectory._STMs[counter_events - 1][-1].reshape(
                     prev_n, prev_n
@@ -459,7 +451,7 @@ class LKF(FilterOD):
 
             # Split STM / H in estimated and considered
             Phi_k, Psi_k, Phi_c_k = self._split_stm_phi_psi(STM_kk1)
-            if self.update_flag and not (hasattr(self, "flag_node") and self.flag_node):
+            if self.update_flag and not self.flag_node:
                 Hx, Hc = self._split_partials_hx_hc(partials)
 
             # COVARIANCE PREDICTION
@@ -470,106 +462,94 @@ class LKF(FilterOD):
                 # Sx_bar maps current consider deviation (at k) to x deviation
                 Sx_bar_k = (Phi_k @ Sx_hat_k1 + Psi_k) @ self._safe_inv(Phi_c_k)
                 Pcc_bar_k = Phi_c_k @ Pcc_bar_k1 @ Phi_c_k.T
-                Pxc_bar_k = Sx_bar_k @ Pcc_bar_k
-                Pc_bar_k = Pxx_bar_k + Sx_bar_k @ Pcc_bar_k @ Sx_bar_k.T
 
-            if hasattr(self, "flag_node") and self.flag_node is True:
+            if self.flag_node:
+                # Forward solution at the node in the previous leg's definition,
+                # taken before the partition is re-initialized for the new leg.
+                # Mapping the final estimate back through the nodes recovers from
+                # it the states dropped here. Covariance analysis carries no
+                # deviation (dx_hat_k1 stays in the first leg's definition).
+                if self.covariance_analysis is False:
+                    dx_node_prev = Phi_k @ dx_hat_k1
+                    self._node_deviations.append(
+                        self._full_leg_deviation(counter_events - 1, dx_node_prev)
+                    )
+                # Covariance of the errors at the node in the previous leg's
+                # definition (considered states always last). With consider
+                # states it is the joint one, whose estimated block is the
+                # consider-inflated Pc: Pxx leaves out the considered states'
+                # contribution, and the matrix it forms with Pxc and Pcc need
+                # not be positive definite.
                 if self.has_consider:
-                    # build consider-inflated full covariance at this epoch
-                    # NOTE: here not inflated, just mapped to new definition
-                    P_full = np.block(
-                        [[Pxx_bar_k, Pxc_bar_k], [Pxc_bar_k.T, Pcc_bar_k]]
+                    Pxc_bar_k = Sx_bar_k @ Pcc_bar_k
+                    Pc_bar_k = Pxx_bar_k + Sx_bar_k @ Pxc_bar_k.T
+                    P_node = np.block(
+                        [[Pc_bar_k, Pxc_bar_k], [Pxc_bar_k.T, Pcc_bar_k]]
                     )
-                    P_full = self._map_covariance_definition_node(
-                        counter_events, P_full
-                    )
+                else:
+                    P_node = Pxx_bar_k
+                self._node_covariances.append(P_node)
+                P_full = self._map_covariance_definition_node(counter_events, P_node)
 
-                    # After mapping you can re-init consider partition safely
-                    self._init_consider_partition(idx_leg=counter_events)
-                    n_use = self.n_est if self.has_consider else self.n
-                    nc = self.n_con
-                    Phi_k, Psi_k, Phi_c_k = self._split_stm_phi_psi(STM_kk1)
+                # After mapping you can re-init consider partition safely
+                self._init_consider_partition(idx_leg=counter_events)
+                if self.update_flag:
                     Hx, Hc = self._split_partials_hx_hc(partials)
 
-                    # Apply impulse in covariance from burn
-                    P_full = STM_k @ P_full @ STM_k.T
+                # Apply impulse in covariance from burn
+                P_full = STM_k @ P_full @ STM_k.T
 
-                    # re-extract blocks in new definition
-                    Pxx_bar_k = P_full[np.ix_(self.idx_est, self.idx_est)]
+                # Back into Schmidt objects in the new definition: Pc is the
+                # estimated block and Pxx = Pc - Sx Pxc^T the part of it the
+                # considered states do not explain. Considered states augmented
+                # here enter uncorrelated, so their Sx is zero.
+                Pc_bar_k = P_full[np.ix_(self.idx_est, self.idx_est)]
+                Pxx_bar_k = Pc_bar_k
+                if self.has_consider:
                     Pcc_bar_k = P_full[np.ix_(self.idx_con, self.idx_con)]
                     Pxc_bar_k = P_full[np.ix_(self.idx_est, self.idx_con)]
-
-                    # refactor back into Schmidt objects
                     Sx_bar_k = Pxc_bar_k @ self._safe_inv(Pcc_bar_k)
-                else:
-                    Pxx_full = self._map_covariance_definition_node(
-                        counter_events, Pxx_bar_k
-                    )
-
-                    # After mapping you can re-init consider partition safely
-                    self._init_consider_partition(idx_leg=counter_events)
-                    n_use = self.n_est if self.has_consider else self.n
-                    nc = self.n_con
-                    Hx, Hc = self._split_partials_hx_hc(partials)
-
-                    # Apply impulse in covariance from burn
-                    Pxx_full = STM_k @ Pxx_full @ STM_k.T
-
-                    # Extract new blocks
-                    Pxx_bar_k = Pxx_full[np.ix_(self.idx_est, self.idx_est)]
-                    if self.has_consider:
-                        Pcc_bar_k = Pxx_full[np.ix_(self.idx_con, self.idx_con)]
-                        R = underweighting_factor * np.array(
-                            CovarianceMatrix(
-                                sigmas,
-                                current_time,
-                                from_list=True,
-                                corr_factors=meas_corr,
-                            ).matrix
-                        )
-                        Sy = Hx @ Pxx_bar_k @ Hx.T + R
-                        K = Pxx_bar_k @ Hx.T @ self._safe_inv(Sy)
-                        Sx_bar_k = -K @ Hc
-                        Pxc_bar_k = Sx_bar_k @ Pcc_bar_k
-                        Pc_bar_k = Pxx_bar_k + Sx_bar_k @ Pcc_bar_k @ Sx_bar_k.T
+                    Pxx_bar_k = Pc_bar_k - Sx_bar_k @ Pxc_bar_k.T
 
             # Add process noise only to x
             if self.SNC_flag or self.DMC_flag:
-                # Ensure gamma matches the CURRENT information matrix size (state may still be 6 here)
-                Q_k = self.process_noise.discrete_time_process_covariances[k]
-                n_k = Pxx_bar_k.shape[0]
-                if Q_k.shape[0] != n_k:
-                    Q_k = Q_k[:n_k, :n_k]
-                Pxx_bar_k += Q_k
+                # Sized for the estimated states of the current leg (after any
+                # node mapping above). The noise is not explained by the
+                # considered states: Sx is unchanged.
+                Pxx_bar_k += ProcessNoise.combined_covariance_at(
+                    self._process_noise_models(), k, Pxx_bar_k.shape[0]
+                )
 
             if self.update_flag:
                 # Measurement covariance and partials
-                measurement_covariance = underweighting_factor * np.array(
-                    CovarianceMatrix(
-                        sigmas,
-                        current_time,
-                        from_list=True,
-                        corr_factors=meas_corr,
-                    ).matrix
+                measurement_covariance = self._measurement_covariance(
+                    sigmas, current_time, meas_corr, underweighting_factor
                 )
 
-                # Kalman Gain computations
-                if self.has_consider:
-                    Sy = Hx @ Pc_bar_k @ Hx.T + measurement_covariance
-                    K = Pc_bar_k @ Hx.T @ self._safe_inv(Sy)
-                else:
-                    Sy = Hx @ Pxx_bar_k @ Hx.T + measurement_covariance
-                    K = Pxx_bar_k @ Hx.T @ self._safe_inv(Sy)
+                # Kalman gain. With consider parameters it is the gain of the
+                # estimate conditioned on c = c_bar (Pxx, not Pc), as in the
+                # SRIF, SRIFB and LSB.
+                Sy = Hx @ Pxx_bar_k @ Hx.T + measurement_covariance
+                K = Pxx_bar_k @ Hx.T @ self._safe_inv(Sy)
                 M = np.eye(Hx.shape[1]) - K @ Hx
 
-            # Save innovation covariance if requested
-            if hasattr(self, "innovation_covariances"):
-                self.innovation_covariances.append(Sy)
+                if save_Sy:
+                    if self.has_consider:
+                        # Covariance of the innovation, which the error in c
+                        # also enters: Hy = Hx Sx + Hc
+                        Hy = Hx @ Sx_bar_k + Hc
+                        self.innovation_covariances.append(Sy + Hy @ Pcc_bar_k @ Hy.T)
+                    else:
+                        self.innovation_covariances.append(Sy)
 
             # COVARIANCE CORRECTION
             if self.update_flag:
                 # Pxx Joseph
                 Pxx_hat_k = M @ Pxx_bar_k @ M.T + K @ measurement_covariance @ K.T
+                # Rounding leaves the product slightly asymmetric, and the next
+                # gain, Pxx Hx^T, amplifies the asymmetry when the data are
+                # much more precise than Pxx (Doppler)
+                Pxx_hat_k = 0.5 * (Pxx_hat_k + Pxx_hat_k.T)
                 if self.has_consider:
                     # Schmidt update for Sx
                     Sx_hat_k = M @ Sx_bar_k - K @ Hc
@@ -581,13 +561,18 @@ class LKF(FilterOD):
             #### State Computations ####
             if self.covariance_analysis is False:
                 # STATE PREDICTION
-                dx_bar_k = Phi_k @ dx_hat_k1
-                if hasattr(self, "flag_node") and self.flag_node is True:
-                    dx_full = self._map_deviation_definition_node(
-                        counter_events, dx_bar_k
+                if self.flag_node:
+                    # Cross the node in the FULL leg definition, then come back
+                    # to the estimated partition. Slicing `dx_full[:n_est]`
+                    # instead silently drops the augmented components whenever
+                    # a leg carries consider parameters. The prediction to the
+                    # node uses the previous leg's partition (`Phi_k` has been
+                    # re-split for the new leg by now).
+                    dx_bar_k = self._map_deviation_at_node(
+                        counter_events, dx_node_prev
                     )
-                    dx_bar_k = dx_full[:n_use]
-                    dx_bar_k = np.atleast_2d(dx_bar_k).reshape(-1, 1)
+                else:
+                    dx_bar_k = Phi_k @ dx_hat_k1
 
                 # Save prefit residuals if requested
                 prefit = residuals.copy()
@@ -609,13 +594,14 @@ class LKF(FilterOD):
                 # Compute innovation (used for state update)
                 if self.update_flag:
                     innovation = residuals - Hx @ dx_bar_k
+                    if save_nis:
+                        self.innovations.append(innovation)
 
                 # STATE CORRECTION
                 if self.update_flag:
                     dx_hat_k = dx_bar_k + K @ innovation
 
-                    # Save Kalman gain if requested
-                    if hasattr(self, "kalman_gains"):
+                    if save_gains:
                         self.kalman_gains.append(K)
                 else:
                     dx_hat_k = dx_bar_k
@@ -674,7 +660,7 @@ class LKF(FilterOD):
                 Pcc_bar_k1 = Pcc_bar_k
 
             # Reset flags
-            if hasattr(self, "flag_node") and self.flag_node is True:
+            if self.flag_node:
                 self.flag_node = False
                 self.update_flag = True
 
@@ -723,10 +709,14 @@ class LKF(FilterOD):
         # Post-process residuals if needed
         if self.covariance_analysis is False:
             self.prefit_residuals = self._unwrap_residuals(
-                self.prefit_residuals, self.measurement_data.dataset_names
+                self.prefit_residuals,
+                self.measurement_data.dataset_names,
+                epoch_attr="prefit_epochs",
             )
             self.postfit_residuals = self._unwrap_residuals(
-                self.postfit_residuals, self.measurement_data.dataset_names
+                self.postfit_residuals,
+                self.measurement_data.dataset_names,
+                epoch_attr="postfit_epochs",
             )
 
         # Return SolutionOD object (no longer pass covariance directly)
@@ -740,11 +730,30 @@ class LKF(FilterOD):
         through the filtered state and covariance histories to compute smoothed
         estimates that use all available measurements (past and future).
 
-        Algorithm
-        ---------
-        Backward recursion from ``k = T-2`` down to ``k = 0``:
+        Parameters
+        ----------
+        printOutput : bool, optional
+            Print per-epoch progress showing pre-fit, post-filter, and
+            post-smoother residual norms and covariance trace. Defaults to
+            ``True``.
 
-        One-step-ahead predicted covariance:
+        Returns
+        -------
+        SolutionOD
+            Solution object with smoothed state deviations
+            (``deviation_smooth``), smoothed covariance history
+            (``covariance_smooth``), and smoothed postfit residuals
+            (``postfits_smoother``).
+
+        Raises
+        ------
+        ValueError
+            If consider parameters or sequence mode are active (not supported).
+
+        Notes
+        -----
+        The backward recursion runs from :math:`k = T-2` down to :math:`k = 0`.
+        The one-step-ahead predicted covariance is
 
         .. math::
 
@@ -764,27 +773,6 @@ class LKF(FilterOD):
 
             \\tilde{P}_k = \\hat{P}_k + G_k (\\tilde{P}_{k+1} - \\bar{P}_{k+1|k}) G_k^T
 
-        Parameters
-        ----------
-        printOutput : bool, optional
-            Print per-epoch progress showing pre-fit, post-filter, and
-            post-smoother residual norms and covariance trace.
-
-        Returns
-        -------
-        SolutionOD
-            Solution object with smoothed state deviations
-            (``deviation_smooth``), smoothed covariance history
-            (``covariance_smooth``), and smoothed postfit residuals
-            (``postfits_smoother``).
-
-        Raises
-        ------
-        ValueError
-            If consider parameters or sequence mode are active (not supported).
-
-        Notes
-        -----
         Smoothing requires ``compute()`` to have been called first so that
         ``state_deviation_history`` and ``covariance_history`` are populated.
         """
@@ -835,7 +823,9 @@ class LKF(FilterOD):
             # One-step-ahead covariance
             P_bar = Phi @ P_hist[k] @ Phi.T
             if self.SNC_flag or self.DMC_flag:
-                P_bar += self.process_noise.discrete_time_process_covariances[k + 1]
+                P_bar += ProcessNoise.combined_covariance_at(
+                    self._process_noise_models(), k + 1, n
+                )
 
             # RTS gain
             G = P_hist[k] @ Phi.T @ self._safe_inv(P_bar)
@@ -903,7 +893,9 @@ class LKF(FilterOD):
         self.smoothed_state_deviation = x_smooth
         self.smoothed_covariance = P_smooth  # Store as list of matrices
         self.postfit_residuals_smooth = self._unwrap_residuals(
-            postfit_residuals_sm, self.measurement_data.dataset_names
+            postfit_residuals_sm,
+            self.measurement_data.dataset_names,
+            epoch_attr="postfit_epochs_smooth",
         )
 
         # Return SolutionOD object (it will extract smoothed data)

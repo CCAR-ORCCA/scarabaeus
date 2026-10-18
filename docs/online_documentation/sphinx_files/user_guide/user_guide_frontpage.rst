@@ -1,5 +1,6 @@
 .. SPDX-FileCopyrightText: 2026 Orbital Research Cluster for Celestial Applications (ORCCA) Lab, University of Colorado at Boulder
 .. SPDX-License-Identifier: ISC
+
 .. meta::
     :description lang=en:
         Introduction to, set up guide, supporting libraries, and general overview of orbit determination in the open-source navigation tool Scarabaeus.
@@ -16,9 +17,9 @@
 
 .. role:: gold
 
-==================
+=============================
 :gold:`Scarabaeus User Guide`
-==================
+=============================
 This guide provides a conceptual overview for Scarabaeus users, including background information on the tool, how to install it, and a quickstart guide to begin using Scarabaeus as soon as possible.
 
 This is **not** an in-depth walkthrough of applications of Scarabaeus, see the :ref:`Examples <examples>` section for step-by-step tutorials and other resources.
@@ -31,13 +32,18 @@ See :ref:`the API Reference <api>` for details on specific objects and their fun
     
     what_is_scb
     install
-    quickstart
+    quickstart/quickstart
     
 .. toctree::
     :caption: Fundamentals and Concepts
 
     the_od_process
     scb_data_flow
+    dynamics
+    measurements
+    estimation_framework
+    solution_mapping_and_analysis
+    orientation_and_station_estimation
 
 .. .. toctree::
 ..     :caption: Additional Setup & Resources

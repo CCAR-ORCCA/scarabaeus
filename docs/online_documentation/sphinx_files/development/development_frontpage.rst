@@ -1,5 +1,6 @@
 .. SPDX-FileCopyrightText: 2026 Orbital Research Cluster for Celestial Applications (ORCCA) Lab, University of Colorado at Boulder
 .. SPDX-License-Identifier: ISC
+
 .. meta::
     :description lang=en:
         Introduction to developer guide for Scarabaeus
@@ -15,11 +16,13 @@
 
 .. role:: gold
 
-=======================
+===============================
 :gold:`Developer Documentation`
-=======================
+===============================
 This section outlines the guidelines adopted by the Scarabaeus development team with 
-regards to coding conventions, documentation and testing, as well as building compiled code and pushing/pulling from the SCB repository.
+regards to coding conventions, documentation and testing, as well as building compiled code.
+To contribute, fork the `GitHub repository <https://github.com/CCAR-ORCCA/scarabaeus>`_, branch from ``main`` and open a pull request into ``main``,
+as described in `CONTRIBUTING.md <https://github.com/CCAR-ORCCA/scarabaeus/blob/main/CONTRIBUTING.md>`_.
 
 .. toctree::
     :maxdepth: 1

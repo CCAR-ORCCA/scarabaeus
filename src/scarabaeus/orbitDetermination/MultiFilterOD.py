@@ -6,11 +6,14 @@
 # ----------------------------------------------------------------
 # N arcs, each with local parameters a_i and shared global
 # parameters g.  After each arc converges, extract (dx_0, P_0)
-# at a common epoch t_0:
+# at the arc's initial epoch t_0 from the row the arc correction
+# uses (first smoothed epoch, else last filtered epoch t_r):
 #
-#   - batch / smoother  : take directly from solution
-#   - sequential only   : map final-epoch result back via Φ_N
-#                         dx_0 = Φ_N · dx_N,  P_0 = Φ_N · P_N · Φ_N^T
+#   M = Φ(t_0) Φ(t_r)^{-1}
+#   dx_0 = M · dx_r,  P_0 = M · P_r · M^T
+#
+# Batch filters (LSB, SRIFB) also store their rows at t_r, so
+# every filter type is mapped back the same way.
 #
 # Form normal equations and partition (Eq. 1):
 #
@@ -42,7 +45,7 @@
 # =============================================================
 
 import numpy as _np
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 
 class MultiFilterOD:
@@ -68,17 +71,21 @@ class MultiFilterOD:
     **Step 1 — Per-arc convergence.**
     Each arc filter is run to inner convergence independently, yielding a
     state deviation :math:`\\delta\\mathbf{x}_{0,i}` and covariance
-    :math:`P_{0,i}` referred to a common reference epoch :math:`t_0`.
+    :math:`P_{0,i}` referred to the arc's initial epoch :math:`t_0`.
 
-    For *batch* or *smoother* outputs the solution is already at :math:`t_0`.
-    For *sequential* filters (LKF, SRIF) the final-epoch result is mapped
-    back via the cumulative state-transition matrix :math:`\\Phi_N`:
+    The row used is the one the arc correction is built from: the first
+    smoothed epoch when the arc was smoothed, otherwise the last filtered
+    epoch :math:`t_r`. Every filter type, batch (LSB, SRIFB) included,
+    stores its rows at their own epoch, so the row is mapped back with the
+    cumulative state-transition matrix :math:`\\Phi`:
 
     .. math::
 
-        \\delta\\mathbf{x}_{0,i} = \\Phi_N\\,\\delta\\mathbf{x}_{N,i},
+        M = \\Phi(t_0)\\,\\Phi(t_r)^{-1},
         \\qquad
-        P_{0,i} = \\Phi_N\\,P_{N,i}\\,\\Phi_N^T
+        \\delta\\mathbf{x}_{0,i} = M\\,\\delta\\mathbf{x}_{r,i},
+        \\qquad
+        P_{0,i} = M\\,P_{r,i}\\,M^T
 
     **Step 2 — Normal equations.**
     The information matrix and right-hand side for arc :math:`i` are
@@ -160,7 +167,9 @@ class MultiFilterOD:
     Each arc is restarted from the corrected reference trajectory
     :math:`\\mathbf{x}_{\\mathrm{ref}} + [\\Delta\\mathbf{x}_{a,i};\\,\\Delta\\mathbf{x}_G]`
     and the outer loop repeats until the relative RMS change in
-    :math:`\\hat{\\mathbf{x}}_G` falls below ``convergence_threshold``.
+    :math:`\\hat{\\mathbf{x}}_G` falls below ``convergence_threshold``, or the
+    relative change of the total weighted cost :math:`J/n` falls below
+    ``convergence_threshold_cost`` (see ``convergence_criterion``).
 
     Parameters
     ----------
@@ -191,6 +200,14 @@ class MultiFilterOD:
         If any arc filter estimates no parameter whose name appears in
         ``global_param_names``.
 
+    See Also
+    --------
+    scarabaeus.FilterOD : Base filter class used per-arc.
+    scarabaeus.LKF : Sequential covariance-form filter.
+    scarabaeus.SRIF : Sequential square-root information filter.
+    scarabaeus.LSB : Batch least-squares estimator.
+    scarabaeus.SRIFB : Batch square-root information estimator.
+
     Notes
     -----
     * Multi-leg (sequence) arcs are not supported; each arc must be a
@@ -203,30 +220,34 @@ class MultiFilterOD:
     * If no ``global_apriori_cov`` is supplied, the combined problem has an
       improper prior and the solution is determined solely by the arc data.
 
-    See Also
-    --------
-    scarabaeus.FilterOD : Base filter class used per-arc.
-    scarabaeus.LKF : Sequential covariance-form filter.
-    scarabaeus.SRIF : Sequential square-root information filter.
-    scarabaeus.LSB : Batch least-squares estimator.
-    scarabaeus.SRIFB : Batch square-root information estimator.
-
     References
     ----------
-    French, A. S., Leonard, J. M., Geeraert, J. L., Page, B. R., Antreasian, P. G.,
-        Moreau, M. C., McMahon, J. W., Scheeres, D. J., & the OSIRIS-REx Team.
-        "Multi-Arc Filtering During the Navigation Campaign of the OSIRIS-REx Mission."
-        KinetX / NASA GSFC / University of Colorado. (Primary reference for the
-        partitioned normal-equation and Schur-complement multi-arc formulation
-        implemented here.)
-    European Space Operations Centre (2009).
-        "NAPEOS — Navigation Package for Earth Orbiting Satellites," May 2009,
-        pp. 1–150.
-    Tapley, B. D., Schutz, B. E., & Born, G. H. (2004). Statistical Orbit Determination.
-        Elsevier Academic Press. ISBN 978-0-12-683630-1.
-    Bierman, G. J. (1977).
-        *Factorization Methods for Discrete Sequential Estimation*. Academic Press.
+    .. [1] French, A. S., Leonard, J. M., Geeraert, J. L., Page, B. R., Antreasian, P. G.,
+       Moreau, M. C., McMahon, J. W., Scheeres, D. J., & the OSIRIS-REx Team.
+       "Multi-Arc Filtering During the Navigation Campaign of the OSIRIS-REx Mission."
+       KinetX / NASA GSFC / University of Colorado. (Primary reference for the
+       partitioned normal-equation and Schur-complement multi-arc formulation
+       implemented here.)
+    .. [2] European Space Operations Centre (2009).
+       "NAPEOS — Navigation Package for Earth Orbiting Satellites," May 2009,
+       pp. 1–150.
+    .. [3] Tapley, B. D., Schutz, B. E., & Born, G. H. (2004). *Statistical Orbit
+       Determination*. Elsevier Academic Press. ISBN 978-0-12-683630-1.
+    .. [4] Bierman, G. J. (1977).
+       *Factorization Methods for Discrete Sequential Estimation*. Academic Press.
     """
+
+    # ------------------#
+    # region   Errors  #
+    # ------------------#
+    class ConvergenceCriterionError(ValueError):
+        """Raised when an unknown convergence criterion is requested."""
+
+    class ArcSolutionError(ValueError):
+        """Raised when an arc solution lacks the histories needed at t_0."""
+
+    # endregion Errors #
+    # ------------------#
 
     def __init__(
         self,
@@ -361,7 +382,22 @@ class MultiFilterOD:
 
     @staticmethod
     def _safe_inv(A, min_svd=1e-14):
-        """Numerically robust matrix inverse (falls back to pseudo-inverse)."""
+        """Invert a matrix, falling back to a floored-SVD pseudo-inverse.
+
+        Parameters
+        ----------
+        A : np.ndarray
+            Square matrix to invert.
+        min_svd : float, optional
+            Floor applied to the singular values when the direct inverse fails.
+            Defaults to ``1e-14``.
+
+        Returns
+        -------
+        np.ndarray
+            :math:`A^{-1}`, or :math:`V \\, \\mathrm{diag}(1/\\max(s_i, s_{min}))
+            \\, U^T` when :math:`A` is singular.
+        """
         try:
             return _np.linalg.inv(A)
         except _np.linalg.LinAlgError:
@@ -371,68 +407,99 @@ class MultiFilterOD:
         return Vt.T @ _np.diag(1.0 / S) @ U.T
 
     # ─────────────────────────────────────────────────────────
-    # Filter-type helpers
-    # ─────────────────────────────────────────────────────────
-
-    @staticmethod
-    def _is_srif_type(filt) -> bool:
-        return (
-            hasattr(filt, "rhat_k") and hasattr(filt, "bhat_k") and len(filt.rhat_k) > 0
-        )
-
-    @staticmethod
-    def _get_stm_final(filt) -> _np.ndarray:
-        """Cumulative STM Φ_N from t_0 to the last processed measurement epoch."""
-        spacecraft_times = filt.measurement_data.get_spacecraft_times()
-        N = (
-            filt.num_processed_steps
-            if hasattr(filt, "num_processed_steps") and filt.num_processed_steps > 0
-            else len(filt.covariance_history)
-        )
-        return filt.trajectory.get_STM(epoch=spacecraft_times[N], idx=N)
-
-    # ─────────────────────────────────────────────────────────
     # Extract (dx_0, P_0) at t_0  —  unified for all filter types
     # ─────────────────────────────────────────────────────────
 
     @staticmethod
     def _extract_dx_P_at_t0(filt, solution) -> tuple:
         """
-        Return (dx_0, P_0) in the estimated subspace at t_0.
+        Return the estimated deviation and covariance at :math:`t_0`.
 
-        SRIF-type
-        ---------
-        R_N = inv(rhat_k[-1]),  P_N = R_N^T R_N  at t_N.
-        Map to t_0 via Φ_N:  dx_0 = Φ_N dx_N,  P_0 = Φ_N P_N Φ_N^T.
+        Parameters
+        ----------
+        filt : FilterOD
+            Filter that has been run.
+        solution : SolutionOD
+            Solution returned by ``filt``.
 
-        Batch / smoother
-        ----------------
-        Solution is already expressed at t_0 — take directly.
+        Returns
+        -------
+        tuple of np.ndarray
+            ``(dx_0, P_0)`` in the estimated subspace.
 
-        Sequential KF (no smoother)
-        ---------------------------
-        P and dx live at the final epoch t_N.
-        Map to t_0 via Φ_N (same formula as SRIF).
+        Raises
+        ------
+        ArcSolutionError
+            If the arc's solution holds no deviation or covariance history
+            aligned with its timeline (e.g. covariance analysis, or history
+            storage turned off in its output settings).
+
+        Notes
+        -----
+        The row used is the one :meth:`FilterOD.fit` maps back for the arc
+        correction (:meth:`SolutionOD.map_state_deviation_to_epoch`): the first
+        smoothed epoch when the arc was smoothed, otherwise the last filtered
+        one. Every filter, sequential (LKF, SRIF) or batch (LSB, SRIFB), stores
+        its deviation and covariance at the epoch :math:`t_r` of their row, so
+        the row is mapped to :math:`t_0` with
+
+        .. math::
+
+            M = \\Phi(t_0) \\, \\Phi(t_r)^{-1}, \\qquad
+            \\delta x_0 = M \\, \\delta x_r, \\qquad
+            P_0 = M \\, P_r \\, M^T ,
+
+        :math:`\\Phi` being the arc's cumulative STM. :math:`\\Phi(t_0)` is the
+        identity unless the stored STM starts elsewhere.
+
+        With considered states (always last, and constant) only the estimated
+        block :math:`M_{ee}` of :math:`M` is applied: the stored estimated
+        covariance is conditional on the considered states, which is the
+        information the arc's normal equations carry, and considered deviations
+        are zero.
         """
-        srif_type = MultiFilterOD._is_srif_type(filt)
-
-        if srif_type:
-            R_N = MultiFilterOD._safe_inv(filt.rhat_k[-1])
-            P_N = R_N.T @ R_N
-            dx_N = _np.asarray(solution.deviation_est[-1]).flatten()
-            Phi = MultiFilterOD._get_stm_final(filt)
-            return Phi @ dx_N, Phi @ P_N @ Phi.T
-
-        P_last = _np.asarray(filt.covariance_history[-1])
-        dx_last = _np.asarray(solution.deviation_est[-1]).flatten()
-
-        if getattr(filt, "if_sequential_smooth", False) or getattr(
-            filt, "is_batch", False
+        smoothed = all(
+            h is not None and len(h) > 0
+            for h in (solution.deviation_smooth, solution.covariance_smooth)
+        )
+        deviations = solution.deviation_smooth if smoothed else solution.deviation_est
+        covariances = solution.covariance_smooth if smoothed else solution.covariance_est
+        timeline = solution._timeline_epochs()
+        if (
+            timeline is None
+            or deviations is None
+            or covariances is None
+            or len(deviations) == 0
+            or not len(timeline) == len(deviations) == len(covariances)
         ):
-            return dx_last, P_last
+            raise MultiFilterOD.ArcSolutionError(
+                "The arc solution needs state deviation and covariance histories "
+                "aligned with its timeline; enable save_state_deviation_history "
+                "and save_covariance_history and run an estimation pass."
+            )
 
-        Phi = MultiFilterOD._get_stm_final(filt)
-        return Phi @ dx_last, Phi @ P_last @ Phi.T
+        # The last update at the selected epoch wins
+        t_r = timeline.min() if smoothed else timeline.max()
+        k = int(_np.flatnonzero(timeline == t_r)[-1])
+        dx_r = _np.asarray(deviations[k], dtype=float).ravel()
+        P_r = _np.asarray(covariances[k], dtype=float)
+
+        epoch = filt.propagator.full_state_vector.epoch
+        t_0 = float(_np.asarray(epoch.et, dtype=float).ravel()[0])
+        Phi_r = _np.asarray(filt.trajectory.get_STM(epoch=float(t_r)), dtype=float)
+        Phi_0 = _np.asarray(filt.trajectory.get_STM(epoch=t_0), dtype=float)
+        M = Phi_0 @ _np.linalg.inv(Phi_r)
+
+        idx_est = getattr(filt, "idx_est", None)
+        est = (
+            _np.arange(dx_r.size)
+            if idx_est is None
+            else _np.asarray(idx_est, dtype=int)
+        )
+        M_ee = M[_np.ix_(est, est)]
+        dx_0 = M_ee @ dx_r[est]
+        P_0 = M_ee @ P_r[_np.ix_(est, est)] @ M_ee.T
+        return dx_0, 0.5 * (P_0 + P_0.T)
 
     # ─────────────────────────────────────────────────────────
     # Normal-equation blocks + Schur complement
@@ -604,6 +671,7 @@ class MultiFilterOD:
         delta_a: _np.ndarray,
         delta_G: _np.ndarray,
         traj_name: Optional[str] = None,
+        rebuild: bool = False,
     ) -> None:
         """
         Apply combined local and global corrections to an arc filter and re-propagate.
@@ -614,7 +682,7 @@ class MultiFilterOD:
         reference trajectory and rebuild measurement datasets.
 
         If the total correction norm is below ``1e-20`` the call is skipped to
-        avoid unnecessary re-propagation.
+        avoid unnecessary re-propagation, unless ``rebuild`` is set.
 
         Parameters
         ----------
@@ -630,13 +698,17 @@ class MultiFilterOD:
             shape ``(n_G,)``.
         traj_name : str, optional
             Name for the new trajectory BSP file after reinitialisation.
+        rebuild : bool
+            Reinitialise even when the correction is zero, so that the
+            datasets are rebuilt after a :meth:`fit` callback changed the
+            data they are built from.
         """
         correction = _np.zeros(arc_d["n_full"])
         if len(arc_d["local_full_idx"]) > 0 and delta_a.size > 0:
             correction[arc_d["local_full_idx"]] = delta_a
         correction[arc_d["global_full_idx"]] = delta_G
 
-        if _np.linalg.norm(correction) < 1e-20:
+        if _np.linalg.norm(correction) < 1e-20 and not rebuild:
             return
 
         filt._reinitialize(
@@ -653,9 +725,12 @@ class MultiFilterOD:
         max_outer_iters: int = 5,
         max_inner_iters: int = 10,
         convergence_threshold: float = 1e-6,
+        convergence_threshold_cost: float = 1e-3,
+        convergence_criterion: str = "any",
         if_sequential_smooth: bool = False,
         traj_name: Optional[str] = None,
         verbose: bool = True,
+        callback: Optional[Callable] = None,
     ) -> List["SolutionOD"]:
         """
         Run multi-arc orbit determination.
@@ -668,6 +743,16 @@ class MultiFilterOD:
             Maximum inner (per-arc) iterations per outer step.
         convergence_threshold : float
             Relative RMS convergence threshold for both inner and outer loops.
+        convergence_threshold_cost : float
+            Threshold on the relative change of the normalised weighted cost
+            :math:`J/n = \\sum_i (r_i/\\sigma_i)^2 / n` between iterations. In the
+            outer loop the cost is summed over all arcs. Weakly observable
+            global parameters keep drifting between outer iterations without
+            improving the fit; this test declares convergence in that case.
+        convergence_criterion : str
+            How the RMS and cost tests are combined, for both loops:
+            ``'any'`` (default), ``'deviation'``, ``'cost'``, or ``'both'``.
+            See :meth:`~scarabaeus.FilterOD.fit`.
         if_sequential_smooth : bool
             Apply smoothing to each arc after inner convergence.
         traj_name : str, optional
@@ -675,6 +760,22 @@ class MultiFilterOD:
             number are appended automatically.
         verbose : bool
             Print progress banners.
+        callback : callable, optional
+            Called as ``callback(multi_filter, outer, arc_solutions)`` after
+            every outer iteration, with this object, the outer iteration number
+            and the solution of each arc in the order of ``filters``. It runs
+            once the outer convergence test is done (the first outer iteration
+            has none) and before the arcs are reinitialised for the next one.
+            Its return value is ignored. It is the place to reweight or edit
+            the data between outer iterations, as the ``callback`` of
+            :meth:`~scarabaeus.FilterOD.fit` is between the iterations of one
+            filter: a sigma set on an arc's model
+            (:meth:`~scarabaeus.FilterOD.set_measurement_sigmas`, or
+            ``model.sigma = ...``) or an outlier flagged through
+            ``MeasurementSpec.flag`` takes effect when that arc's datasets are
+            rebuilt for the next outer iteration, so one made after the last
+            outer iteration does nothing within this call. The inner fit of
+            each arc runs without a callback. Defaults to None.
 
         Returns
         -------
@@ -688,8 +789,46 @@ class MultiFilterOD:
             * ``arc_global_abs``     — per-arc absolute estimates
             * ``n_outer``            — outer iterations performed
             * ``converged``          — True if outer loop converged
+            * ``criterion``          — convergence criterion used
+            * ``cost``               — total weighted cost of the last outer step
+            * ``cost_normalized``    — that cost divided by ``n_residuals``
+            * ``cost_relative_change`` — its relative change vs. the previous step
+            * ``n_residuals``        — residuals contributing to ``cost``
+
+        Raises
+        ------
+        ConvergenceCriterionError
+            If ``convergence_criterion`` is not one of the accepted values.
+
+        Notes
+        -----
+        Reweighting the data from ``callback`` changes the scale of the cost, so
+        the cost test of the next outer iteration compares two differently
+        weighted costs; prefer ``convergence_criterion='deviation'`` across a
+        change of sigmas.
+
+        Examples
+        --------
+        >>> # Loosen the range sigma of every arc after the first outer iteration
+        >>> def reweight(multi, outer, arc_solutions):
+        ...     if outer == 1:
+        ...         for filt in multi.filters:
+        ...             filt.set_measurement_sigmas({"GS1 Range": ArrayWUnits(5.0, m)})
+        >>> arc_solutions = multi.fit(callback=reweight)
         """
+        criterion = str(convergence_criterion).lower()
+        if criterion not in ("any", "deviation", "cost", "both"):
+            raise self.ConvergenceCriterionError(
+                f"Unknown convergence_criterion '{convergence_criterion}'. "
+                "Choose 'any', 'deviation', 'cost', or 'both'."
+            )
+
         x_G_prev: Optional[_np.ndarray] = None
+        cost_normalized_prev = float("nan")
+        cost_total = float("nan")
+        cost_normalized = float("nan")
+        cost_change = float("inf")
+        n_residuals_total = 0
         arc_solutions = [None] * len(self.filters)
         arc_global_abs_final = [None] * len(self.filters)
         x_G_combined: Optional[_np.ndarray] = None
@@ -713,6 +852,8 @@ class MultiFilterOD:
                 print(f"{'='*70}")
 
             arc_data: list = []
+            cost_total = 0.0
+            n_residuals_total = 0
 
             # ── Inner loop: converge each arc independently ────────────────
             for i, filt in enumerate(self.filters):
@@ -727,11 +868,19 @@ class MultiFilterOD:
                 solution, n_inner, inner_conv = filt.fit(
                     max_iterations=max_inner_iters,
                     convergence_threshold=convergence_threshold,
+                    convergence_threshold_cost=convergence_threshold_cost,
+                    convergence_criterion=criterion,
                     if_sequential_smooth=if_sequential_smooth,
                     verbose=verbose,
                     traj_name=arc_traj,
                 )
                 arc_solutions[i] = solution
+
+                # Accumulate the arc's weighted cost for the outer-loop test
+                cost_arc, n_res_arc = filt._cost_function()
+                if n_res_arc > 0:
+                    cost_total += cost_arc
+                    n_residuals_total += n_res_arc
 
                 local_idx, global_idx, local_full_idx, global_full_idx = (
                     self._get_partition(filt)
@@ -789,26 +938,76 @@ class MultiFilterOD:
                     print(f"    Arc {i+1} estimate: {d['x_G_abs']}")
 
             # ── Outer convergence check ────────────────────────────────────
+            # Total weighted cost over all arcs, normalized by the number of
+            # residuals so that measurement editing does not look like a change.
+            cost_normalized = (
+                cost_total / n_residuals_total
+                if n_residuals_total > 0
+                else float("nan")
+            )
+            cost_change = float("inf")
+            if _np.isfinite(cost_normalized) and _np.isfinite(cost_normalized_prev):
+                cost_change = abs(cost_normalized - cost_normalized_prev) / max(
+                    abs(cost_normalized_prev), 1e-300
+                )
+
             if x_G_prev is not None:
                 delta = x_G_combined - x_G_prev
                 scale = _np.maximum(_np.abs(x_G_combined), 1.0)
                 rms_outer = float(_np.sqrt(_np.mean((delta / scale) ** 2)))
+
+                converged_deviation = bool(rms_outer < convergence_threshold)
+                converged_cost = bool(cost_change < convergence_threshold_cost)
+
+                if criterion == "deviation":
+                    outer_converged = converged_deviation
+                elif criterion == "cost":
+                    outer_converged = converged_cost
+                elif criterion == "both":
+                    outer_converged = converged_deviation and converged_cost
+                else:  # "any"
+                    outer_converged = converged_deviation or converged_cost
+
                 if verbose:
                     print(
                         f"\n  Outer relative RMS Δx_G = {rms_outer:.3e}"
                         f"  (threshold = {convergence_threshold:.3e})"
                     )
-                if rms_outer < convergence_threshold:
-                    outer_converged = True
-                    if verbose:
-                        print(f"\n  {'='*60}")
+                    if n_residuals_total > 0:
                         print(
-                            f"  ✓ Multi-arc CONVERGED after {outer} outer iteration(s)"
+                            f"  Outer cost J = Σ(r/σ)² = {cost_total:.3e}"
+                            f"  (n = {n_residuals_total}, J/n = {cost_normalized:.3e})"
                         )
-                        print(f"  {'='*60}")
-                    break
+                        print(
+                            f"  Outer relative cost change = {cost_change:.3e}"
+                            f"  (threshold = {convergence_threshold_cost:.3e})"
+                        )
+                    else:
+                        print(
+                            "  Outer cost: unavailable (no weighted residuals) "
+                            "-> cost criterion inactive"
+                        )
+
+            if callback is not None:
+                callback(self, outer, list(arc_solutions))
+
+            if outer_converged:
+                if verbose:
+                    triggers = []
+                    if converged_deviation:
+                        triggers.append("RMS Δx_G")
+                    if converged_cost:
+                        triggers.append("cost function")
+                    print(f"\n  {'='*60}")
+                    print(
+                        f"  ✓ Multi-arc CONVERGED after {outer} outer iteration(s)"
+                    )
+                    print(f"    Triggered by: {' and '.join(triggers)}")
+                    print(f"  {'='*60}")
+                break
 
             x_G_prev = x_G_combined.copy()
+            cost_normalized_prev = cost_normalized
 
             # ── Back-substitute and reinitialize (Eq. 11–12) ──────────────
             if outer < max_outer_iters:
@@ -835,7 +1034,12 @@ class MultiFilterOD:
                         f"{arc_base}_outer{outer}_update.bsp" if arc_base else None
                     )
                     self._reinitialize_arc(
-                        filt, d, delta_a, delta_G, traj_name=upd_traj
+                        filt,
+                        d,
+                        delta_a,
+                        delta_G,
+                        traj_name=upd_traj,
+                        rebuild=callback is not None,
                     )
 
         if not outer_converged and verbose:
@@ -850,6 +1054,11 @@ class MultiFilterOD:
             "arc_global_abs": arc_global_abs_final,
             "n_outer": outer,
             "converged": outer_converged,
+            "criterion": criterion,
+            "cost": cost_total,
+            "cost_normalized": cost_normalized,
+            "cost_relative_change": cost_change,
+            "n_residuals": n_residuals_total,
         }
         for sol in arc_solutions:
             if sol is not None:

@@ -2,12 +2,12 @@
 # SPDX-License-Identifier: ISC
 from scarabaeus import (
     FilterOD,
-    CovarianceMatrix,
     SolutionOD,
     Propagator,
     FilterSettings,
     MissionSequence,
     MeasurementSpec,
+    ProcessNoise,
 )
 from typing import List, Dict, Optional, Tuple
 import scarabaeus.utils.NumpyWrapper as np
@@ -167,13 +167,9 @@ class SRIF(FilterOD):
         Directory for the trajectory BSP file.
     overwrite_traj : bool, optional
         If ``True``, overwrite any existing trajectory file.
-
-    Notes
-    -----
-    The SRIF is preferred over :class:`~scarabaeus.LKF` when the problem
-    is ill-conditioned (e.g., sparse tracking, very tight a-priori, or poorly
-    observable parameters).  When no process noise is required, the batch
-    formulation :class:`~scarabaeus.SRIFB` is simpler and equivalent.
+    verbose : bool, optional
+        If ``False``, silence the printout of the propagation run at
+        construction. Defaults to ``True``.
 
     See Also
     --------
@@ -182,17 +178,24 @@ class SRIF(FilterOD):
     scarabaeus.SRIFB : Batch (non-sequential) SRIF; no process noise support.
     scarabaeus.FilterOD : Base class providing trajectory and measurement handling.
 
+    Notes
+    -----
+    The SRIF is preferred over :class:`~scarabaeus.LKF` when the problem
+    is ill-conditioned (e.g., sparse tracking, very tight a-priori, or poorly
+    observable parameters).  When no process noise is required, the batch
+    formulation :class:`~scarabaeus.SRIFB` is simpler and equivalent.
+
     References
     ----------
     .. [1] Tapley, B. D., Schutz, B. E., & Born, G. H. (2004).
-    Statistical Orbit Determination.
-    Elsevier Academic Press.
-    ISBN 978-0-12-683630-1.
+       Statistical Orbit Determination.
+       Elsevier Academic Press.
+       ISBN 978-0-12-683630-1.
 
     .. [2] Bierman, G. J. (1977).
-    Factorization Methods for Discrete Sequential Estimation.
-    Academic Press.
-    ISBN 978-0-12-097650-8.
+       Factorization Methods for Discrete Sequential Estimation.
+       Academic Press.
+       ISBN 978-0-12-097650-8.
     """
 
     # ------------------------------------------------------------------
@@ -201,7 +204,8 @@ class SRIF(FilterOD):
 
     @property
     def q(self) -> int:
-        """Dimension of the process-noise vector (3 for SNC and DMC)."""
+        """Dimension of the process-noise vector of the last time update (3 for
+        SNC, 9 for DMC)."""
         return self._q
 
     @q.setter
@@ -258,55 +262,9 @@ class SRIF(FilterOD):
     def rbar_ux_sub_k(self, value):
         self._rbar_ux_sub_k = value
 
-    @property
-    def covariance_history(self) -> list:
-        """Posterior covariance :math:`\\hat{P}_k` at each measurement epoch.
-        Populated after calling :meth:`~FilterOD.fit`."""
-        return self._covariance_history
-
-    @covariance_history.setter
-    def covariance_history(self, value):
-        self._covariance_history = value
-
-    @property
-    def covariance_consider_history(self) -> list:
-        """Consider-parameter covariance block at each epoch.
-        Empty list when no consider parameters are active."""
-        return self._covariance_consider_history
-
-    @covariance_consider_history.setter
-    def covariance_consider_history(self, value):
-        self._covariance_consider_history = value
-
-    @property
-    def state_deviation_history(self) -> list:
-        """Posterior state deviation :math:`\\hat{x}_k` at each measurement epoch.
-        Populated after calling :meth:`~FilterOD.fit`."""
-        return self._state_deviation_history
-
-    @state_deviation_history.setter
-    def state_deviation_history(self, value):
-        self._state_deviation_history = value
-
-    @property
-    def prefit_residuals(self) -> dict:
-        """Pre-update residuals :math:`y_k`, keyed by dataset name.
-        Populated after calling :meth:`~FilterOD.fit`."""
-        return self._prefit_residuals
-
-    @prefit_residuals.setter
-    def prefit_residuals(self, value):
-        self._prefit_residuals = value
-
-    @property
-    def postfit_residuals(self) -> dict:
-        """Post-update residuals, keyed by dataset name.
-        Populated after calling :meth:`~FilterOD.fit`."""
-        return self._postfit_residuals
-
-    @postfit_residuals.setter
-    def postfit_residuals(self, value):
-        self._postfit_residuals = value
+    # The history/residual properties (covariance_history,
+    # covariance_consider_history, state_deviation_history, prefit_residuals,
+    # postfit_residuals) are inherited from FilterOD. SRIF-specific ones below.
 
     @property
     def smoothed_state_deviation(self) -> list:
@@ -336,17 +294,25 @@ class SRIF(FilterOD):
         traj_name: Optional[str] = None,
         traj_dir: Optional[str] = None,
         overwrite_traj: bool = True,
+        verbose: bool = True,
     ):
         # parent class initialization
         super().__init__(
-            propagator, measurements, settings, traj_name, traj_dir, overwrite_traj
+            propagator,
+            measurements,
+            settings,
+            traj_name,
+            traj_dir,
+            overwrite_traj,
+            verbose=verbose,
         )
 
         # Define q and n for extracting information from the transformed matrices
-        self.q = 3  # Noise vector
+        self.q = 3  # Noise vector, resized by each time update
 
         # Track information needed for smoothing
-        # Note the gamma matrices are stored in self.process_noise.gamma_matrices
+        # Note the gamma matrices are stored in each process noise model
+        # (see _process_noise_models)
         self.num_processed_steps = 0
         self.STM_k_from_k_minus_1 = []
         self.posterior_covariance = []
@@ -356,26 +322,17 @@ class SRIF(FilterOD):
         self.rbar_u_sub_k = []
         self.rbar_ux_sub_k = []
 
-        # Initialize output containers
-        self._covariance_history = []
-        self._covariance_consider_history = []
-        self._state_deviation_history = []
-        self._prefit_residuals = {}
-        self._postfit_residuals = {}
+        # SRIF-specific output containers (shared ones live on FilterOD).
         self._smoothed_state_deviation = []
         self._smoothed_covariance = []
-
-        # Initialize process noise from settings if provided
-        if self.settings.process_noise is not None:
-            self._initialize_process_noise_from_settings()
 
         ## Print
         print("")
         print("=" * 80)
         print("Initializing Sequence Square Root Information Filter (SRIF)")
         print("=" * 80)
-        if hasattr(self, "process_noise"):
-            print(f"Process Noise Model: {self.settings.process_noise.type}")
+        if self.process_noise is not None:
+            print(f"Process Noise Model: {self._process_noise_description()}")
         print("=" * 80)
 
     def _compute(
@@ -393,8 +350,23 @@ class SRIF(FilterOD):
         than the covariance or state deviation directly.  This improves
         numerical stability by avoiding explicit covariance inversion.
 
-        Time update (square-root information propagation)
-        --------------------------------------------------
+        Parameters
+        ----------
+        meas_corr : list, optional
+            Correlation factors forwarded to :class:`~scarabaeus.CovarianceMatrix`.
+        printOutput : bool, optional
+            Print per-epoch progress. Defaults to True.
+        underweighting_factor : float, optional
+            Multiplicative scale on the measurement covariance.  Defaults to 1.0.
+
+        Returns
+        -------
+        SolutionOD
+            Solution object with state deviation history, covariance history,
+            pre/postfit residuals, and smoother auxiliary arrays populated.
+
+        Notes
+        -----
         The square-root information matrix is propagated via:
 
         .. math::
@@ -424,8 +396,6 @@ class SRIF(FilterOD):
         ``_apply_process_noise_correction`` (defined locally inside
         ``_compute``).
 
-        Measurement update (QR accumulation)
-        -------------------------------------
         Whitened partials and residuals are appended below the current
         information block and a QR factorisation extracts the updated
         square-root information matrix and information vector:
@@ -444,21 +414,6 @@ class SRIF(FilterOD):
 
             \\hat{x}_k = R_{xx,k}^{-1} z_{x,k}, \\quad
             \\hat{P}_k = R_{xx,k}^{-1} R_{xx,k}^{-T}
-
-        Parameters
-        ----------
-        meas_corr : list, optional
-            Correlation factors forwarded to :class:`~scarabaeus.CovarianceMatrix`.
-        printOutput : bool, optional
-            Print per-epoch progress. Defaults to True.
-        underweighting_factor : float, optional
-            Multiplicative scale on the measurement covariance.  Defaults to 1.0.
-
-        Returns
-        -------
-        SolutionOD
-            Solution object with state deviation history, covariance history,
-            pre/postfit residuals, and smoother auxiliary arrays populated.
         """
 
         ## Utils
@@ -484,7 +439,7 @@ class SRIF(FilterOD):
             dx_k  : (nx, 1)             -- predicted dx (used only to form z_x_bar)
             """
             # Get STM from k1 to k
-            if getattr(self, "flag_node", False) and self.flag_node:
+            if self.flag_node:
                 prev_n = self.legs_n[counter_events - 1]
                 curr_STM_prev_leg = self.trajectory._STMs[counter_events - 1][
                     -1
@@ -520,17 +475,24 @@ class SRIF(FilterOD):
             Ru   : (q, q)
             gamma_k: (nx, q)
             """
-            Ru = self._safe_inv(spln.cholesky(self.process_noise.Q_tilde[k]))
+            # Ru^T Ru = Q^-1 takes the lower factor Q = L L^T; the upper one
+            # differs whenever Q is not diagonal (always, once RTN-rotated)
+            noise_models = self._process_noise_models()
+            Ru = self._safe_inv(
+                spln.cholesky(
+                    ProcessNoise.combined_input_covariance_at(noise_models, k),
+                    lower=True,
+                )
+            )
             nx = self.n_est if self.has_consider else self.n
-            q = self.q
-            gamma_k = self.process_noise.gamma_matrices[k]  # (nx, q)
-
-            # Ensure gamma matches the CURRENT information matrix size (state may still be 6 here)
-            n_k = Rxx_k.shape[0]
-            if gamma_k.shape[0] != n_k:
-                gamma_k = gamma_k[
-                    :n_k, :
-                ]  # keep top rows (pos/vel first), drop padded zeros
+            # One noise component per row of the input covariance (three per
+            # noised body)
+            q = self.q = Ru.shape[0]
+            # Sized for the estimated states of the current leg (after any node
+            # mapping)
+            gamma_k = ProcessNoise.combined_gamma_at(
+                noise_models, k, Rxx_k.shape[0]
+            )  # (nx, q)
 
             if self.has_consider:
                 nc = self.n_con
@@ -606,11 +568,13 @@ class SRIF(FilterOD):
 
         # Create initial square root information matrix from initial covariance
         P0 = self.initial_covariance.matrix_without_units()
-        if hasattr(self, "flag_MTM") and self.flag_MTM is True:
+        dx_bar_0 = self._apriori_deviation(0)
+        if self.flag_MTM:
             MTM = self.trajectory._STMs[0].reshape(
                 int(np.sqrt(len(self.trajectory._STMs[0]))), -1
             )
             P0 = MTM @ P0 @ MTM.T
+            dx_bar_0 = MTM @ dx_bar_0
             self.flag_MTM = False
 
         if self.has_consider:
@@ -626,25 +590,20 @@ class SRIF(FilterOD):
             Rxc_hat_k1 = None
 
         # Extract spacecraft times
-        measurement_times = np.asarray(
-            self.measurement_data.get_spacecraft_times(), dtype=float
-        )
-        if self.flag_sequence:
-            event_times = np.asarray(self.events_epochs, dtype=float)
-            timeline_times = np.unique(np.concatenate((measurement_times, event_times)))
-        else:
-            event_times = np.array([])
-            timeline_times = measurement_times
+        measurement_times, event_times, timeline_times = self._build_timeline()
 
         # Initialize storage as instance attributes
         STM_k1 = np.eye(self.n)
-        dx_hat_k1 = np.zeros((self.n_est if self.has_consider else self.n, 1))
+        dx_hat_k1 = dx_bar_0[self.idx_est] if self.has_consider else dx_bar_0
         Pcc_hat_k1 = Pcc_hat_0 if self.has_consider else None
         self.covariance_history = []
         self.covariance_consider_history = []
         self.state_deviation_history = []
         self.prefit_residuals = []
         self.postfit_residuals = []
+        # Forward solution at each sequence node, in the previous leg's definition
+        self._node_deviations = []
+        self._node_covariances = []
         # Reset smoother-related arrays each call so multiple compute() calls do not
         # accumulate stale entries that corrupt the backward smoother indexing.
         self.num_processed_steps = 0
@@ -682,8 +641,7 @@ class SRIF(FilterOD):
             #### Extract Measurement Data for Epoch t2 ####
             block = None
             if self.update_flag:
-                block = self.measurement_data.get_combined_for_t2(current_time)
-                block = block[current_time]
+                block = self._epoch_measurement_block(current_time)
                 sigmas = block["sigma"]
                 partials = block["partials"][:, : self.n]
                 residuals = block["residuals"]
@@ -720,98 +678,56 @@ class SRIF(FilterOD):
                 Pcc_bar_k = Phi_c_k @ Pcc_hat_k1 @ Phi_c_k.T
 
             # node handling applies AFTER time update, on BAR quantities
-            if getattr(self, "flag_node", False) and self.flag_node:
+            if self.flag_node:
+                # Forward solution at the node in the previous leg's definition:
+                # mapping the final estimate back through the nodes recovers from
+                # it the states dropped here.
+                self._node_deviations.append(
+                    self._full_leg_deviation(counter_events - 1, dx_bar_k)
+                )
+                # Covariance of the errors at the node in the previous leg's
+                # definition (considered states always last). With consider
+                # states it is the joint one, whose estimated block is the
+                # consider-inflated Pc: Rxx^-1 Rxx^-T is the covariance
+                # conditional on the considered states, and the matrix it forms
+                # with Pxc and Pcc need not be positive definite.
+                Rxx_bar_k_inv = solve_triangular(
+                    Rxx_bar_k, np.eye(Rxx_bar_k.shape[0]), lower=False
+                )
+                Pxx_bar_k = Rxx_bar_k_inv @ Rxx_bar_k_inv.T
                 if self.has_consider:
-                    n_est_prev = self.n_est  # OLD leg estimated size (before re-init)
-                    nc = self.n_con  # OLD leg consider size
-
-                    # Convert SRIF-Schmidt BAR objects to full covariance/deviation
-                    Rxx_bar_k_inv = solve_triangular(
-                        Rxx_bar_k, np.eye(n_est_prev), lower=False
-                    )
-                    Pxx_bar_k = Rxx_bar_k_inv @ Rxx_bar_k_inv.T
-                    Sxc_bar_k = -self._safe_inv(Rxx_bar_k) @ Rxc_bar_k
-
-                    # Full inflated covariance at k|k-1
-                    # NOTE: here not inflated, just mapped to new definition
+                    Sxc_bar_k = -Rxx_bar_k_inv @ Rxc_bar_k
                     Pxc_bar_k = Sxc_bar_k @ Pcc_bar_k
-                    P_full = np.block(
-                        [[Pxx_bar_k, Pxc_bar_k], [Pxc_bar_k.T, Pcc_bar_k]]
+                    Pc_bar_k = Pxx_bar_k + Sxc_bar_k @ Pxc_bar_k.T
+                    P_node = np.block(
+                        [[Pc_bar_k, Pxc_bar_k], [Pxc_bar_k.T, Pcc_bar_k]]
                     )
-
-                    # Full deviation vector (x part only is estimated; c mean=0 in deviations)
-                    dx_full = np.zeros((n_est_prev + nc, 1))
-                    dx_full[:n_est_prev, :] = dx_bar_k
-
-                    # Apply node mapping (definition change)
-                    dx_full = self._map_deviation_definition_node(
-                        counter_events, dx_full
-                    )
-                    P_full = self._map_covariance_definition_node(
-                        counter_events, P_full
-                    )
-
-                    # After mapping you can re-init consider partition safely
-                    self._init_consider_partition(idx_leg=counter_events)
-                    n_use = self.n_est if self.has_consider else self.n
-                    nc = self.n_con
-
-                    # Apply impulsive burn at node on the covariance
-                    P_full = STM_k @ P_full @ STM_k.T
-
-                    # Extract mapped blocks using NEW leg indices (after re-init)
-                    Pxx_bar_k = P_full[np.ix_(self.idx_est, self.idx_est)]
-                    Pxc_bar_k = P_full[np.ix_(self.idx_est, self.idx_con)]
-
-                    # Refactor back to SRIF-Schmidt BAR objects
-                    R0_node = self._sqrt_info_matrix((P_full))
-                    Rxx_bar_k = R0_node[np.ix_(self.idx_est, self.idx_est)]
-                    Rxc_bar_k = R0_node[np.ix_(self.idx_est, self.idx_con)]
-                    Sxc_bar_k = -Rxx_bar_k @ Rxc_bar_k
-
-                    # Map dx back to x and rebuild z using NEW leg indices
-                    dx_bar_k = dx_full[self.idx_est]
-                    zx_bar_k = Rxx_bar_k @ dx_bar_k
-
                 else:
-                    # Non-consider: just map x covariance/deviation at BAR level
-                    prev_n = self.legs_n[counter_events - 1]
-                    Rxx_bar_k_inv = solve_triangular(
-                        Rxx_bar_k, np.eye(prev_n), lower=False
-                    )
-                    Pxx_bar_k = Rxx_bar_k_inv @ Rxx_bar_k_inv.T
+                    P_node = Pxx_bar_k
+                self._node_covariances.append(P_node)
 
-                    dx_full = self._map_deviation_definition_node(
-                        counter_events, dx_bar_k
-                    )
-                    P_full = self._map_covariance_definition_node(
-                        counter_events, Pxx_bar_k
-                    )
+                # Apply node mapping (definition change)
+                dx_bar_k = self._map_deviation_at_node(counter_events, dx_bar_k)
+                P_full = self._map_covariance_definition_node(counter_events, P_node)
 
-                    # After mapping you can re-init consider partition safely
-                    self._init_consider_partition(idx_leg=counter_events)
-                    n_use = self.n_est if self.has_consider else self.n
-                    nc = self.n_con
+                # After mapping you can re-init consider partition safely
+                self._init_consider_partition(idx_leg=counter_events)
+                n_use = self.n_est if self.has_consider else self.n
 
-                    # Apply impulsive burn at node on the covariance
-                    P_full = STM_k @ P_full @ STM_k.T
+                # Apply impulsive burn at node on the covariance
+                P_full = STM_k @ P_full @ STM_k.T
 
-                    # Re-extract mapped blocks
-                    if self.has_consider:
-                        Pxx_bar_k = P_full[np.ix_(self.idx_est, self.idx_est)]
-                        Pcc_bar_k = P_full[np.ix_(self.idx_con, self.idx_con)]
-                        Pxc_bar_k = P_full[np.ix_(self.idx_est, self.idx_con)]
-                        R0 = self._sqrt_info_matrix((P_full))
-                        Rxx_bar_k = R0[np.ix_(self.idx_est, self.idx_est)]
-                        Rxc_bar_k = R0[np.ix_(self.idx_est, self.idx_con)]
-                    else:
-                        Pxx_bar_k = P_full[: self.n_est, : self.n_est]
-                        Rxx_bar_k = self._sqrt_info_matrix((Pxx_bar_k))
-                        Rxc_bar_k = None
-
-                    dx_bar_k = dx_full[:n_use]
-                    zx_bar_k = Rxx_bar_k @ dx_bar_k
-                zx_bar_k = np.atleast_2d(zx_bar_k).reshape(-1, 1)
+                # Refactor back to SRIF-Schmidt BAR objects: with the estimated
+                # states first, the leading rows of the joint square-root
+                # information are [Rxx Rxc]
+                R_node = self._sqrt_info_matrix(P_full)
+                Rxx_bar_k = R_node[:n_use, :n_use]
+                if self.has_consider:
+                    Rxc_bar_k = R_node[:n_use, n_use:]
+                    Pcc_bar_k = P_full[np.ix_(self.idx_con, self.idx_con)]
+                else:
+                    Rxc_bar_k = None
+                zx_bar_k = Rxx_bar_k @ dx_bar_k
 
             # Add SNC if needed, else re-triangularize the predicted information terms via QR
             if self.SNC_flag or self.DMC_flag:
@@ -837,13 +753,8 @@ class SRIF(FilterOD):
             # Measurement information whitening and split H in estimated and considered
             if self.update_flag:
                 Hx, Hc = self._split_partials_hx_hc(partials)
-                measurement_covariance = underweighting_factor * np.array(
-                    CovarianceMatrix(
-                        sigmas,
-                        current_time,
-                        from_list=True,
-                        corr_factors=meas_corr,
-                    ).matrix
+                measurement_covariance = self._measurement_covariance(
+                    sigmas, current_time, meas_corr, underweighting_factor
                 )
                 measurement_SRI = self._sqrt_info_matrix((measurement_covariance))
                 partials_w = measurement_SRI @ Hx
@@ -939,12 +850,7 @@ class SRIF(FilterOD):
                             )
                         )
                     else:
-                        J_bar_k = np.vstack(
-                            (
-                                np.hstack((Rxx_bar_k)),
-                                np.hstack((partials_w)),
-                            )
-                        )
+                        J_bar_k = np.vstack((Rxx_bar_k, partials_w))
                     _, J_hat_k = np.linalg.qr(J_bar_k)
 
                     # Recover information terms
@@ -1032,17 +938,21 @@ class SRIF(FilterOD):
                     )
 
             # Reset flags after node
-            if hasattr(self, "flag_node") and self.flag_node is True:
+            if self.flag_node:
                 self.flag_node = False
                 self.update_flag = True
 
         # Reformat postfit residuals
         if self.covariance_analysis is False:
             self.prefit_residuals = self._unwrap_residuals(
-                self.prefit_residuals, self.measurement_data.dataset_names
+                self.prefit_residuals,
+                self.measurement_data.dataset_names,
+                epoch_attr="prefit_epochs",
             )
             self.postfit_residuals = self._unwrap_residuals(
-                self.postfit_residuals, self.measurement_data.dataset_names
+                self.postfit_residuals,
+                self.measurement_data.dataset_names,
+                epoch_attr="postfit_epochs",
             )
 
         # Return SolutionOD object
@@ -1131,22 +1041,21 @@ class SRIF(FilterOD):
 
         # Backward recursion
         if self.SNC_flag or self.DMC_flag:
+            noise_models = self._process_noise_models()
             for k in range(self.num_processed_steps, 0, -1):
+                gamma_k = ProcessNoise.combined_gamma_at(noise_models, k, self.n)
                 m1 = np.vstack(
                     (
                         np.hstack(
                             (
-                                self.rbar_u_sub_k[k]
-                                + self.rbar_ux_sub_k[k]
-                                @ self.process_noise.gamma_matrices[k],
+                                self.rbar_u_sub_k[k] + self.rbar_ux_sub_k[k] @ gamma_k,
                                 self.rbar_ux_sub_k[k] @ self.STM_k_from_k_minus_1[k],
                                 self.btilde_u_sub_k[k],
                             )
                         ),
                         np.hstack(
                             (
-                                smoothed_rhat_k[k]
-                                @ self.process_noise.gamma_matrices[k],
+                                smoothed_rhat_k[k] @ gamma_k,
                                 smoothed_rhat_k[k] @ self.STM_k_from_k_minus_1[k],
                                 smoothed_bhat_k[k],
                             )
@@ -1155,12 +1064,9 @@ class SRIF(FilterOD):
                 )
                 _, tstar_k_minus_1 = np.linalg.qr(m1)
 
-                bstar = tstar_k_minus_1[
-                    self.q : self.q + self.n, self.q + self.n : self.q + self.n + 1
-                ]
-                rstar = tstar_k_minus_1[
-                    self.q : self.q + self.n, self.q : self.q + self.n
-                ]
+                q = self.rbar_u_sub_k[k].shape[0]
+                bstar = tstar_k_minus_1[q : q + self.n, q + self.n : q + self.n + 1]
+                rstar = tstar_k_minus_1[q : q + self.n, q : q + self.n]
 
                 smoothed_bhat_k[k - 1] = bstar
                 smoothed_rhat_k[k - 1] = rstar
@@ -1231,7 +1137,9 @@ class SRIF(FilterOD):
         self.smoothed_state_deviation = smoothed_state_devs
         self.smoothed_covariance = smoothed_covars  # Store as list of matrices
         self.postfit_residuals_smooth = self._unwrap_residuals(
-            postfit_residuals_sm, self.measurement_data.dataset_names
+            postfit_residuals_sm,
+            self.measurement_data.dataset_names,
+            epoch_attr="postfit_epochs_smooth",
         )
 
         # Return SolutionOD object (it will extract smoothed data)

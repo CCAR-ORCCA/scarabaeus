@@ -1,5 +1,6 @@
 .. SPDX-FileCopyrightText: 2026 Orbital Research Cluster for Celestial Applications (ORCCA) Lab, University of Colorado at Boulder
 .. SPDX-License-Identifier: ISC
+
 .. meta::
     :description lang=en:
         Tutorial for Scarabaeus developers to set up their development environment
@@ -22,9 +23,9 @@
 
 .. role:: bold
 
-=======================
+========================================================
 :gold:`Setting Up and Using the Development Environment`
-=======================
+========================================================
 Last revised on 2026 MAY 28 by Z. Ellis.
 
 .. note:: The following covers setting up a development environment for Scarabaeus. If you are simply using Scarabaeus, see the :ref:`User Guide <user>`.
@@ -41,14 +42,19 @@ Most of the development team uses VSCode as their IDE because of its extension e
 - **GitLens:** most of the development team uses GitLens for managing version control
 - **Jupyter:** SCB utilizes Jupyter Notebooks for all tutorials
 
--------------------------
+----------------------------
 :bold:`Clone the Repository`
--------------------------
-Clone the Scarabaeus repository. THIS WILL CHANGE WITH OPEN SOURCE?
+----------------------------
+Clone the Scarabaeus repository.
 
--------------------------
+.. code-block:: bash
+
+   git clone <https://github.com/CCAR-ORCCA/scarabaeus>
+   cd scarabaeus
+
+------------------------------------
 :bold:`Set Up A Virtual Environment`
--------------------------
+------------------------------------
 Before installing the developer environment, we'll need to create a virtual environment to place hold it. In your terminal, run:
 
 .. code-block:: console
@@ -77,9 +83,9 @@ You'll know it's activated when you see ``(.venv)`` in your terminal. To deactiv
 
     deactivate
 
--------------------------
+-------------------------------------------
 :bold:`Install the Development Environment`
--------------------------
+-------------------------------------------
 With the virtual environment activated, run the following command to install the development environment:
 
 .. code-block:: console
@@ -104,9 +110,10 @@ The following sections require the packages installed with the dev environment t
 See :ref:`Building From Source <buildsource>`.
 
 .. _dev-commit-hooks:
--------------------------
+
+-------------------------------
 :bold:`Enable Git Commit Hooks`
--------------------------
+-------------------------------
 The first time you clone the repository or create/pull a new branch, in the terminal run:
 
 .. code-block:: console

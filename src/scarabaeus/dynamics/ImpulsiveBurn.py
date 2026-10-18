@@ -62,8 +62,8 @@ class ImpulsiveBurn(DynamicModel):
 
     References
     ----------
-    Vallado, D. A. (2013). *Fundamentals of Astrodynamics and Applications*
-    (4th ed.). Microcosm Press.
+    .. [1] Vallado, D. A. (2013). *Fundamentals of Astrodynamics and Applications*
+       (4th ed.). Microcosm Press.
     """
 
     # --------------------#
@@ -167,8 +167,11 @@ class ImpulsiveBurn(DynamicModel):
             )
         self._delta_v = self._validate_input(delta_v.quantity, "delta_v")
         delta_v_val = ArrayWUnits.get_value_in_target_units(self.delta_v, km * sec**-1)
-        self._dv_magnitude = np.linalg.norm(delta_v_val)
-        self._dv_unit_vector = delta_v_val / self.dv_magnitude
+        dv_magnitude_val = np.linalg.norm(delta_v_val)
+        # Keep the ArrayWUnits convention used by the magnitude/unit-vector init
+        # path: magnitude carries km/s, the unit vector is unitless.
+        self._dv_magnitude = ArrayWUnits(dv_magnitude_val, km / sec)
+        self._dv_unit_vector = ArrayWUnits(delta_v_val / dv_magnitude_val, None)
         self.base_frame = delta_v.frame
 
     def _initialize_from_magnitude_and_unit_vector(
@@ -349,7 +352,10 @@ class ImpulsiveBurn(DynamicModel):
         covar_rotated : ArrayWUnits
             The rotated 3x3 covariance matrix. Expressed in units of :math:`\\frac{km^2}{s^2}`.
         """
-        # Compute the magnitude of the vector y and normalize it
+        # Compute the magnitude of the vector y and normalize it.
+        # magnitude_DV carries km/s, so the proportional terms
+        # (magnitude_DV**2 * sig**2) share the km^2/s^2 units of the fixed
+        # terms (sig**2) and can be added together.
         magnitude_DV = self.dv_magnitude
         DV_hat = self.dv_unit_vector  # Normalize y
 
@@ -390,7 +396,7 @@ class ImpulsiveBurn(DynamicModel):
             * If ``v`` is already aligned with the x-axis, the identity matrix is returned.
             * The function normalizes the input vector before computing the transformation.
             """
-            v = v.values  # Remove units
+            v = v.values.reshape(3)  # Remove units, flatten to a 1-D 3-vector
             x_axis = np.array([1, 0, 0])
 
             # Calculate the rotation axis (cross product between x-axis and vector v)
@@ -454,7 +460,7 @@ class ImpulsiveBurn(DynamicModel):
             The 3x3 isotropic covariance matrix. Expressed in units of :math:`\\frac{km^2}{s^2}`.
         """
         # Compute the magnitude of the delta-V vector (TCM magnitude)
-        TCM_mag = ArrayWUnits(self.dv_magnitude, km / sec)
+        TCM_mag = self.dv_magnitude
 
         # Compute the TCM error using the given model
         TCM_error = TCM_mag * (sig1 + np.sin(sig34)) + sig2

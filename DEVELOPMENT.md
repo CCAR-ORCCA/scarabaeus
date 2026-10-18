@@ -62,7 +62,7 @@ Due to the structure of the [src](src/) folder, we'll have to manually link [SCB
     ```
 This will allow rust-analyzer to link to our Cargo file. Without it, we won't be able to utilize the IDE functionalities provided by rust-analyzer.
 
-## 3. Build `scarabaeus_rust`
+## 3. Build Rust
 The [SCB dev environment](#set-up-scarabaeus-dev-environment) includes [maturin](https://github.com/pyo3/maturin), which will allow us to build our Rust binaries as a Python package so that they're callable within SCB's frontend.
 SCB's Rust source code is separated from Python source code, placed in the [src/scarabaeus_rust](src/scarabaeus_rust/) folder. To compile this code, run in your terminal:
 ```
@@ -71,9 +71,9 @@ SCB's Rust source code is separated from Python source code, placed in the [src/
 This will build and bind the Rust code to the Python component of SCB, allowing compiled Rust code to be called within Python. If you are working solely on Python code (under [src/scarabaeus](src/scarabaeus/)), you will only need to run this the first time you've cloned the Rust code. However, if you are developing new Rust code, continue to the next step.
 
 ## 4. Expose Rust to Python (Writing Rust Code Only)
-If you are modifying or writing any Rust code, you'll need to define and/or update its corresponding stub in the [stub file](src/scarabaeus/scarabaeus_rust.pyi) before building with `maturin develop`. This stub file provides the docstrings used for documentation generation as well as inline definitions for any Rust code bound to Python.
+If you are modifying or writing any Rust code, you'll need to define and/or update its corresponding stub in the [stub file](src/scarabaeus/rust.pyi) before building with `maturin develop`. This stub file provides the docstrings used for documentation generation as well as inline definitions for any Rust code bound to Python.
 
-Additionally, if you've created a brand new class (Rust struct bound to Python class), youll need to add it to the `scarabaeus_rust` package in the [lib file](src/scarabaeus_rust/src/lib.rs) using:
+Additionally, if you've created a brand new class (Rust struct bound to Python class), youll need to add it to the `rust` package in the [lib file](src/scarabaeus_rust/src/lib.rs) using:
 ```
 m.add_class::<ClassName>()?;
 ```

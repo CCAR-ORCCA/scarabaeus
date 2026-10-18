@@ -1,5 +1,6 @@
 .. SPDX-FileCopyrightText: 2026 Orbital Research Cluster for Celestial Applications (ORCCA) Lab, University of Colorado at Boulder
 .. SPDX-License-Identifier: ISC
+
 .. create a gold color role
 .. raw:: html
 
@@ -63,4 +64,4 @@ for the tutorial series.
 
 .. seealso::
 
-   :ref:`About Scarabaeus <about_scb_page>` — project motivation, team, and related publications.
+   :ref:`About Scarabaeus <about-scb>` — project motivation, team, and related publications.

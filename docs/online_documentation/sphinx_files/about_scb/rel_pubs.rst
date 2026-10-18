@@ -1,5 +1,6 @@
 .. SPDX-FileCopyrightText: 2026 Orbital Research Cluster for Celestial Applications (ORCCA) Lab, University of Colorado at Boulder
 .. SPDX-License-Identifier: ISC
+
 .. meta::
     :description lang=en:
         Scarabaeus related publications.
@@ -15,9 +16,9 @@
 
 .. role:: gold
 
-=========================
+============================
 :gold:`Related Publications`
-=========================
+============================
 The following is a list of publications regarding Scarabaeus: 
 
 [1] J. W. McMahon, M. Pugliatti, D. Baker, A. Pedros-Faura, G. Fereoli, K. Shakerin, S. Pattamudu-Manoharan, Z. Ellis, A. Cabra, M. Almashjari, M. Kuleib, W. Frank, J. Villa, and J. Knittel,
