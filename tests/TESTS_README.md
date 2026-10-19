@@ -1,3 +1,5 @@
+<!-- SPDX-FileCopyrightText: 2026 Orbital Research Cluster for Celestial Applications (ORCCA) Lab, University of Colorado at Boulder -->
+<!-- SPDX-License-Identifier: ISC -->
 # Testing in Scarabaeus
 
 * [Pytest](#pytest)
@@ -25,10 +27,11 @@ A beaker icon should appear in the VSCode sidebar. Select it to open the testing
 
 ```
 tests
-├─ integration_testing
-│  ├─ ...
-├─ unit_testing
-│  ├─ ...
+├─ python_tests
+│  ├─ integration_testing
+│  │  ├─ ...
+│  ├─ unit_testing
+│  │  ├─ ...
 ```
 
 The following sections will detail how to use this testing window as well as the purpose of the different kinds of tests. For more information on setting up the testing window, see [VSCode's guide](https://code.visualstudio.com/docs/debugtest/testing).

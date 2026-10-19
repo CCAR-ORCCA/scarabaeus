@@ -10,11 +10,11 @@ from scarabaeus import (
     Measurement,
     Noise,
     SpiceManager,
-    StateArray,
     Units,
     StateDefinition,
 )
 from scarabaeus.body.Body import Body
+from scarabaeus.spacecraft.Instrument import Instrument
 
 # ------------------#
 #  Generate Units  #
@@ -56,18 +56,22 @@ class AngularIdeal(Measurement):
         Body object from scarabaeus. This is the "observer" in the angular measurement.
     sigma : ArrayWUnits, optional
         Measurement standard deviation. Defaults to ``None``.
-    meas_bias : float, optional
-        Angular bias. Defaults to ``None``.
+    meas_bias : array_like | ArrayWUnits | ArrayWFrame, optional
+        Angular bias ``(b_ra, b_dec)``; plain numbers are taken in rad. An
+        ``angular_bias`` entry for this observer in the reference state
+        overrides it.
+        Defaults to ``None``.
     state_definition : list, optional
         StateVector definition list. Defaults to ``None``.
-    sequence_definition : list, optional
-        Sequence definition list. Defaults to ``None``.
+    sequence_definition : MissionSequence, optional
+        Mission sequence whose per-leg state definitions replace
+        *state_definition*. Defaults to ``None``.
 
     Raises
     ------
     RuntimeError
         If the units extracted from the measurements are not consistent.
-    RuntimeError
+    ValueError
         If neither an EpochArray nor start/end Epochs are provided.
 
     See Also
@@ -128,17 +132,36 @@ class AngularIdeal(Measurement):
 
     """
 
+    # ------------------#
+    # region   Errors  #
+    # ------------------#
+    # Custom exceptions: named on the model and raised on the
+    # line that detects the failure, so tracebacks point at the real cause
+    # rather than a generic Exception/RuntimeError.
+    class MissingImageIndexError(Exception):
+        """A stacked per-image angular bias has no epoch-to-image mapping.
+
+        Raised by the forward model and the partials when the bias, from
+        ``meas_bias`` or an ``angular_bias`` state entry, has dimension
+        ``2 * n_images`` but :meth:`set_image_epochs` was never called, so
+        there is no way to know which image slot an epoch belongs to.
+        """
+
+    # endregion Errors #
+    # ------------------#
+
     # -------------#
     # Constructor #
     # -------------#
     def __init__(
         self,
         name: str,
-        observer: Body,
+        observer: Body | Instrument,
         sigma: ArrayWUnits = None,
         meas_bias=None,
         state_definition=None,
         sequence_definition=None,
+        observed_target: Body = None,
     ):
         super().__init__(name, observer)
 
@@ -148,16 +171,39 @@ class AngularIdeal(Measurement):
         self._state_definition = state_definition
         self._sequence_definition = sequence_definition
         self._measurement_type = "AngularIdeal"
-        self._reference_state_vector: StateArray | None = None
+        self._component_labels = ("ra", "dec")
         self._epoch_to_image_index: dict | None = None
+        # Optical opNav: the observer is this model's ``instrument`` (the
+        # spacecraft) and the body it images is ``observed_target`` (e.g. an
+        # asteroid / beacon).  Filters build datasets with
+        # ``target = propagator.primary_body`` (the estimated spacecraft, which
+        # for an optical model is the *observer*), so when ``observed_target`` is
+        # set we substitute it in :meth:`generate_measurement_dataset` -- without
+        # it, observer == target and the line of sight collapses to NaN.
+        self._observed_target = observed_target
 
     # ----------------------#
     # region    Properties #
     # ----------------------#
     @property
-    def sigma(self) -> ArrayWUnits:
-        """Measurement noise standard deviation."""
-        return self._sigma
+    def _observer_designator(self) -> str:
+        """
+        SPICE designator for the observer.
+
+        The observer may be given as the spacecraft itself or as one of its
+        cameras — this model is :class:`~scarabaeus.CentroidingIdeal` with the
+        attitude taken out of the loop, so the same instrument should be
+        acceptable. A ``Camera``'s ``name`` is the instrument's and means
+        nothing to SPICE, but its ``spice_id`` is the body it rides on, so the
+        id is preferred wherever there is one. A ``Spacecraft`` observer
+        resolves identically either way.
+        """
+        return self._spice_designator(self.instrument)
+
+    @property
+    def observed_target(self) -> Body:
+        """Beacon body imaged by this optical model (``None`` if not configured)."""
+        return self._observed_target
 
     # endregion Properties #
     # ----------------------#
@@ -165,6 +211,72 @@ class AngularIdeal(Measurement):
     # ----------------#
     # region Methods #
     # ----------------#
+
+    def generate_measurement_dataset(
+        self,
+        dataset_name: str | None = None,
+        target: Body = None,
+        observed_meas=None,
+        epochs: EpochArray | None = None,
+        frame: Frame = J2000,
+        noisy: bool = False,
+    ):
+        """
+        Build the filter dataset for this optical measurement.
+
+        Parameters
+        ----------
+        dataset_name : str, optional
+            Name of the dataset, which becomes its residual key in
+            ``solution.json``. Defaults to :attr:`default_dataset_name`.
+        target : Body, optional
+            Body the filter passes as the target, normally the estimated
+            spacecraft. It is replaced by the configured ``observed_target`` when
+            one is set. Defaults to ``None``.
+        observed_meas : tuple or list, optional
+            Observed measurements as ``(epoch_array, meas_sec, meas_obs,
+            outlier_flag)``. Give this or ``epochs``, not both. Defaults to
+            ``None``.
+        epochs : EpochArray, optional
+            Epochs to simulate the measurements at. Give this or
+            ``observed_meas``, not both. Defaults to ``None``.
+        frame : Frame, optional
+            Reference frame of the measurements. Defaults to ``J2000``.
+        noisy : bool, optional
+            Whether noise is added to simulated measurements. Defaults to
+            ``False``.
+
+        Returns
+        -------
+        list of MeasurementDataSet
+            The datasets built by :meth:`Measurement.generate_measurement_dataset`
+            for the substituted target.
+
+        Notes
+        -----
+        ``AngularIdeal`` is an optical model: the *observer* is this model's
+        instrument (the spacecraft) and the *observed* body is a fixed beacon.
+        Filters call this with ``target = propagator.primary_body`` (the estimated
+        spacecraft), which is the right target for radiometric models, but for an
+        optical model the estimated spacecraft is the observer. When an
+        ``observed_target`` was configured it is therefore substituted for the
+        passed ``target``\\; otherwise observer and target coincide and the line of
+        sight degenerates to :math:`\\arctan(0 / \\sqrt{0})`, a NaN.
+
+        The partials still map to the estimated spacecraft (the observer): with a
+        ``state_definition`` supplied, :meth:`_partials` returns :math:`-H` for the
+        observer position, so the optical track informs the spacecraft estimate.
+        """
+        if self._observed_target is not None:
+            target = self._observed_target
+        return super().generate_measurement_dataset(
+            dataset_name,
+            target,
+            observed_meas=observed_meas,
+            epochs=epochs,
+            frame=frame,
+            noisy=noisy,
+        )
 
     def set_image_epochs(self, image_epochs: list | None):
         """
@@ -185,38 +297,21 @@ class AngularIdeal(Measurement):
             }
 
     def set_image_index(self, mapping: dict | None):
-        """Directly assign a pre-built ``{epoch_value: image_index}`` mapping (or None to disable)."""
+        """Set the epoch-to-image mapping directly.
+
+        Parameters
+        ----------
+        mapping : dict or None
+            ``{epoch_value: image_index}`` mapping used to pick the per-image slot
+            of a stacked ``angular_bias``, or ``None`` to clear it. Use
+            :meth:`set_image_epochs` to build it from an ordered list of epochs.
+        """
         self._epoch_to_image_index = mapping
-
-    def _extract_angular_bias(self) -> ArrayWUnits | None:
-        """
-        Return angular bias [b_ra, b_dec] for this observer (global mode — first match).
-        Falls back to ``meas_bias`` when no reference state vector is set.
-        """
-        if self._reference_state_vector is None:
-            return self._meas_bias.quantity if self._meas_bias is not None else None
-
-        state_allowed = StateDefinition._generate_allowed_state_dictionary()
-        if "angular_bias" not in state_allowed:
-            return None
-
-        obs_sid = getattr(self.instrument, "spice_id", None)
-        for state_entry in self._reference_state_vector.state:
-            component = state_entry[0]
-            body = state_entry[4]
-            value = state_entry[5]
-
-            if state_allowed["angular_bias"][2].match(component) is None:
-                continue
-            if getattr(body, "spice_id", None) == obs_sid:
-                return value.quantity
-
-        return None
 
     def observed_measurements(
         self,
         file_name,
-        meas_name: str = "meas_ideal",
+        meas_name: str = "meas_sim",
         units=None,
         frame: Frame = J2000,
         image_epochs: list | None = None,
@@ -224,10 +319,27 @@ class AngularIdeal(Measurement):
         """
         Load angular measurements from a .json file.
 
-        image_epochs : list[float], optional
-            Ordered list of observation epoch values, one per image.
-            Must be provided when the state vector contains a stacked
-            ``angular_bias_<suffix>`` entry (dim > 2).
+        Parameters
+        ----------
+        file_name : str
+            Name of the .json file holding the measurements.
+        meas_name : str, optional
+            Key of the measurement block to read. Defaults to ``'meas_sim'``.
+        units : Units, optional
+            Units to interpret the stored values in. Defaults to ``None``.
+        frame : Frame, optional
+            Reference frame the loaded measurements are expressed in. Defaults
+            to ``J2000``.
+        image_epochs : list, optional
+            Ordered list of observation epoch values, one per image. Must be
+            provided when the state vector contains a stacked
+            ``angular_bias_<suffix>`` entry (dimension > 2). Defaults to ``None``.
+
+        Returns
+        -------
+        ObsData
+            The observation tuple returned by
+            :meth:`Measurement.observed_measurements`.
         """
         result = super().observed_measurements(file_name, meas_name, units, frame)
         if image_epochs is not None:
@@ -248,50 +360,99 @@ class AngularIdeal(Measurement):
         """
         Compute the angular measurement between an observer and a target.
 
-        This function calculates the angular measurement (right ascension/declination) from the observer
-        to a specified target body, taking into account optional parameters like
-        specific epochs, time steps, reference frame, and noise settings.
+        Calculates the angular measurement (right ascension / declination) from
+        the observer to a specified target body, taking into account optional
+        parameters like specific epochs, time steps, reference frame and noise
+        settings.
 
-        Parameters:
-            target (Body) : The target spacecraft for which the angular measurement is to be computed.
-            epoch_array (EpochArray) : An array of epochs (times) at which the angular measurements should be computed. If provided, it overrides epoch_start, epoch_end, and tstep.
-            epoch_start (Epoch) : The starting epoch for the angular measurement computations. Required if `epoch_array` is not provided.
-            epoch_end (Epoch) : The ending epoch for the angular measurement computations. Required if `epoch_array` is not provided.
-            tstep (float) : The time step, in seconds, between consecutive angular measurements. If `epoch_array` is not provided. Defaults to 1 second.
-            frame (Frame) : The reference frame in which the angular computation is performed.
-            noisy (bool) : Whether to add noise to the computed angular measurement. Defaults to False.
-            image_epochs (list[float], optional) : Ordered list of observation epoch values (one per image).
-                Must be provided when the state vector contains a stacked ``angular_bias_<suffix>`` entry.
+        Parameters
+        ----------
+        target : Body
+            The target body the angular measurement is computed to.
+        epoch_array : EpochArray, optional
+            Epochs at which the angular measurements are computed. Overrides
+            *epoch_start*, *epoch_end* and *tstep* when given. Defaults to
+            ``None``.
+        epoch_start : EpochArray, optional
+            Starting epoch for the angular measurement computations. Required
+            if *epoch_array* is not provided. Defaults to ``None``.
+        epoch_end : EpochArray, optional
+            Ending epoch for the angular measurement computations. Required if
+            *epoch_array* is not provided. Defaults to ``None``.
+        tstep : float, optional
+            Time step, in seconds, between consecutive angular measurements
+            when *epoch_array* is not provided. Defaults to ``1`` second.
+        frame : Frame, optional
+            Reference frame in which the angular computation is performed.
+            Defaults to ``J2000``.
+        noisy : bool, optional
+            Whether to add noise to the computed angular measurement. Defaults
+            to ``False``.
+        image_epochs : list, optional
+            Ordered list of observation epoch values, one per image. Must be
+            provided when the state vector contains a stacked
+            ``angular_bias_<suffix>`` entry. Defaults to ``None``.
 
-        Returns:
-            ArrayWFrame: The computed angular measurement as an array with frames.
+        Returns
+        -------
+        tuple
+            ``(t1, t2, t3, meas)``, per the contract in
+            :meth:`Measurement.computed_measurements`.
+
+            This observable is **single-epoch** -- unlike a two-way radiometric
+            measurement it is not spread across a light-time path with distinct
+            transmit, reflect and receive times -- so ``t1``, ``t2`` and ``t3``
+            are all the observation epoch. They are returned, rather than a bare
+            measurement, because the estimator reads ``t1`` when detrending
+            residuals and matches measurements on ``t2``; collapsing them here
+            is a correct statement about this observable, not padding.
+
+            ``meas`` is the computed angular measurement as an
+            :class:`~scarabaeus.ArrayWFrame`.
+
+        Raises
+        ------
+        ValueError
+            If neither *epoch_array* nor both *epoch_start* and *epoch_end* are
+            provided.
+        RuntimeError
+            If the per-epoch measurements do not share one unit.
+        MissingImageIndexError
+            If the bias holds one ``(b_ra, b_dec)`` pair per image (more
+            than two elements) and no epoch-to-image mapping is set.
         """
         if image_epochs is not None:
             self.set_image_epochs(image_epochs)
 
         ## Input check
-        if epoch_array is None:
-            if epoch_start is None or epoch_end is None:
-                raise RuntimeError(
-                    "Please provide an EpochArray or provide start and end Epochs"
-                )
-            else:
-                _units = epoch_start.times.units
-                epoch_array = [
-                    EpochArray(ArrayWUnits(_t, _units), timeFrame=epoch_start.system)
-                    for _t in np.arange(
-                        epoch_start.times.values, epoch_end.times.values + tstep, tstep
-                    )
-                ]
+        epoch_array = Measurement._resolve_epoch_array(
+            epoch_array, epoch_start, epoch_end, tstep
+        )
 
         # Extract full bias vector once (dim=2 global, dim=2*n_images stacked per-image).
-        _bias_full = self._extract_angular_bias()
+        _bias_full = self._extract_bias("angular_bias", rad)
+        if (
+            _bias_full is not None
+            and _bias_full.values.size > 2
+            and self._epoch_to_image_index is None
+        ):
+            raise AngularIdeal.MissingImageIndexError(
+                f"The angular bias has {_bias_full.values.size} elements, so it "
+                "holds one (b_ra, b_dec) bias per image, but no epoch-to-image "
+                "mapping is set and the bias of each epoch is undefined. Call "
+                "set_image_epochs() (or pass image_epochs=) first."
+            )
 
         ## Append measurements in a list at multiple epochs
         meas_list = []
         for epoch in epoch_array:
             # Determine active bias for this epoch
-            if self._epoch_to_image_index is not None and _bias_full is not None:
+            # A single (b_ra, b_dec) pair is global: it applies to every image.
+            if (
+                self._epoch_to_image_index is not None
+                and _bias_full is not None
+                and _bias_full.values.size > 2
+            ):
                 _iidx = self._epoch_to_image_index.get(float(epoch.times.values))
                 _bvals = _bias_full.values.ravel()
                 if _iidx is not None and 2 * _iidx + 1 < len(_bvals):
@@ -303,12 +464,7 @@ class AngularIdeal(Measurement):
             else:
                 bias_awu = _bias_full
 
-            relative_state = SpiceManager.get_state(
-                trgt_bdy=target.name,
-                epoch_time=epoch.times.values,
-                reference_frame=frame.name,
-                obsvr_bdy=self.instrument.name,
-            )
+            relative_state = self._relative_state(target, epoch, frame)
             # Get right ascension and declination measurement as AWU
             ra_meas = ArrayWUnits(
                 np.arctan2(relative_state[1].values, relative_state[0].values), rad
@@ -345,8 +501,14 @@ class AngularIdeal(Measurement):
             meas = ra_meas.append(dec_meas)
             meas_list.append(meas)
 
-        ## Pack output measurement as an AWF
-        values_array = np.array([item.values for item in meas_list])
+        ## Pack output measurement as an AWF.
+        # Ravel each epoch's [RA, Dec] to a flat (n_components,) row so the stack
+        # is exactly (n_epochs, n_components). Without this, when SpiceManager
+        # returns length-1-array components the per-epoch values come out (2, 1)
+        # and the stack becomes 3-D (n_epochs, 2, 1); generate_measurement_dataset
+        # then splits it into datasets whose `computed` stays 2-D while `observed`
+        # is scalar, which later blows up the combined block.
+        values_array = np.array([np.ravel(item.values) for item in meas_list])
         units_list = [item.units for item in meas_list]
         units_names = [item.units.name for item in meas_list]
         if len(np.unique(units_names)) != 1:
@@ -354,7 +516,11 @@ class AngularIdeal(Measurement):
 
         meas_AWF = ArrayWFrame(values_array, units_list[0], frame)
 
-        # For compatibility with real measurement models
+        # Single-epoch observable: there is no light-time path with distinct
+        # transmit / reflect / receive times to distinguish, so all three
+        # collapse to the observation epoch. Returned because the estimator
+        # detrends on t1 and matches measurements on t2 -- see
+        # Measurement.computed_measurements for the contract.
         t1 = epoch_array
         t2 = epoch_array
         t3 = epoch_array
@@ -365,27 +531,44 @@ class AngularIdeal(Measurement):
 
     def _compute_h_tilde_pos(self, relative_state: ArrayWUnits) -> np.ndarray:
         """
-        Generate the portion of the H-tilde matrix corresponding to the partial
-        derivatives of the ideal angular measurement model with respect to the
-        position components (RA, DEC w.r.t. x, y, z).
+        Partials of the ideal right ascension and declination with respect to
+        position.
+
+        The derivatives are taken with respect to the relative position
+        :math:`[x, y, z] = \\mathbf{r}_{target} - \\mathbf{r}_{observer}`, so they
+        are also the partials with respect to the target position\\; the observer
+        position enters with the opposite sign (see
+        :meth:`_compute_h_tilde_pos_secondary`). With
+        :math:`\\alpha = \\operatorname{atan2}(y, x)`,
+        :math:`\\delta = \\arctan(z / \\rho)`, :math:`\\rho^2 = x^2 + y^2` and
+        :math:`r^2 = \\rho^2 + z^2`, eq. 4.2.6 of [1]_ gives
+
+        .. math::
+
+            \\frac{\\partial \\alpha}{\\partial [x, y, z]} =
+                \\left[ -\\frac{y}{\\rho^2},\\quad \\frac{x}{\\rho^2},\\quad 0 \\right]
+
+            \\frac{\\partial \\delta}{\\partial [x, y, z]} =
+                \\left[ -\\frac{x z}{r^2 \\rho},\\quad -\\frac{y z}{r^2 \\rho},\\quad
+                \\frac{\\rho}{r^2} \\right]
 
         Parameters
         ----------
         relative_state : ArrayWUnits
-            Relative state between observer and target (position-only),
-            expected shape (3,) with components [x, y, z].
+            Position of the target relative to the observer, shape (3,), with
+            components :math:`[x, y, z]`.
 
         Returns
         -------
         np.ndarray
-            2x3 array containing the partial derivatives:
-            [ d(RA)/dx  d(RA)/dy  d(RA)/dz
-              d(DEC)/dx d(DEC)/dy d(DEC)/dz ]
+            Shape (2, 3): row 0 is :math:`\\partial \\alpha / \\partial [x, y, z]`
+            and row 1 is :math:`\\partial \\delta / \\partial [x, y, z]`.
 
         References
         ----------
-        Tapley, B. D., Schutz, B. E., & Born, G. H. (2004). Statistical Orbit Determination.
-        Elsevier Academic Press. ISBN 978-0-12-683630-1 (p. 161, eq. 4.2.6).
+        .. [1] Tapley, B. D., Schutz, B. E., & Born, G. H. (2004). *Statistical
+           Orbit Determination*. Elsevier Academic Press. ISBN
+           978-0-12-683630-1, p. 161, eq. 4.2.6.
         """
 
         x = float(relative_state[0].values)
@@ -400,55 +583,75 @@ class AngularIdeal(Measurement):
         rho_safe = np.sqrt(rho2_safe)
         r2_safe = r2 if r2 > eps else eps
 
+        # d(RA)/dr and d(DEC)/dr with respect to the TARGET position, with
+        # r = r_target - r_observer. RA = atan2(y, x) gives dRA/dx = -y/rho^2,
+        # and DEC = atan(z/rho) gives dDEC/dz = +rho/r^2. The observer partial
+        # is the negation, supplied by _compute_h_tilde_pos_secondary.
         h_tilde_ra = [
-            y / rho2_safe,
-            -x / rho2_safe,
+            -y / rho2_safe,
+            x / rho2_safe,
             0.0,
         ]
         h_tilde_dec = [
-            (x * z) / (r2_safe * rho_safe),
-            (y * z) / (r2_safe * rho_safe),
-            -rho_safe / r2_safe,
+            -(x * z) / (r2_safe * rho_safe),
+            -(y * z) / (r2_safe * rho_safe),
+            rho_safe / r2_safe,
         ]
 
         return np.array([h_tilde_ra, h_tilde_dec], dtype=float)
 
     def _compute_h_tilde_vel(self) -> np.ndarray:
         """
-        Partial of (RA, DEC) w.r.t. velocity — zero for instantaneous model.
+        Partials of right ascension and declination with respect to the target
+        velocity.
 
         Returns
         -------
         np.ndarray
-            2×3 zero matrix.
+            Zeros of shape (2, 3); the ideal angles are instantaneous and depend on
+            position only.
         """
         return np.zeros((2, 3), dtype=float)
 
     def _compute_h_tilde_pos_secondary(self, relative_state: ArrayWUnits) -> np.ndarray:
         """
-        Partial of (RA, DEC) w.r.t. the *observer* position (negative of target partial).
+        Partials of right ascension and declination with respect to the observer
+        position.
+
+        Parameters
+        ----------
+        relative_state : ArrayWUnits
+            Position of the target relative to the observer, shape (3,).
+
+        Returns
+        -------
+        np.ndarray
+            Shape (2, 3), the negative of :meth:`_compute_h_tilde_pos`, because the
+            observer position enters the relative position with a minus sign.
         """
         return -self._compute_h_tilde_pos(relative_state)
 
     def _compute_h_tilde_vel_secondary(self) -> np.ndarray:
         """
-        Partial of (RA, DEC) w.r.t. observer velocity — always zero for the ideal model.
+        Partials of right ascension and declination with respect to the observer
+        velocity.
 
         Returns
         -------
         np.ndarray
-            2×3 zero matrix.
+            Zeros of shape (2, 3)\\; the ideal angles depend on position only.
         """
         return np.zeros((2, 3), dtype=float)
 
     def _compute_h_tilde_angular_bias(self) -> np.ndarray:
         """
-        Partial of (RA, DEC) w.r.t. [b_ra, b_dec] — identity (global mode).
+        Partials of right ascension and declination with respect to a global
+        ``[b_ra, b_dec]`` bias.
 
         Returns
         -------
         np.ndarray
-            2×2 identity: [[1, 0], [0, 1]].
+            The (2, 2) identity, since each bias adds directly to its angle.
         """
         return np.eye(2, dtype=float)
 
@@ -460,33 +663,43 @@ class AngularIdeal(Measurement):
         frame: Frame = J2000,
     ) -> list:
         """
-        Groups together the different components of measurement _partials in the
-        global H-tilde.  Returns a 2-row list ``[row_ra, row_dec]``.
-
-        Sign convention (same as CentroidingIdeal):
-            relative_state = r_target − r_observer
-            target   position   ->  +H   (dmeas/dr_target   = +H_pos)
-            observer position   ->  −H   (dmeas/dr_observer  = −H_pos)
+        Assemble the right-ascension and declination rows of the global H-tilde.
 
         Parameters
         ----------
         target : Body
+            The body the line of sight points to.
         epoch : EpochArray
-        frame : Frame
+            Single epoch at which the partials are evaluated.
+        frame : Frame, optional
+            Reference frame in which the partials are expressed. Defaults to
+            ``J2000``.
 
         Returns
         -------
         list
-            ``[row_ra, row_dec]`` — each row is a list of floats of length
-            equal to the total state dimension.
+            ``[row_ra, row_dec]``, each a list of floats as long as the state.
+            Without a ``state_definition`` each row holds the target position and
+            velocity partials only.
+
+        Raises
+        ------
+        MissingImageIndexError
+            If the state holds a stacked per-image ``angular_bias``
+            (dimension > 2) and no epoch-to-image mapping is set.
+
+        Notes
+        -----
+        Sign convention, the same as :class:`~scarabaeus.CentroidingIdeal`: the
+        relative position is :math:`\\mathbf{r}_{target} - \\mathbf{r}_{observer}`,
+        so the target position enters with :math:`+H_{pos}` and the observer
+        position with :math:`-H_{pos}`. Velocity columns are zero. An
+        ``angular_bias`` of the observer gets the (2, 2) identity when it is
+        global, or ones in the two columns of the current image when it is stacked
+        per image. Every other component gets zeros.
         """
 
-        relative_state = SpiceManager.get_state(
-            trgt_bdy=target.name,
-            epoch_time=epoch.times.values,
-            reference_frame=frame.name,
-            obsvr_bdy=self.instrument.name,
-        )
+        relative_state = self._relative_state(target, epoch, frame)
 
         H_pos = self._compute_h_tilde_pos(relative_state)  # (2, 3)
         H_vel = self._compute_h_tilde_vel()  # (2, 3) zeros
@@ -535,7 +748,7 @@ class AngularIdeal(Measurement):
                 2
             ].match(comp_name):
                 if comp_body_sid == observer_sid:
-                    if self._epoch_to_image_index is not None:
+                    if self._epoch_to_image_index is not None and comp_dim > 2:
                         _cur = self._epoch_to_image_index.get(float(epoch.times.values))
                         ind_ra = [0.0] * comp_dim
                         ind_dec = [0.0] * comp_dim
@@ -544,12 +757,30 @@ class AngularIdeal(Measurement):
                             ind_dec[2 * _cur + 1] = 1.0
                         row_ra.extend(ind_ra)
                         row_dec.extend(ind_dec)
+                    elif comp_dim > 2:
+                        raise AngularIdeal.MissingImageIndexError(
+                            f"State component '{comp_name}' has dimension {comp_dim}, so "
+                            "it holds one (b_ra, b_dec) bias per image, but no "
+                            "epoch-to-image mapping is set and the partial for this "
+                            "epoch is undefined. Call set_image_epochs() (or pass "
+                            "image_epochs= to observed_measurements/"
+                            "computed_measurements) before computing partials."
+                        )
                     else:
                         row_ra.extend([1.0, 0.0])  # global (dim=2)
                         row_dec.extend([0.0, 1.0])
                 else:
                     row_ra.extend([0.0] * comp_dim)
                     row_dec.extend([0.0] * comp_dim)
+
+            #  Station geometry, when this model observes from a surface
+            #  station: RA/DEC is a topocentric direction, so moving the
+            #  station moves it.
+            elif self._is_station_parameter(comp_name):
+                block = self._compute_h_tilde_station(
+                    comp_def, epoch.times.values, frame, H_pos, H_vel)
+                row_ra.extend(block[0].tolist())
+                row_dec.extend(block[1].tolist())
 
             #  Unknown / unhandled components: zeros
             else:

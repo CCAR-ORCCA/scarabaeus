@@ -1,5 +1,8 @@
 .. SPDX-FileCopyrightText: 2026 Orbital Research Cluster for Celestial Applications (ORCCA) Lab, University of Colorado at Boulder
 .. SPDX-License-Identifier: ISC
+
+:orphan:
+
 .. meta::
     :description lang=en:
         Setup and installation guide for Scarabaeus.
@@ -52,7 +55,6 @@ ecosystem of powerful extensions. For SCB, we recommend using **VSCode** as your
 
 - GitLens - `link <https://marketplace.visualstudio.com/items?itemName=eamodio.gitlens>`_
 - SonarQube - `link <https://marketplace.visualstudio.com/items?itemName=SonarSource.sonarlint-vscode>`_
-.. - autoDocstring - `link <https://marketplace.visualstudio.com/items?itemName=SonarSource.sonarlint-vscode>`_
 - Python - `link <https://marketplace.visualstudio.com/items?itemName=ms-python.python>`_
 - Pylance - `link <https://marketplace.visualstudio.com/items?itemName=ms-python.vscode-pylance>`_
 
@@ -60,38 +62,15 @@ ecosystem of powerful extensions. For SCB, we recommend using **VSCode** as your
 :bold:`Clone Scarabaeus Repository`
 -----------------------------------
 
-Clone the Scarabaeus repository to your local machine. You will need to setup some form of secure access between your machine and Gitlab before you are able to do this. The 
-options for secure access are below. We highly recommend using SSH.
-
-To setup a secure access method:
-
-- **SSH - Recommended**:
-    - On Gitlab, go to your **Preferences**. This can be done by clicking on your **user icon** in the top right corner, and the selecting **Preferences**.
-    - Navigate to the menu on the far left of the screen and click on the **SSH Keys** option. This will have a key icon to the left of the text.
-    - Follow the instructions on this page for adding an SSH key. The page contains links to documentation for how to set up the private and public key pair. We understand this process can be somewhat confusing so if you have any trouble please reach out to a fellow developer for assistance.
-    - General GitLab SSH documentation can be found on the `GitLab SSH Docs <https://docs.gitlab.com/ee/user/ssh.html>`_
-
-Alternatively: 
-
-- **HTTPS - Not Recommended**:
-    - This process involves generating Gitlab Tokens. If you would like to use this method please reference the Gitlab documentation for a how-to.
-
-Once you have a secure access method set up you can clone the Scarabaeus repository. You may do this via a terminal or your IDE. We recommend using your IDE as it makes 
-things slightly simpler but this is up to you. The following instructions will be for cloning via SSH.
+Clone the Scarabaeus repository from `GitHub <https://github.com/CCAR-ORCCA/scarabaeus>`_ to your local machine. The repository is public, so no account or access keys are 
+needed to clone it. You may do this via a terminal or your IDE.
 
 **Cloning via VSC**:
 
-- Navigate to the Scarabaeus project on Gitlab and click on the Clone button shown in the image below.
-- Copy the link under "Clone with SSH" (the one that starts with git@).
-- Now navigate to VSCode, open a new window, and clock on the Clone Git Repository... option under the Start menu (center left of the window). Your screen should look like the image below.
-- Next, paste the link you copied from Gitlab into the bar at the top of the VSCode window. From there follow the prompts to clone the repository.
+- Open a new VSCode window and click on the Clone Git Repository... option under the Start menu (center left of the window). Your screen should look like the image below.
+- Paste ``https://github.com/CCAR-ORCCA/scarabaeus.git`` into the bar at the top of the VSCode window. From there follow the prompts to clone the repository.
 
-|pic1|  |pic2|
-
-.. |pic1| image:: ../../../images/readme_images/clone_repo_screenshot.png
-   :width: 45%
-
-.. |pic2| image:: ../../../images/readme_images/VSCode_New_Window.png
+.. image:: ../../../images/readme_images/VSCode_New_Window.png
    :width: 45%
 
 **Cloning via Command Line**:
@@ -100,9 +79,9 @@ In the terminal type:
 
 .. code-block::
 
-    git clone git@orccagitlab.colorado.edu:javi9068/scarabaeus.git
+    git clone https://github.com/CCAR-ORCCA/scarabaeus.git
 
-Refer to `GitLab CLI Cloning Guide <https://docs.gitlab.com/ee/gitlab-basics/start-using-git.html>`_ for extra documentations on cloning via command line.
+Refer to `GitHub Cloning Guide <https://docs.github.com/en/repositories/creating-and-managing-repositories/cloning-a-repository>`_ for extra documentations on cloning via command line.
 
 -------------------------------------------------
 :gold:`Add Scarabaeus Package to Python Path`

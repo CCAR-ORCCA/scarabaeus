@@ -90,7 +90,11 @@ class UtilsOD:
             * ``'alpha'``     – float, Lagrange multiplier at the tangency point.
             * ``'x_tang'``    – ndarray shape (n,), tangency point in state space.
             * ``'all_roots'`` – list of all positive alpha roots found.
-            * ``'all_t_sq'``  – list of t² values for each root.
+            * ``'all_t_sq'``  – list of :math:`t^2` values for each root.
+
+        See Also
+        --------
+        UtilsOD.closeness_matrix : Pairwise matrix for N solutions.
 
         Notes
         -----
@@ -105,10 +109,6 @@ class UtilsOD:
         on a logarithmic grid, brackets sign changes, and refines them with
         bisection.  If no root is found a :class:`UserWarning` is issued and
         ``'d'`` is returned as ``nan``.
-
-        See Also
-        --------
-        UtilsOD.closeness_matrix : Pairwise matrix for N solutions.
 
         References
         ----------
@@ -218,7 +218,7 @@ class UtilsOD:
         **closeness_kwargs,
     ) -> tuple:
         """
-        Compute the N×N pairwise closeness matrix for a list of OD solutions.
+        Compute the (N, N) pairwise closeness matrix for a list of OD solutions.
 
         Parameters
         ----------
@@ -279,7 +279,7 @@ class UtilsOD:
         save_path: str = None,
     ) -> None:
         """
-        Visualise an N×N pairwise closeness matrix.
+        Visualise an (N, N) pairwise closeness matrix.
 
         Parameters
         ----------
@@ -291,8 +291,9 @@ class UtilsOD:
             Colormap scheme:
 
             * ``'merb'`` *(default)* — five-band categorical map.
-            * ``'mera'`` — two-band binary map at the 0.8 σ boundary.
-            * ``'sigma'`` — four-band map at 1, 2, 3 σ boundaries.
+            * ``'mera'`` — two-band binary map at the :math:`0.8\\sigma` boundary.
+            * ``'sigma'`` — four-band map at the :math:`1\\sigma`, :math:`2\\sigma`
+              and :math:`3\\sigma` boundaries.
             * ``'continuous'`` — ``RdYlGn_r`` continuous colormap.
 
         title : str, optional
@@ -484,7 +485,7 @@ class UtilsOD:
             c_m = P_m (P_1^{-1} c_1 + P_2^{-1} c_2)
 
         This is equivalent to a Kalman update where one estimate treats the
-        other as a measurement [2]_.
+        other as a measurement.
 
         Parameters
         ----------
@@ -502,7 +503,7 @@ class UtilsOD:
         c_merged : ndarray, shape (n,)
             Combined mean.
         P_merged : ndarray, shape (n, n)
-            Combined covariance (always ≤ min(P1, P2) element-wise on the
+            Combined covariance (never larger than ``min(P1, P2)`` element-wise on the
             diagonal).
 
         Raises
@@ -610,7 +611,7 @@ class UtilsOD:
         """
         Compute the Normalized Estimation Error Squared (NEES).
 
-        A standard filter consistency metric [2]_:
+        A standard filter consistency metric:
 
         .. math::
 
@@ -652,7 +653,7 @@ class UtilsOD:
 
         Two ellipsoids overlap if the sum of their Mahalanobis radii (each
         evaluated at the midpoint between the means) exceeds the distance
-        between the means [2]_.  This is a fast, conservative heuristic; use
+        between the means.  This is a fast, conservative heuristic; use
         :meth:`closeness` for the exact tangency value.
 
         Parameters

@@ -5,12 +5,10 @@ from scarabaeus import Dimensions
 import numpy as np
 import numpy.typing as npt
 import sys
-
 if sys.version_info >= (3, 11):
     from typing import Self
 else:
     from typing_extensions import Self
-
 import re, math, random
 
 
@@ -285,6 +283,27 @@ class Units:
         """
         return self._unitless
 
+    def to_dict(self) -> dict:
+        """
+        Serialize to a JSON-friendly dict.
+
+        A unit is fully described by its dimensional ``powers`` and ``scales``
+        (compound units such as ``km/sec`` cannot be re-parsed from their name,
+        so the numeric representation is stored instead).
+        """
+        return {
+            "powers": [int(p) for p in self.dimensions.powers],
+            "scales": [float(s) for s in self.scales],
+            "name": self.name,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "Units":
+        """Reconstruct a Units object from a dict produced by :meth:`to_dict`."""
+        return cls(
+            Dimensions(list(data["powers"])), np.array(data["scales"], dtype=float)
+        )
+
     # endregion Properties
 
     # region Operators
@@ -382,9 +401,6 @@ class Units:
             if isinstance(other, np.ndarray):
                 # multiplied by array -> return an array
                 return to_return
-            else:
-                # multiplied by list -> return a list
-                return to_return.tolist()
 
         ## Unit object * invalid object
         else:
@@ -524,6 +540,10 @@ class Units:
         return self**0.5
 
     def __eq__(self, other) -> bool:
+        # the same object, e.g. the shared units of a state vector
+        if self is other:
+            return True
+
         # input validation
         if not isinstance(other, self.__class__):
             bad_type_err = (
@@ -732,7 +752,7 @@ class Units:
                         # return cls(np.array([1, 1, 1, 1]), np.array([1, 1, 1, 1]))
 
                 # return n Unit objects where n = the number of requested units
-                if random.random() < 0.00001:
+                if random.random() < 0.0000001:
                     print(random.choice(_vandv_log))
 
                 if len(to_return) > 1:
@@ -756,10 +776,11 @@ class Units:
             potential_units = self._base_units
             potential_units.update(self._unit_dictionary)
             # isolate base unit first
+            base = ""
             for key in potential_units:
-                base = re.findall(key + r"\Z", unit_str)
-                if base != []:
-                    base = "".join(base)  # regex returns as a list, want as a string
+                match = re.findall(key + r"\Z", unit_str)
+                if match != []:
+                    base = "".join(match)  # regex returns as a list, want as a string
                     break
 
             # verify that the requested singular unit exists

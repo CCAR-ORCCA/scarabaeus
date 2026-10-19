@@ -91,7 +91,7 @@ class Data(Enum):
     stns_bsp = FileInfo(
         path="kernels/locked/spk/earthstns_fx_201023.bsp",
         comes_from="download",
-        link="https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/stations/earthstns_fx_201023.bsp",
+        link="https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/stations/a_old_versions/earthstns_fx_201023.bsp",
     )
     """ DSN ground-station positions/velocities. """
 
@@ -156,7 +156,7 @@ class Data(Enum):
     stns_itrf93 = FileInfo(
         path="kernels/locked/spk/earthstns_itrf93_201023.bsp",
         comes_from="download",
-        link="https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/stations/earthstns_itrf93_201023.bsp",
+        link="https://naif.jpl.nasa.gov/pub/naif/generic_kernels/spk/stations/a_old_versions/earthstns_itrf93_201023.bsp",
     )
     """ DSN ground-station positions/velocities (ITRF93 frame). """
 
@@ -172,27 +172,63 @@ class Data(Enum):
         comes_from="existing",
     )
 
-    """ Seasonal tropospheric coefficients. """
-    tropo_seasonal = FileInfo(
+    """ Non-seasonal (monthly NRMPOW) tropospheric coefficients, June 2018. """
+    tropo_nonseasonal_2018_jun = FileInfo(
         path="measurements/media_correction/2018_152_2018_182_tro.json",
         comes_from="existing",
     )
 
-    """ Seasonal tropospheric coefficients. """
+    """ Non-seasonal (monthly NRMPOW) tropospheric coefficients, July 2018. """
+    tropo_nonseasonal_2018_jul = FileInfo(
+        path="measurements/media_correction/2018_182_2018_213_tro.json",
+        comes_from="existing",
+    )
+
+    """ Seasonal (TRIG climatology) tropospheric coefficients. """
     tropo_seasonal_new = FileInfo(
         path="measurements/media_correction/1972_001_2048_001_tro_modified.json",
         comes_from="existing",
     )
 
-    """Non-seasonal tropospheric"""
+    """ Non-seasonal (monthly NRMPOW) tropospheric coefficients, January 2010. """
     tropo_nonseasonal = FileInfo(
         path="measurements/media_correction/2010_001_2010_032_tro.json",
         comes_from="existing",
     )
 
-    """ Radiometric tracking file """
+    """ Radiometric tracking file: OSIRIS-REx, DSS-35, 2018 DoY 159 """
     trk_file = FileInfo(
         path="measurements/radiometric/orex_beno_2018_159_054533_2018_159_104001_35.json",
+        comes_from="existing",
+    )
+
+    """ Radiometric tracking file: OSIRIS-REx, DSS-65, 2018 DoY 158 """
+    trk_file_158_dss65 = FileInfo(
+        path="measurements/radiometric/orex_beno_2018_158_184515_2018_158_230501_65.json",
+        comes_from="existing",
+    )
+
+    """ Radiometric tracking file: OSIRIS-REx, DSS-65, 2018 DoY 159 """
+    trk_file_159_dss65 = FileInfo(
+        path="measurements/radiometric/orex_beno_2018_159_183015_2018_159_230501_65.json",
+        comes_from="existing",
+    )
+
+    """ Radiometric tracking file: OSIRIS-REx, DSS-35, 2018 DoY 183 """
+    trk_file_183_dss35 = FileInfo(
+        path="measurements/radiometric/orex_beno_2018_183_041506_2018_183_120501_35.json",
+        comes_from="existing",
+    )
+
+    """ Radiometric tracking file: OSIRIS-REx, DSS-35, 2018 DoY 185 """
+    trk_file_185_dss35 = FileInfo(
+        path="measurements/radiometric/orex_beno_2018_185_020516_2018_185_074000_35.json",
+        comes_from="existing",
+    )
+
+    """ Radiometric tracking file: OSIRIS-REx, DSS-35, 2018 DoY 187 """
+    trk_file_187_dss35 = FileInfo(
+        path="measurements/radiometric/orex_beno_2018_187_050517_2018_187_093501_35.json",
         comes_from="existing",
     )
 

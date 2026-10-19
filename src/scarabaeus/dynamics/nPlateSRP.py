@@ -1,6 +1,7 @@
 # SPDX-FileCopyrightText: 2026 Orbital Research Cluster for Celestial Applications (ORCCA) Lab, University of Colorado at Boulder
 # SPDX-License-Identifier: ISC
 from scarabaeus import (
+    CelestialBody,
     DynamicModel,
     Frame,
     Units,
@@ -11,11 +12,18 @@ from scarabaeus import (
     StateArray,
     Spacecraft,
     nPlateModel,
+    DynamicalUtils,
 )
 from scarabaeus import constants
-import warnings
+from scarabaeus.utils.EphemerisCache import build_ephemeris_cache
 import scarabaeus.utils.NumpyWrapper as np
-import spiceypy
+
+try:
+    from scarabaeus.rust import NPlateSRPCore as _NPlateRustCore
+except ImportError:
+    _NPlateRustCore = None
+
+_SUN_SPICE_ID = 10
 
 # ------------------#
 #  Generate Units  #
@@ -68,13 +76,35 @@ class nPlateSRP(DynamicModel):
         retrieved from the state vector via a ``("eta_srp", spice_id)`` entry
         and can be solved for in the OD process.
 
+        A double-sided plate (``nPlateModel.double_sided``) lit from behind
+        (:math:`\\hat{\\mathbf{n}}_i \\cdot \\hat{\\mathbf{r}}_\\odot < 0`)
+        contributes as a plate with normal :math:`-\\hat{\\mathbf{n}}_i`.
+
+        Plates in the spacecraft body frame (Fixed plates without a frame) are
+        oriented by the spacecraft ``attitudeMode`` (see
+        :class:`~scarabaeus.DynamicalUtils`): a C-kernel, an inertially fixed
+        DCM, or ``nadirPointingSun``. The nadir attitude follows the
+        spacecraft state, so its position partial carries the attitude terms
+        and its velocity partial is non-zero (``depends_on_velocity``).
+        CK plates and Fixed plates in a named SPICE frame are oriented by
+        SPICE alone, so their contribution does not depend on the
+        ``attitudeMode``; a model with no body-frame plate needs none. The two
+        groups can be mixed under any attitude (a nadir-pointed bus with
+        solar arrays on their own CK, say): each is summed in its own frame.
+
         Parameters
         ----------
-        state_vector : StateArray
-            The state vector of the spacecraft containing position, velocity, and other estimated parameters.
+        origin : CelestialBody
+            Propagation origin. Used for the Sun-relative geometry; the estimable
+            ``eta_srp`` is read from the propagated state at evaluation time.
 
         spacecraft : Spacecraft
             The spacecraft containing physical and plate model properties.
+
+        Raises
+        ------
+        ValueError
+            If any plate area in the n-plate model is not expressed in km^2.
 
         See Also
         --------
@@ -83,29 +113,57 @@ class nPlateSRP(DynamicModel):
         scarabaeus.Propagator : Uses this model when ``nPlate_SRP = True``.
         scarabaeus.CannonballSRP : Lower fidelity model for calculating SRP.
 
-            Raises
-            ------
-            ValueError
-                If any plate area in the n-plate model is not expressed in km².
-
-            Notes
-            -----
-            The Sun’s position is retrieved dynamically from SPICE data.
+        Notes
+        -----
+        The Sun’s position is retrieved dynamically from SPICE data.
 
         References
         ----------
-        P. W. Kenneally, “High geometric fidelity solar radiation pressure modeling via graphics processing unit,”
-        Master’s thesis, Colorado Boulder, 2016.
+        .. [1] P. W. Kenneally, “High geometric fidelity solar radiation pressure modeling via graphics processing unit,”
+           Master’s thesis, Colorado Boulder, 2016.
     """
+
+    # ------------------#
+    # region   Errors  #
+    # ------------------#
+    # Custom exceptions: named on the model and raised on the
+    # line that detects the failure, so tracebacks point at the real cause
+    # rather than a generic Exception/RuntimeError.
+    class RustCoreUnavailableError(Exception):
+        """The rust N-plate SRP core is unavailable.
+
+        Raised by the compute and partial methods when ``_rust_cores`` could not
+        be built because the extension is not importable. The Rust kernels are
+        the only implementation of the acceleration and its position partial.
+        """
+
+    class AutogradTracingError(Exception):
+        """Autograd is tracing the acceleration through the Rust kernels.
+
+        The autograd NumPy backend (``UseAutoGrad=TRUE``) is fine on its own —
+        the model runs on plain arrays under it. Only a traced position or
+        eta_srp cannot pass into Rust. The partials are verified by the Rust
+        dual-number differentiation instead
+        (``NPlateSRPCore.compute_partials_ad``), which is what
+        ``check_force_model_partials=TRUE`` runs.
+        """
+
+    # endregion Errors #
+    # ------------------#
 
     # --------------------#
     # region Constructor #
     # --------------------#
     def __init__(
-        self, state_vector: StateArray, spacecraft: Spacecraft, base_frame: Frame
+        self,
+        origin: CelestialBody,
+        spacecraft: Spacecraft,
+        base_frame: Frame,
+        t0: float = None,
+        tf: float = None,
     ):
         # Origin and reference frame
-        self._origin = state_vector.origin
+        self._origin = origin
         self._origin_name = self._origin.name
         self._frame = base_frame
         self._spacecraft = spacecraft
@@ -127,14 +185,160 @@ class nPlateSRP(DynamicModel):
             constants.srp_constant2, kg * km * sec**-2
         )
 
-        # Cache eta_srp per body (spice_id -> float)
+        # eta_srp is read from the propagated state on every evaluation (see
+        # _get_eta_srp). The map is kept only so callers that poke a value in
+        # directly — the partial-derivative diagnostics do — still work.
         self._eta_srp_map: dict[int, float] = {}
-        self._initialize_eta_srp_map(state_vector)
 
         # Initialization check on the correct units for nPlate areas
         for ii in range(len(self.plate_model.names)):
             if self.plate_model.areas[ii].units != km**2:
                 raise ValueError(f"units of nPlate areas not compliant.")
+
+        # Precompute constant plate geometry as raw numpy arrays so the per-RHS
+        # loop doesn't re-extract .values / re-index the plate model each step.
+        _nplates = len(self.plate_model.names)
+        self._plate_areas = np.array(
+            [self.plate_model.areas[ii].values for ii in range(_nplates)], dtype=float
+        )  # km^2
+        self._plate_diff_ref = np.array(
+            [self.plate_model.diff_ref_coeffs[ii] for ii in range(_nplates)], dtype=float
+        )
+        self._plate_spec_ref = np.array(
+            [self.plate_model.spec_ref_coeffs[ii] for ii in range(_nplates)], dtype=float
+        )
+        # Plates whose normals are given in the body frame; the others (CK and
+        # named-frame plates) come back from the plate model in base_frame.
+        # Each group runs in its own rust core (_build_rust_cores).
+        self._body_plates = np.array(self.plate_model.body_frame_plates, dtype=bool)
+
+        # Sun-position source. When the origin IS the Sun the vector is
+        # identically zero. Otherwise, if the propagation span is known and
+        # the frame is the SPK-native J2000, cache the Chebyshev records so
+        # _sun_to_origin avoids the per-step spkpos; SPICE stays the fallback.
+        self._origin_spice_id = getattr(self._origin, "spice_id", None)
+        self._origin_is_sun = self._origin_spice_id == _SUN_SPICE_ID
+        self._sun_eph = None
+        self._sun_eph_span = None
+        frame_name = getattr(base_frame, "name", str(base_frame))
+        self._frame_name = frame_name
+        if (
+            t0 is not None
+            and tf is not None
+            and self._origin_spice_id is not None
+            and not self._origin_is_sun
+            and frame_name.upper() == "J2000"
+        ):
+            self._sun_eph_span = (t0 - 86400.0, tf + 86400.0)
+            self._sun_eph = self._build_sun_ephemeris()
+
+        # Plate sums and the SC-fixed <-> inertial mapping run in rust — the
+        # only compute path. Unavailable only when the extension is missing;
+        # the compute methods then raise (_require_rust_core). Built under the
+        # autograd backend too: the propagation evaluates the model on plain
+        # arrays.
+        self._rust_cores = self._build_rust_cores()
+
+    def _build_rust_cores(self):
+        """
+        One rust core per non-empty plate group, or ``None`` without the
+        extension.
+
+        The body-frame plates are turned by the attitude. The CK and
+        named-frame plates come back from the plate model already in
+        ``base_frame``, so they are evaluated with the identity: they do not
+        turn with an attitude that follows the state (``nadirPointingSun``),
+        and need no ``attitudeMode`` at all. The kernel is rotation
+        covariant, so the two group sums add up to the acceleration.
+
+        Returns
+        -------
+        tuple or None
+            ``(plates, body_frame, core)`` per group: the plate mask, whether
+            the group is in the body frame, and its ``NPlateSRPCore``.
+        """
+        if _NPlateRustCore is None:
+            return None
+        double_sided = np.array(self.plate_model.double_sided, dtype=bool)
+        cores = []
+        for plates, body_frame in (
+            (self._body_plates, True),
+            (~self._body_plates, False),
+        ):
+            if not plates.any():
+                continue
+            core = _NPlateRustCore(
+                self._P_SRP,
+                self._plate_areas[plates],
+                self._plate_diff_ref[plates],
+                self._plate_spec_ref[plates],
+                double_sided=[bool(flag) for flag in double_sided[plates]],
+            )
+            cores.append((plates, body_frame, core))
+        return tuple(cores)
+
+    def __getstate__(self):
+        # Compiled extension objects are not picklable; rebuilt in __setstate__.
+        state = self.__dict__.copy()
+        state["_rust_cores"] = None
+        state["_sun_eph"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._rust_cores = self._build_rust_cores()
+        if self.__dict__.get("_sun_eph_span") is not None:
+            self._sun_eph = self._build_sun_ephemeris()
+
+    def _build_sun_ephemeris(self):
+        """
+        Cache the origin and Sun Chebyshev records over ``_sun_eph_span``.
+
+        Returns
+        -------
+        EphemerisCache or None
+            The cache, or ``None`` when the loaded SPKs do not cover the span;
+            the Sun position then falls back to SPICE.
+        """
+        try:
+            return build_ephemeris_cache(
+                [self._origin_spice_id, _SUN_SPICE_ID], *self._sun_eph_span
+            )
+        except Exception:
+            return None  # no/partial SPK coverage -> SPICE fallback
+
+    def _require_rust_core(self, *inputs):
+        """
+        Guard for the compute methods: the rust core is the only
+        implementation of the N-plate kernels.
+
+        The autograd NumPy backend alone is not an error — only an input that
+        autograd is actually tracing, since it cannot enter Rust.
+
+        Parameters
+        ----------
+        *inputs
+            The differentiable inputs handed to Rust (position, eta_srp).
+
+        Raises
+        ------
+        RustCoreUnavailableError
+            If the rust cores were not built.
+        AutogradTracingError
+            If autograd is tracing any of ``inputs``.
+        """
+        if self._rust_cores is None:
+            raise self.RustCoreUnavailableError(
+                "nPlateSRP requires the rust extension. Build it with "
+                "`maturin develop --release` from the repository root."
+            )
+        if any(isinstance(x, np.autograd_types) for x in inputs):
+            raise self.AutogradTracingError(
+                "nPlateSRP evaluates its plate sums in Rust, which autograd "
+                "cannot trace. Verify its partials with "
+                "check_force_model_partials=TRUE, which uses the Rust "
+                "dual-number differentiation (compute_partials_ad)."
+            )
 
     # -------------------------#
     # region ====> Properties #
@@ -150,6 +354,18 @@ class nPlateSRP(DynamicModel):
         The spacecraft associated with the SRP model.
         """
         return self._spacecraft
+
+    @property
+    def depends_on_velocity(self) -> bool:
+        """ Whether the acceleration depends on the spacecraft velocity.
+
+            True only for the ``nadirPointingSun`` attitude, where the
+            spacecraft Y axis follows the heliocentric velocity, and only when
+            some plate is in the body frame.
+        """
+        return bool(self._body_plates.any()) and DynamicalUtils.depends_on_velocity(
+            self._spacecraft
+        )
 
     @property
     def origin(self) -> Body:
@@ -214,60 +430,28 @@ class nPlateSRP(DynamicModel):
     # region Methods #
     # ----------------#
 
-    def _initialize_eta_srp_map(self, state_array: StateArray) -> None:
-        """
-        Scan the StateArray and store eta_srp per body (by spice_id).
-
-        Expects entries of the form:
-            ('eta_srp', dim, est, dyn, owner, value)
-
-        Only the first value is used if an array is provided.
-        """
-        for entry in state_array.state:
-            if len(entry) < 6:
-                continue
-
-            name, _, _, _, owner, raw_val = entry
-            if name != "eta_srp":
-                continue
-
-            spice_id = getattr(owner, "spice_id", None)
-            if spice_id is None:
-                raise ValueError(
-                    "CannonballSRP: 'eta_srp' entry requires an owner with 'spice_id'. "
-                    f"Got owner={owner!r}."
-                )
-
-            # Extract numeric value robustly
-            if hasattr(raw_val, "quantity"):
-                vals = raw_val.quantity.values
-            elif hasattr(raw_val, "values"):
-                vals = raw_val.values
-            else:
-                vals = raw_val
-
-            eta = float(np.atleast_1d(vals)[0])
-            self._eta_srp_map[spice_id] = eta
-
     def _get_eta_srp(self, current_state: dict, body: Body) -> float:
         """
         Resolve eta_srp for the given body.
 
         Priority:
-        1. Cached from StateArray (self._eta_srp_map[spice_id])
-        2. Dynamic from current_state[("eta_srp", spice_id)] if present
+        1. The propagated state, ``current_state[("eta_srp", spice_id)]``
+        2. Any value pushed into ``self._eta_srp_map`` by a caller
         3. Fallback: 1.0
+
+        The state comes first so that an estimated eta_srp takes effect, which
+        also matches how every other model resolves its parameters.
         """
         spice_id = getattr(body, "spice_id", None)
 
         if spice_id is not None:
-            if spice_id in self._eta_srp_map:
-                return self._eta_srp_map[spice_id]
-
             key = ("eta_srp", spice_id)
             if key in current_state:
                 val = current_state[key]
-                return float(val.values if hasattr(val, "values") else val)
+                return self._scalar_from_state(val)
+
+            if spice_id in self._eta_srp_map:
+                return self._eta_srp_map[spice_id]
 
         return 1.0
 
@@ -304,10 +488,312 @@ class nPlateSRP(DynamicModel):
             dcm, _, _ = SpiceManager.get_attitude(
                 self.spacecraft.spice_id, epoch, self.frame, tol
             )
-            return dcm.values
+            return dcm
 
         except Exception:
             return default_DCM
+
+    def _sun_to_origin(self, epoch: float) -> np.ndarray:
+        """
+        Sun->origin position (km, raw numpy), memoized per epoch.
+
+        ``compute_acceleration`` and ``_compute_partial_by_position`` both need it
+        at the same epoch within one RHS step, so the SPICE lookup is cached and
+        reused (the origin SPICE name is already resolved at construction).
+
+        Parameters
+        ----------
+        epoch : float
+            TDB epoch (seconds past J2000).
+
+        Returns
+        -------
+        numpy.ndarray
+            ``(3,)`` Sun->origin position in km.
+        """
+        if self.__dict__.get("_s2o_epoch") != epoch:
+            self._s2o_cache = self._lookup_sun_to_origin(epoch)
+            self._s2o_epoch = epoch
+        return self._s2o_cache
+
+    def _lookup_sun_to_origin(self, epoch: float) -> np.ndarray:
+        """
+        Uncached Sun->origin lookup: identically zero for a heliocentric
+        origin; Chebyshev ephemeris cache when available (falling back to
+        SPICE for epochs outside the cached span); SPICE otherwise.
+        """
+        if self._origin_is_sun:
+            return np.zeros(3)
+        if self._sun_eph is not None:
+            try:
+                return np.asarray(
+                    self._sun_eph.get_relative_position(
+                        self._origin_spice_id, _SUN_SPICE_ID, epoch
+                    ),
+                    dtype=float,
+                )
+            except Exception:
+                pass  # epoch outside the cached span -> SPICE fallback
+        return SpiceManager.get_pos_values(
+            self._origin_spice_name, epoch, self._frame, "SUN"
+        )
+
+    def _sun_to_origin_velocity(self, epoch: float) -> np.ndarray:
+        """
+        Sun->origin velocity (km/s, raw numpy), memoized per epoch. Only the
+        ``nadirPointingSun`` attitude needs it.
+
+        Parameters
+        ----------
+        epoch : float
+            TDB epoch (seconds past J2000).
+
+        Returns
+        -------
+        numpy.ndarray
+            ``(3,)`` Sun->origin velocity in km/s.
+        """
+        if self.__dict__.get("_s2o_vel_epoch") != epoch:
+            if self._origin_is_sun:
+                self._s2o_vel_cache = np.zeros(3)
+            else:
+                self._s2o_vel_cache = DynamicalUtils.sun_to_origin_velocity(
+                    self._origin_spice_name, self._frame, epoch
+                )
+            self._s2o_vel_epoch = epoch
+        return self._s2o_vel_cache
+
+    def _attitude_dcm_ck(self, body, epoch: float) -> np.ndarray:
+        """
+        Body->inertial DCM for CK attitude at ``epoch``, memoized per epoch.
+
+        ``compute_acceleration`` and ``_compute_partial_by_position`` both query
+        the CK attitude kernel at the same epoch within one RHS step; the lookup
+        depends only on ``epoch``, so the kernel query and the ``q2m``
+        conversion of :meth:`~scarabaeus.DynamicalUtils.ck_dcm` run once.
+
+        Parameters
+        ----------
+        body : Spacecraft
+            Spacecraft whose CK-driven attitude is queried.
+        epoch : float
+            TDB epoch (seconds past J2000).
+
+        Returns
+        -------
+        numpy.ndarray
+            ``(3, 3)`` direction-cosine matrix transforming spacecraft-fixed
+            vectors into ``base_frame``, the frame of the Sun vector and of
+            the CK and named-frame plate normals.
+        """
+        if self.__dict__.get("_att_dcm_epoch") != epoch:
+            self._att_dcm_cache = DynamicalUtils.ck_dcm(body, epoch, self._frame)
+            self._att_dcm_epoch = epoch
+        return self._att_dcm_cache
+
+    def _all_normals(self, epoch: float) -> np.ndarray:
+        """
+        Plate outward normals at ``epoch``: the body-frame plates in the body
+        frame, the CK and named-frame plates in ``base_frame``.
+
+        Like the attitude DCM, the CK and named-frame normals are requested by
+        both :meth:`compute_acceleration` and
+        :meth:`_compute_partial_by_position` at the same epoch within one RHS
+        step, so the (epoch-only) SPICE lookup is cached and reused.
+
+        Parameters
+        ----------
+        epoch : float
+            TDB epoch (seconds past J2000).
+
+        Returns
+        -------
+        numpy.ndarray
+            ``(N, 3)`` array of the ``N`` plate outward-normal vectors at ``epoch``.
+        """
+        if self.__dict__.get("_normals_epoch") != epoch:
+            # dtype is pinned to float: a config whose normals are written as
+            # integers (e.g. [1, 0, 0]) otherwise yields an int64 array, which
+            # the Rust core rejects since it takes f64. Models with a CK plate
+            # hide this, because the rotated CK normals make the array float.
+            self._normals_cache = np.asarray(
+                self.plate_model.get_all_normals(
+                    epoch, self.spacecraft.spice_id, inertial_frame=self._frame_name
+                ),
+                dtype=float,
+            )
+            self._normals_epoch = epoch
+        return self._normals_cache
+
+    def _mass_value(self, epoch: float) -> float:
+        """
+        Spacecraft mass at ``epoch`` (raw kg float), memoized per epoch.
+
+        :meth:`compute_acceleration` and :meth:`_compute_partial_by_position` both
+        need the spacecraft mass at the same epoch within one RHS step (the partial
+        reuses the same value for every plate), so the polynomial mass evaluation and
+        its ``ArrayWUnits`` wrap are performed once and reused.
+
+        Parameters
+        ----------
+        epoch : float
+            Epoch at which to evaluate the spacecraft mass, in ephemeris time
+            (seconds past J2000).
+
+        Returns
+        -------
+        float
+            Spacecraft mass at ``epoch`` in kilograms.
+        """
+        if self.__dict__.get("_mass_epoch") != epoch:
+            self._mass_cache = self._spacecraft.mass(epoch).values
+            self._mass_epoch = epoch
+        return self._mass_cache
+
+    def _attitude(
+        self, sun2body: np.ndarray, current_state: dict, epoch: float, body: Spacecraft,
+        derivatives: bool = False,
+    ) -> tuple:
+        """
+        Spacecraft-fixed to inertial rotation and, for the nadir attitude,
+        its derivatives, from :class:`~scarabaeus.DynamicalUtils`.
+
+        The derivatives are returned per axis, ``D[j]`` being the Jacobian of
+        axis :math:`j` (see
+        :meth:`~scarabaeus.DynamicalUtils.nadirPointingSun`), which is the
+        layout the rust Jacobians take.
+
+        Parameters
+        ----------
+        sun2body : numpy.ndarray
+            ``(3,)`` Sun->spacecraft position (inertial), km.
+        current_state : dict
+            The propagated state.
+        epoch : float
+            TDB epoch (seconds past J2000).
+        body : Spacecraft
+            The spacecraft for which SRP acceleration is calculated.
+        derivatives : bool, optional
+            Also return the nadir derivatives. Defaults to ``False``.
+
+        Returns
+        -------
+        tuple
+            ``(C, D_r, D_v)``: ``C`` is the ``(3, 3)`` spacecraft-fixed to
+            inertial DCM; ``D_r`` and ``D_v`` are ``(3, 3, 3)`` arrays, or
+            ``None`` when the attitude does not depend on the state or
+            ``derivatives`` is false.
+
+        Raises
+        ------
+        DynamicalUtils.InvalidAttitudeModeError
+            If ``body.attitudeMode`` is not supported.
+        DynamicalUtils.InvalidFixedAttitudeError
+            If an ``inertialFixedAttitude`` body carries no 3x3
+            ``fixedInertialAttitude``.
+        DynamicalUtils.MissingVelocityError
+            If a ``nadirPointingSun`` body has no velocity in the state.
+        """
+        attitude_mode = DynamicalUtils.attitude_mode(body)
+
+        if attitude_mode == "CK":
+            return self._attitude_dcm_ck(body, epoch), None, None
+
+        if attitude_mode == "inertialFixedAttitude":
+            return DynamicalUtils.fixed_dcm(body), None, None
+
+        # Nadir: -X at the Sun, Y along the heliocentric velocity.
+        velocity = DynamicalUtils.velocity_from_state(current_state, body)
+        sun2body_vel = self._sun_to_origin_velocity(epoch) + velocity
+        return DynamicalUtils.nadirPointingSun(sun2body, sun2body_vel, derivatives)
+
+    def _rust_terms(
+        self, position: np.ndarray, current_state: dict, epoch: float, body: Spacecraft,
+        derivatives: bool = False,
+    ) -> list:
+        """
+        Resolve the per-evaluation inputs of the rust kernels, one term per
+        plate group (:meth:`_build_rust_cores`), in their argument order:
+        Sun->body position (inertial, km), DCM into ``base_frame``, eta_srp,
+        spacecraft mass (kg), and the group's plate normals; plus the DCM
+        derivatives the Jacobians take when the attitude follows the state.
+
+        The body-frame group takes the attitude DCM and its body-frame
+        normals. The CK and named-frame group takes the identity and its
+        normals in ``base_frame``, with no DCM derivatives: those plates are
+        oriented by SPICE, not by the attitude.
+
+        Shared by :meth:`compute_acceleration`, the partials and the
+        dual-number partials check, so all of them evaluate the same geometry.
+
+        Parameters
+        ----------
+        position : np.ndarray
+            3x1 vector describing the spacecraft's position. Assumed in units of kilometers.
+
+        current_state : dict
+            Dictionary containing the current state parameters.
+
+        epoch : float
+            Current simulation epoch in seconds.
+
+        body : Spacecraft
+            The spacecraft for which SRP acceleration is calculated.
+
+        derivatives : bool, optional
+            Also return the nadir DCM derivatives. Defaults to ``False``.
+
+        Returns
+        -------
+        list
+            ``(core, inputs, D_r, D_v)`` per plate group: ``inputs`` is
+            ``(sun2body, DCM, eta_srp, mass, normals)``; ``D_r`` and ``D_v``
+            are as in :meth:`_attitude` (``None`` for the CK and named-frame
+            group).
+
+        Raises
+        ------
+        RustCoreUnavailableError
+            If the rust extension is not available.
+        AutogradTracingError
+            If autograd is tracing ``position`` or eta_srp.
+        DynamicalUtils.InvalidAttitudeModeError
+            If ``body.attitudeMode`` is not supported.
+        DynamicalUtils.InvalidFixedAttitudeError
+            If an ``inertialFixedAttitude`` body carries no 3x3
+            ``fixedInertialAttitude``.
+        DynamicalUtils.MissingVelocityError
+            If a ``nadirPointingSun`` body has no velocity in the state.
+        """
+        # Sun-to-Body vector (Sun-to-Origin memoized per epoch)
+        sun2body = self._sun_to_origin(epoch) + position
+
+        # Get the SRP scale factor
+        eta_srp = self._get_eta_srp(current_state, body)
+        self._require_rust_core(position, eta_srp)
+
+        terms = []
+        for plates, body_frame, core in self._rust_cores:
+            if body_frame:
+                # Spacecraft-fixed -> inertial DCM for the attitude mode.
+                # dtype pinned to float: the rust core takes f64 (an integer
+                # fixedInertialAttitude would otherwise be rejected).
+                DCM, D_r, D_v = self._attitude(
+                    sun2body, current_state, epoch, body, derivatives
+                )
+                DCM = np.asarray(DCM, dtype=float)
+            else:
+                # Normals already in base_frame: the kernel is rotation
+                # covariant, so the identity gives their acceleration.
+                DCM, D_r, D_v = np.eye(3), None, None
+
+            # Plate normals and spacecraft mass (kg), both memoized per epoch.
+            # Pass the raw ET float to avoid creating an EpochArray on every
+            # evaluation.
+            normals = self._all_normals(epoch)[plates]
+            m_t = self._mass_value(epoch)
+            terms.append((core, (sun2body, DCM, eta_srp, m_t, normals), D_r, D_v))
+        return terms
 
     def compute_acceleration(
         self, position: np.ndarray, current_state: dict, epoch: float, body: Spacecraft
@@ -318,7 +804,9 @@ class nPlateSRP(DynamicModel):
 
         Calculates the contribution of each spacecraft plate to the total
         acceleration, considering reflection, absorption, and the relative orientation
-        of the spacecraft with respect to the Sun.
+        of the spacecraft with respect to the Sun. The plate sums and the
+        SC-fixed -> inertial mapping run in rust (``NPlateSRPCore``), one core
+        per plate group (body frame; CK and named frame), summed.
 
         Parameters
         ----------
@@ -339,167 +827,18 @@ class nPlateSRP(DynamicModel):
         total_srp_acc : np.ndarrays
             3x1 vector describing the total SRP acceleration. Assumed in units
             of :math:`\\frac{km}{s^2}`.
+
+        Raises
+        ------
+        RustCoreUnavailableError
+            If the rust extension is not available.
+        AutogradTracingError
+            If autograd is tracing ``position`` or eta_srp.
         """
-        # Initialize acceleration
-        nplate_srp_acceleration = np.array([0, 0, 0])
-
-        # Compute the Sun-to-Origin vector from a Spice call
-        sun2origin = SpiceManager.get_pos(
-            self._origin_spice_name,
-            epoch,
-            self._frame,
-            "SUN",
-        ).values  # Assumed in km
-
-        # Compute the Sun-to-Body vector
-        sun2body = sun2origin + position
-
-        # Get the SRP scale factor
-        eta_srp = self._get_eta_srp(current_state, body)
-
-        # Get and validate the attitude mode
-        attitude_mode = getattr(body, "attitudeMode", None)
-        allowed_attitude_modes = (
-            "CK",
-            "nadir_pointing_to_sun",
-            "inertialFixedAttitude",
-        )
-        if attitude_mode not in allowed_attitude_modes:
-            raise ValueError(
-                f"Invalid attitudeMode '{attitude_mode}'. Must be one of: {allowed_attitude_modes}."
-            )
-
-        # AttitudeMode cases
-        if attitude_mode == "CK":
-            quat_inertial2body = body.get_attitude(J2000, epoch)
-            DCM_body2inertial = spiceypy.q2m(quat_inertial2body).T
-        elif attitude_mode == "nadir_pointing_to_sun":
-            warnings.warn(
-                "nadir_pointing_to_sun attitude mode not yet fully implemented for nPlateSRP. "
-                "It currently produces incorrect partial derivatives.",
-                RuntimeWarning,
-                stacklevel=2,
-            )
-            DCM_body2inertial = body.inertial_to_body_DCM_nadir_pointing_to_sun(
-                self.origin_name,
-                self._frame,
-                ArrayWUnits(sun2body, km),
-                current_state,
-                epoch,
-                body,
-            )
-        elif attitude_mode == "inertialFixedAttitude":
-            if not (
-                isinstance(body.fixedInertialAttitude, np.ndarray)
-                and body.fixedInertialAttitude.shape == (3, 3)
-            ):
-                raise ValueError(
-                    "fixedInertialAttitude must be a 3x3 numpy array. represent the rotation from Body fixed to inertial frame"
-                )
-            DCM_body2inertial = body.fixedInertialAttitude
-
-        # Compute Body-to-Sun vectors in SC-fixed reference frame
-        body2Sun_SCfixed = DCM_body2inertial.T @ -sun2body
-        body2Sun_SCfixed_norm = np.linalg.norm(body2Sun_SCfixed)
-        body2Sun_SCfixed_versor = body2Sun_SCfixed / body2Sun_SCfixed_norm
-
-        # Get all normals — pass raw ET float to avoid creating an EpochArray object on
-        # every ODE function evaluation (get_all_normals / _get_ck_normals accept floats).
-        normals = np.array(
-            self.plate_model.get_all_normals(epoch, self.spacecraft.spice_id)
-        )
-
-        # Compute nPlate SRP acceleration (Split into part 1, 2, and 3)
-        # Compute part 1 of the acceleration formula, made of constants and squared distance
-        m_t = self._spacecraft.mass(epoch).values  # Assumed in kg
-        nplate_srp_acceleration_bf_p1 = (
-            -(eta_srp / m_t) * self.P_SRP / (body2Sun_SCfixed_norm**2)
-        )
-
-        # Compute part 2 and 3 of the acceleration formula
-        nplate_srp_acceleration_bf_p23 = np.array([0, 0, 0])
-        T1 = np.zeros(
-            3,
-        )
-        T2 = np.zeros(
-            3,
-        )
-        T3 = np.zeros(
-            3,
-        )
-
-        # Loop through plates of the nPlate model
-        for ii in range(len(self.plate_model.names)):
-            normal_plate_ii = normals[ii]
-            normal_plate_ii_versor = normal_plate_ii / np.linalg.norm(normal_plate_ii)
-            C_dref_plate_ii = self.plate_model.diff_ref_coeffs[ii]
-            C_sref_plate_ii = self.plate_model.spec_ref_coeffs[ii]
-            A_plate_ii = self.plate_model.areas[ii].values  # Assumed in km^2
-
-            # Compute the angle theta between face's normal and body2Sun vector
-            theta = self._angle_between(normal_plate_ii, body2Sun_SCfixed)
-            # Compute the logic parameter H(theta)
-            cos_theta = np.cos(theta)
-            if cos_theta <= 0:
-                H_theta = 0
-            elif cos_theta > 0:
-                H_theta = 1
-
-            if H_theta == 1:
-                part2 = A_plate_ii * cos_theta
-                part3a = (1 - C_sref_plate_ii) * body2Sun_SCfixed_versor
-                part3b = (
-                    2
-                    * ((1 / 3) * C_dref_plate_ii + C_sref_plate_ii * cos_theta)
-                    * normal_plate_ii_versor
-                )
-                nplate_srp_acceleration_bf_p23 = (
-                    nplate_srp_acceleration_bf_p23 + part2 * (part3a + part3b)
-                )
-
-                C_i = self.P_SRP * (eta_srp / m_t) * A_plate_ii
-                A_i = -C_i * (1 - C_sref_plate_ii)
-                B_i = (-2 / 3) * (C_dref_plate_ii) * C_i
-                D_i = -2 * C_i * C_sref_plate_ii
-
-                a = normal_plate_ii_versor[0]
-                b = normal_plate_ii_versor[1]
-                c = normal_plate_ii_versor[2]
-                x = body2Sun_SCfixed[0]
-                y = body2Sun_SCfixed[1]
-                z = body2Sun_SCfixed[2]
-
-                T1 += (
-                    A_i
-                    * (a * x + b * y + c * z)
-                    / (np.sqrt(x**2 + y**2 + z**2) ** 4)
-                    * np.array([x, y, z])
-                )
-                T2 += (
-                    B_i
-                    * (a * x + b * y + c * z)
-                    / (np.sqrt(x**2 + y**2 + z**2) ** 3)
-                    * np.array([a, b, c])
-                )
-                T3 += (
-                    D_i
-                    * (a * x + b * y + c * z) ** 2
-                    / (np.sqrt(x**2 + y**2 + z**2) ** 4)
-                    * np.array([a, b, c])
-                )
-
-        T_tot_bf = T1 + T2 + T3
-
-        # Compute the total acceleration on the spacecraft (Multiply the constant terms outside the SUM)
-        nplate_srp_acceleration_bf = (
-            nplate_srp_acceleration_bf_p1 * nplate_srp_acceleration_bf_p23
-        )
-
-        # Transform the total acceleration from SC-fixed to original_inertial r.f.
-        nplate_srp_acceleration = DCM_body2inertial @ nplate_srp_acceleration_bf
-        T_tot = DCM_body2inertial @ T_tot_bf
-
-        return T_tot
+        acceleration = np.zeros(3)
+        for core, inputs, _, _ in self._rust_terms(position, current_state, epoch, body):
+            acceleration = acceleration + np.asarray(core.compute_acceleration(*inputs))
+        return acceleration
 
     def _compute_partial_by_position(
         self, position: np.ndarray, current_state: dict, epoch: float, body: Spacecraft
@@ -508,7 +847,15 @@ class nPlateSRP(DynamicModel):
         Computes the partial derivatives of the SRP acceleration with respect to position.
 
         Determines how the SRP acceleration varies as a function of
-        the spacecraft's position relative to the Sun.
+        the spacecraft's position relative to the Sun. Analytical, in rust
+        (``NPlateSRPCore.compute_jacobian``): with s = DCM^T (-sun2body) the
+        SC-fixed body->Sun vector and T the SC-fixed acceleration,
+        da/dr = -DCM @ dT/ds @ DCM^T for an attitude that does not follow the
+        position (CK, inertially fixed). The ``nadirPointingSun`` attitude
+        turns with the position, so its DCM derivative adds
+        sum_j T_j dDCM[:, j]/dr + DCM @ dT/ds @ (ds/dr through the attitude).
+        Body-frame normals are held fixed in the body, CK and named-frame
+        normals in ``base_frame``; the mass is held fixed.
 
         Parameters
         ----------
@@ -529,258 +876,77 @@ class nPlateSRP(DynamicModel):
         partial_a_by_pos : np.ndarrays
             The 3x3 Jacobian matrix of SRP acceleration with respect to position. Assumed in units
             of :math:`\\frac{1}{s^2}`.
+
+        Raises
+        ------
+        RustCoreUnavailableError
+            If the rust extension is not available.
+        AutogradTracingError
+            If autograd is tracing ``position`` or eta_srp.
         """
-        # Initialize the total partial derivative matrix
-        partial_a_by_pos_bf = np.zeros(
-            (3, 3)
-        )  # Jacobian matrix in 1/s^2, body-fixed frame
-        partial_a_by_pos = np.zeros((3, 3))  # Jacobian matrix in 1/s^2, input frame
+        jacobian = np.zeros((3, 3))
+        for core, inputs, D_r, _ in self._rust_terms(
+            position, current_state, epoch, body, derivatives=True
+        ):
+            jacobian = jacobian + np.asarray(
+                core.compute_jacobian(*inputs, D_r)
+            ).reshape((3, 3))
+        return jacobian
 
-        # Compute the Sun-to-Origin vector
-        sun2origin = SpiceManager.get_pos(
-            self._origin_spice_name,
-            epoch,
-            self._frame,
-            "SUN",
-        ).values  # Assumed in km
+    def _compute_partial_by_velocity(
+        self, position: np.ndarray, current_state: dict, epoch: float, body: Spacecraft
+    ) -> np.ndarray:
+        """
+        Computes the partial derivatives of the SRP acceleration with respect to velocity.
 
-        # Compute the Sun-to-Body vector
-        sun2body = sun2origin + position
+        Non-zero only for the body-frame plates under the
+        ``nadirPointingSun`` attitude, whose Y axis follows the heliocentric
+        velocity: analytical, in rust
+        (``NPlateSRPCore.compute_jacobian_by_velocity``), from the DCM
+        derivative with respect to the velocity. Body-frame normals are held
+        fixed in the body, CK and named-frame normals in ``base_frame``; the
+        mass is held fixed.
 
-        # Get the SRP scale factor
-        eta_srp = self._get_eta_srp(current_state, body)
+        Parameters
+        ----------
+        position : np.ndarray
+            3x1 vector describing the spacecraft's position. Assumed in units of kilometers.
 
-        # Get and validate the attitude mode
-        attitude_mode = getattr(body, "attitudeMode", None)
-        # allowed_attitude_modes = ("CK", "nadir_pointing_to_sun", "inertialFixedAttitude")
-        # if attitude_mode not in allowed_attitude_modes:
-        #     raise ValueError(
-        #         f"Invalid attitudeMode '{attitude_mode}'. Must be one of: {allowed_attitude_modes}."
-        #     )
+        current_state : dict
+            Dictionary containing the current state parameters.
 
-        # AttitudeMode cases
-        if attitude_mode == "CK":
-            quat_inertial2body = body.get_attitude(J2000, epoch)
-            DCM_body2inertial = spiceypy.q2m(quat_inertial2body).T
-        elif attitude_mode == "nadir_pointing_to_sun":
-            DCM_body2inertial = body.inertial_to_body_DCM_nadir_pointing_to_sun(
-                self.origin_name,
-                self._frame,
-                ArrayWUnits(sun2body, km),
-                current_state,
-                epoch,
-                body,
-            )
-        elif attitude_mode == "inertialFixedAttitude":
-            if not (
-                isinstance(body.fixedInertialAttitude, np.ndarray)
-                and body.fixedInertialAttitude.shape == (3, 3)
-            ):
-                raise ValueError(
-                    "fixedInertialAttitude must be a 3x3 numpy array. represent the rotation from Body fixed to inertial frame"
-                )
-            DCM_body2inertial = body.fixedInertialAttitude
+        epoch : float
+            Current simulation epoch in seconds.
 
-        # Compute Body-to-Sun vectors in SC-fixed reference frame
-        # body2Sun_SCfixed = (self.inertial_to_body_DCM(epoch) @ -sun2body.transpose()).transpose() #DCM_body2inertial.T @ -sun2body
-        body2Sun_SCfixed = (DCM_body2inertial.T @ -sun2body.transpose()).transpose()
-        body2Sun_SCfixed_norm = np.linalg.norm(body2Sun_SCfixed)
+        body : Spacecraft
+            The spacecraft for which SRP acceleration is calculated.
 
-        # Compute part1 of the acceleration formula made of constants and squared distance
-        dT_dxyz_tot = np.zeros((3, 3))
-        normals = self.plate_model.get_all_normals(epoch, self.spacecraft.spice_id)
+        Returns
+        -------
+        partial_a_by_vel : np.ndarray
+            The 3x3 Jacobian matrix of SRP acceleration with respect to velocity. Assumed in units
+            of :math:`\\frac{1}{s}`.
 
-        for ii in range(len(self.plate_model.names)):
-            normal_plate_ii_versor = normals[ii] / np.linalg.norm(normals[ii])
-            C_dref_plate_ii = self.plate_model.diff_ref_coeffs[ii]
-            C_sref_plate_ii = self.plate_model.spec_ref_coeffs[ii]
-            A_plate_ii = self.plate_model.areas[ii].values  # Assumed in km^2
-
-            # Compute C + A, B, D constant terms of the partials
-            m_t = self._spacecraft.mass(epoch).values  # Assumed in kg
-            C_i = self.P_SRP * (eta_srp / m_t) * A_plate_ii
-            A_i = -C_i * (1 - C_sref_plate_ii)
-            B_i = (-2 / 3) * (C_dref_plate_ii) * C_i
-            D_i = -2 * (C_sref_plate_ii) * C_i
-
-            # For simplicity, extract pos + face normal vectors
-            a = normal_plate_ii_versor[0]
-            b = normal_plate_ii_versor[1]
-            c = normal_plate_ii_versor[2]
-            x = body2Sun_SCfixed[0]
-            y = body2Sun_SCfixed[1]
-            z = body2Sun_SCfixed[2]
-            r = body2Sun_SCfixed_norm
-
-            abc_9 = np.array(
-                [normal_plate_ii_versor, normal_plate_ii_versor, normal_plate_ii_versor]
-            )
-
-            # Compute partials of T1 terms
-            dT1x_dx = (b * y + c * z) * (-4 * x**2 + r**2) + 2 * a * x * (
-                -2 * x**2 + r**2
-            )
-            dT1x_dy = x * (-4 * y * (a * x + c * z) + b * (r**2 - 4 * y**2))
-            dT1x_dz = x * (-4 * z * (a * x + b * y) + c * (r**2 - 4 * z**2))
-            dT1y_dx = y * (-4 * x * (b * y + c * z) + a * (r**2 - 4 * x**2))
-            dT1y_dy = (a * x + c * z) * (r**2 - 4 * y**2) + 2 * b * y * (
-                r**2 - 2 * y**2
-            )
-            dT1y_dz = y * (-4 * z * (a * x + b * y) + c * (r**2 - 4 * z**2))
-            dT1z_dx = z * (-4 * x * (b * y + c * z) + a * (r**2 - 4 * x**2))
-            dT1z_dy = z * (-4 * y * (a * x + c * z) + b * (r**2 - 4 * y**2))
-            dT1z_dz = (a * x + b * y) * (r**2 - 4 * z**2) + 2 * c * z * (
-                r**2 - 2 * z**2
-            )
-            row_1 = np.array([dT1x_dx, dT1x_dy, dT1x_dz])
-            row_2 = np.array([dT1y_dx, dT1y_dy, dT1y_dz])
-            row_3 = np.array([dT1z_dx, dT1z_dy, dT1z_dz])
-            T1 = np.array([row_1, row_2, row_3])
-
-            dT1_dxyz = (A_i / (r**6)) * T1
-
-            # Compute partials of T2 terms
-            dT2_dx = -3 * x * (b * y + c * z) + a * (r**2 - 3 * x**2)
-            dT2_dy = -3 * y * (a * x + c * z) + b * (r**2 - 3 * y**2)
-            dT2_dz = -3 * z * (a * x + b * y) + c * (r**2 - 3 * z**2)
-            vals = np.array([dT2_dx, dT2_dy, dT2_dz])
-            T2 = np.array([vals, vals, vals])
-
-            dT2_dxyz = (B_i / (r**5)) * (T2 * abc_9.transpose())
-
-            # Compute partials of T3 terms
-            dT3_dx = (
-                -2
-                * (a * x + b * y + c * z)
-                * (2 * x * (b * y + c * z) + a * (2 * x**2 - r**2))
-            )
-            dT3_dy = (
-                -2
-                * (a * x + b * y + c * z)
-                * (2 * y * (a * x + c * z) + b * (2 * y**2 - r**2))
-            )
-            dT3_dz = (
-                -2
-                * (a * x + b * y + c * z)
-                * (2 * z * (a * x + b * y) + c * (2 * z**2 - r**2))
-            )
-            T3 = np.zeros((3, 3))
-            T3[0] = np.array([dT3_dx, dT3_dy, dT3_dz])
-            T3[1] = T3[0]
-            T3[2] = T3[0]
-            dT3_dxyz = (D_i / (r**6)) * (T3 * abc_9.transpose())
-
-            # Put together the partials of T1, T2, and T3 terms
-            dT_dxyz = dT1_dxyz + dT2_dxyz + dT3_dxyz
-
-            # Compute the angle theta between face's normal and body2Sun vector
-            theta = self._angle_between(normal_plate_ii_versor, body2Sun_SCfixed)
-
-            # Compute the logic parameter H(theta)
-            cos_theta = np.cos(theta)
-            if cos_theta <= 0:
-                H_theta = 0
-            elif cos_theta > 0:
-                H_theta = 1
-
-            # Compute the plate component on the acceleration (The terms within the SUM)
-            if H_theta == 1:
-                dT_dxyz_tot = dT_dxyz_tot + dT_dxyz
-
-        partial_a_by_pos_bf = dT_dxyz_tot
-
-        # Transform the partial acceleration matrix from SC-fixed to original_inertial r.f.
-        # partial_a_by_pos = self.inertial_to_body_DCM(epoch) @ partial_a_by_pos_bf
-
-        DCM = DCM_body2inertial.T
-        T = dT_dxyz_tot.T
-        daix_dxi = (
-            DCM[0, 0]
-            * (T[0, 0] * -DCM[0, 0] + T[1, 0] * -DCM[1, 0] + T[2, 0] * -DCM[2, 0])
-            + DCM[1, 0]
-            * (T[0, 1] * -DCM[0, 0] + T[1, 1] * -DCM[1, 0] + T[2, 1] * -DCM[2, 0])
-            + DCM[2, 0]
-            * (T[0, 2] * -DCM[0, 0] + T[1, 2] * -DCM[1, 0] + T[2, 2] * -DCM[2, 0])
-        )
-
-        daix_dyi = (
-            DCM[0, 0]
-            * (T[0, 0] * -DCM[0, 1] + T[1, 0] * -DCM[1, 1] + T[2, 0] * -DCM[2, 1])
-            + DCM[1, 0]
-            * (T[0, 1] * -DCM[0, 1] + T[1, 1] * -DCM[1, 1] + T[2, 1] * -DCM[2, 1])
-            + DCM[2, 0]
-            * (T[0, 2] * -DCM[0, 1] + T[1, 2] * -DCM[1, 1] + T[2, 2] * -DCM[2, 1])
-        )
-
-        daix_dzi = (
-            DCM[0, 0]
-            * (T[0, 0] * -DCM[0, 2] + T[1, 0] * -DCM[1, 2] + T[2, 0] * -DCM[2, 2])
-            + DCM[1, 0]
-            * (T[0, 1] * -DCM[0, 2] + T[1, 1] * -DCM[1, 2] + T[2, 1] * -DCM[2, 2])
-            + DCM[2, 0]
-            * (T[0, 2] * -DCM[0, 2] + T[1, 2] * -DCM[1, 2] + T[2, 2] * -DCM[2, 2])
-        )
-
-        daiy_dxi = (
-            DCM[0, 1]
-            * (T[0, 0] * -DCM[0, 0] + T[1, 0] * -DCM[1, 0] + T[2, 0] * -DCM[2, 0])
-            + DCM[1, 1]
-            * (T[0, 1] * -DCM[0, 0] + T[1, 1] * -DCM[1, 0] + T[2, 1] * -DCM[2, 0])
-            + DCM[2, 1]
-            * (T[0, 2] * -DCM[0, 0] + T[1, 2] * -DCM[1, 0] + T[2, 2] * -DCM[2, 0])
-        )
-
-        daiy_dyi = (
-            DCM[0, 1]
-            * (T[0, 0] * -DCM[0, 1] + T[1, 0] * -DCM[1, 1] + T[2, 0] * -DCM[2, 1])
-            + DCM[1, 1]
-            * (T[0, 1] * -DCM[0, 1] + T[1, 1] * -DCM[1, 1] + T[2, 1] * -DCM[2, 1])
-            + DCM[2, 1]
-            * (T[0, 2] * -DCM[0, 1] + T[1, 2] * -DCM[1, 1] + T[2, 2] * -DCM[2, 1])
-        )
-
-        daiy_dzi = (
-            DCM[0, 1]
-            * (T[0, 0] * -DCM[0, 2] + T[1, 0] * -DCM[1, 2] + T[2, 0] * -DCM[2, 2])
-            + DCM[1, 1]
-            * (T[0, 1] * -DCM[0, 2] + T[1, 1] * -DCM[1, 2] + T[2, 1] * -DCM[2, 2])
-            + DCM[2, 1]
-            * (T[0, 2] * -DCM[0, 2] + T[1, 2] * -DCM[1, 2] + T[2, 2] * -DCM[2, 2])
-        )
-
-        daiz_dxi = (
-            DCM[0, 2]
-            * (T[0, 0] * -DCM[0, 0] + T[1, 0] * -DCM[1, 0] + T[2, 0] * -DCM[2, 0])
-            + DCM[1, 2]
-            * (T[0, 1] * -DCM[0, 0] + T[1, 1] * -DCM[1, 0] + T[2, 1] * -DCM[2, 0])
-            + DCM[2, 2]
-            * (T[0, 2] * -DCM[0, 0] + T[1, 2] * -DCM[1, 0] + T[2, 2] * -DCM[2, 0])
-        )
-
-        daiz_dyi = (
-            DCM[0, 2]
-            * (T[0, 0] * -DCM[0, 1] + T[1, 0] * -DCM[1, 1] + T[2, 0] * -DCM[2, 1])
-            + DCM[1, 2]
-            * (T[0, 1] * -DCM[0, 1] + T[1, 1] * -DCM[1, 1] + T[2, 1] * -DCM[2, 1])
-            + DCM[2, 2]
-            * (T[0, 2] * -DCM[0, 1] + T[1, 2] * -DCM[1, 1] + T[2, 2] * -DCM[2, 1])
-        )
-
-        daiz_dzi = (
-            DCM[0, 2]
-            * (T[0, 0] * -DCM[0, 2] + T[1, 0] * -DCM[1, 2] + T[2, 0] * -DCM[2, 2])
-            + DCM[1, 2]
-            * (T[0, 1] * -DCM[0, 2] + T[1, 1] * -DCM[1, 2] + T[2, 1] * -DCM[2, 2])
-            + DCM[2, 2]
-            * (T[0, 2] * -DCM[0, 2] + T[1, 2] * -DCM[1, 2] + T[2, 2] * -DCM[2, 2])
-        )
-
-        row_1 = [daix_dxi, daix_dyi, daix_dzi]
-        row_2 = [daiy_dxi, daiy_dyi, daiy_dzi]
-        row_3 = [daiz_dxi, daiz_dyi, daiz_dzi]
-        partial_a_by_pos_math = np.array([row_1, row_2, row_3])
-
-        return partial_a_by_pos_math
+        Raises
+        ------
+        RustCoreUnavailableError
+            If the rust extension is not available.
+        AutogradTracingError
+            If autograd is tracing ``position`` or eta_srp.
+        """
+        jacobian = np.zeros((3, 3))
+        if not self.depends_on_velocity:
+            return jacobian
+        for core, inputs, _, D_v in self._rust_terms(
+            position, current_state, epoch, body, derivatives=True
+        ):
+            if D_v is None:
+                # SPICE-oriented plates do not turn with the velocity
+                continue
+            jacobian = jacobian + np.asarray(
+                core.compute_jacobian_by_velocity(*inputs, D_v)
+            ).reshape((3, 3))
+        return jacobian
 
     def _compute_partial_by_eta(
         self, position: np.ndarray, current_state: dict, epoch: float, body: Spacecraft

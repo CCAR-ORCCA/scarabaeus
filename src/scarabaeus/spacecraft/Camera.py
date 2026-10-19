@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Orbital Research Cluster for Celestial Applications (ORCCA) Lab, University of Colorado at Boulder
 # SPDX-License-Identifier: ISC
-from scarabaeus import Units, ArrayWUnits, Instrument
+from scarabaeus import Units, ArrayWUnits, Frame, Instrument
 
 import scarabaeus.utils.NumpyWrapper as np
 
@@ -41,8 +41,10 @@ class Camera(Instrument):
     associated_body_spice_id : int | str
         SPICE ID of the associated body.
 
-    camera_frame : str
-        Reference frame of the camera.
+    camera_frame : str or Frame
+        Reference frame of the camera. Either a SPICE frame name or a
+        :class:`~scarabaeus.Frame`; it is normalised to the name and the object
+        is available from :attr:`camera_frame_object`.
 
     measurement_type : str
         Type of measurement (e.g., image, lidar, etc.).
@@ -76,7 +78,7 @@ class Camera(Instrument):
         self,
         name: str,
         associated_body_spice_id: int | str,
-        camera_frame: str,
+        camera_frame: str | Frame,
         fov_angular: ArrayWUnits,
         fov_pixels: tuple,
         focal_length: ArrayWUnits,
@@ -89,7 +91,17 @@ class Camera(Instrument):
 
         # Camera-specific attributes
         self._associated_body_spice_id = associated_body_spice_id
-        self._camera_frame = camera_frame
+        # Normalise the frame at the boundary: SPICE calls need the name while
+        # ArrayWFrame needs the object, so store the name and build the object
+        # on demand (see camera_frame_object). Accepting both without
+        # normalising previously made get_rotation_to_camera fall through to
+        # the identity attitude whenever a Frame was passed.
+        self._camera_frame = (
+            camera_frame.name if isinstance(camera_frame, Frame) else camera_frame
+        )
+        self._camera_frame_object = (
+            camera_frame if isinstance(camera_frame, Frame) else None
+        )
         self._focal_length = focal_length  # Focal length in millimeters
         self._fov_angular = fov_angular
         self._fov_pixels = fov_pixels
@@ -102,9 +114,12 @@ class Camera(Instrument):
         # Compute focal length in pixels
         self._focal_length_pixels = focal_length / self._ifov  # pixels
 
-        # Compute the camera calibration matrix
-        a = self.focal_length_pixels[0].values / self._ifov[0].values
-        e = self.focal_length_pixels[1].values / self._ifov[1].values
+        # Compute the camera calibration matrix. K holds the focal length in
+        # PIXELS, i.e. f/delta — which is exactly _focal_length_pixels. Dividing
+        # that by the pixel pitch again would give f/delta^2, off by one factor
+        # of the pitch (~1e13 px for a 150 mm / 25 urad camera).
+        a = self.focal_length_pixels[0].values
+        e = self.focal_length_pixels[1].values
         c, f = self.pp_offset.values[0], self.pp_offset.values[1]
         self._calibration_matrix = np.array([[a, 0, c], [0, e, f]])
 
@@ -122,11 +137,28 @@ class Camera(Instrument):
         return self._associated_body_spice_id
 
     @property
-    def camera_frame(self) -> int | str:
+    def camera_frame(self) -> str:
         """
-        SPICE-defined frame.
+        Name of the SPICE-defined camera frame.
+
+        Always the frame *name*, whether the camera was built from a string or
+        from a :class:`~scarabaeus.Frame`. This is what the SPICE calls
+        (``pxform``, ``spkezr``) expect; use :attr:`camera_frame_object` where
+        a :class:`~scarabaeus.Frame` is needed.
         """
         return self._camera_frame
+
+    @property
+    def camera_frame_object(self) -> Frame:
+        """
+        The camera frame as a :class:`~scarabaeus.Frame` object.
+
+        Built lazily from :attr:`camera_frame` and cached, so cameras whose
+        frame is not known to SPICE only fail if this is actually used.
+        """
+        if self._camera_frame_object is None:
+            self._camera_frame_object = Frame(self._camera_frame)
+        return self._camera_frame_object
 
     @property
     def fov_angular(self) -> ArrayWUnits:
@@ -240,7 +272,7 @@ class Camera(Instrument):
     # ----------------#
     def get_rotation_to_camera(self, epoch_time: float) -> np.ndarray:
         """
-        Return the 3×3 rotation matrix that maps vectors from J2000 to camera frame.
+        Return the (3, 3) rotation matrix that maps vectors from J2000 to camera frame.
 
         Tries SPICE first (requires a SPICE camera-frame kernel). Falls back to a
         manually set attitude matrix (``camera.attitude_matrix = R``), or identity
@@ -263,7 +295,7 @@ class Camera(Instrument):
     @property
     def attitude_matrix(self) -> np.ndarray:
         """
-        Fallback 3×3 rotation matrix (J2000 → camera frame) used when SPICE
+        Fallback (3, 3) rotation matrix (J2000 to camera frame) used when SPICE
         does not have the camera frame defined. Identity by default.
         """
         return getattr(self, "_attitude_matrix", np.eye(3))

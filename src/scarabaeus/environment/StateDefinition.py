@@ -27,6 +27,14 @@ class StateDefinition:
 
     Notes
     -----
+    **Custom components**
+
+    Beyond the built-in component names, user scripts may register their own
+    solve-for parameters with :meth:`register_custom_parameter` (or implicitly
+    through :meth:`custom_param`) so that a
+    :class:`~scarabaeus.CustomDynamicModel` can estimate them without any
+    change to the library source.
+
     **Ordering rules**
 
     * Dynamic components must appear **before** static components.
@@ -35,7 +43,6 @@ class StateDefinition:
     * Each of ``dv_man`` / ``dv_man1`` / ``dv_man2`` may appear at most once per state.
     * ``dRA[N]`` and ``dDEC[N]`` finite-burn angle pairs must both be present for the same
       owner and numeric suffix.
-    * ``"considered"`` estimation mode is not yet fully implemented.
 
     **Estimation and dynamics modes**
 
@@ -80,6 +87,18 @@ class StateDefinition:
          - Dimensionless
          - --
          - Cannonball SRP scale factor. Nominal value 1.0.
+       * - ``eta_thermal``
+         - Thermal radiation
+         - 1
+         - Dimensionless
+         - --
+         - Thermal re-radiation scale factor. Nominal value 1.0.
+       * - ``eta_antenna``
+         - Antenna radiation
+         - 1
+         - Dimensionless
+         - --
+         - Antenna/LIDAR radiation pressure scale factor. Nominal value 1.0.
        * - ``k_thrust[N]``
          - Finite burn
          - 1
@@ -109,7 +128,80 @@ class StateDefinition:
          - 3
          - Length
          - km
-         - ECEF position correction for station ``[tag]``.
+         - Cartesian correction in the station's declared body-fixed frame.
+       * - ``gs_delta_location_CYL_[tag]``
+         - Ground station
+         - 3
+         - Length
+         - km
+         - Local cylindrical delta (radius, east arc length, Z).
+       * - ``eop_delta_pole_x``, ``eop_delta_pole_y``
+         - Earth or Earth station
+         - 1 each
+         - Angle
+         - rad
+         - Intended minus nominal terrestrial xp/yp; static measurement parameters.
+       * - ``eop_delta_ut1``
+         - Earth or Earth station
+         - 1
+         - Time
+         - sec
+         - Intended minus nominal UT1; positive advances spin.
+       * - ``eop_delta_celestial_pole_x``, ``eop_delta_celestial_pole_y``
+         - Earth or Earth station
+         - 1 each
+         - Angle
+         - rad
+         - Intended minus nominal celestial pole offsets dX/dY (nutation).
+       * - ``body_orientation_delta``
+         - Central body or station
+         - 3
+         - Angle
+         - rad
+         - Active body-fixed X/Y/Z station rotation; usable on any planet.
+       * - ``love_h2``, ``shida_l2``
+         - Central body or station
+         - 1 each
+         - unitless
+         - —
+         - Degree-2 displacement Love and Shida numbers. Scale how far the
+           solid tide moves a station, so they need an attached
+           :class:`~scarabaeus.SolidTide`; without one the partial is zero.
+       * - ``love_k_[n]_[m]``
+         - Central body
+         - 1 each
+         - unitless
+         - —
+         - Degree-``n`` order-``m`` *potential* Love number. Scales how far the
+           solid tide moves the gravity field, a different quantity from
+           ``love_h2``. Reaches the observable only through the trajectory, so
+           it needs a :class:`~scarabaeus.SolidTide` on the harmonics model.
+       * - ``tropo_zenith_delay_[tag]``
+         - Ground station
+         - 1
+         - Length
+         - km
+         - Estimated zenith tropospheric delay, mapped to the slant direction
+           by the Chao wet mapping. Additive on the modelled troposphere.
+       * - ``iono_zenith_delay_[tag]``
+         - Ground station
+         - 1
+         - Length
+         - km
+         - Estimated zenith ionospheric delay **at 2295 MHz**, scaled by
+           (2295 MHz / f)^2 and mapped by the thin-shell obliquity.
+       * - ``dt_dv``
+         - Spacecraft
+         - 1
+         - Time
+         - sec
+         - Time offset of an impulsive maneuver.
+       * - ``dv_smooth``
+         - Spacecraft
+         - 3
+         - Velocity
+         - km/sec
+         - Smoothed impulsive burn components.
        * - ``range_bias_[tag]``
          - Radiometric bias
          - dyn
@@ -124,16 +216,48 @@ class StateDefinition:
          - Additive range-rate bias for station ``[tag]``.
        * - ``range_bias_RU_[tag]``
          - Radiometric bias
-         - 1
+         - dyn
          - Dimensionless
          - RU
-         - Range bias in range units for station ``[tag]``.
+         - Range bias in range units for station ``[tag]``; one element
+           for every pass or one per pass.
        * - ``rangerate_bias_Hz_[tag]``
          - Radiometric bias
-         - 1
+         - dyn
          - per Time
          - Hz
-         - Doppler bias in Hz for station ``[tag]``.
+         - Doppler bias in Hz for station ``[tag]``; one element for every
+           pass or one per pass.
+       * - ``dor_bias_[tag]``
+         - Radiometric bias
+         - dyn
+         - Length
+         - km
+         - Range bias on the first station ``[tag]`` of a differential
+           one-way range; one element for every pass or one per pass.
+       * - ``uplink_delay_bias_[tag]``
+         - Ground station
+         - 1
+         - Time
+         - sec
+         - Electronic delay correction at t1 (transmit) for station ``[tag]``,
+           common to its passes; enters the round-trip light time of range
+           measurements.
+       * - ``transponder_delay_bias``
+         - Spacecraft
+         - 1
+         - Time
+         - sec
+         - Transponder delay correction at t2, common to every station and
+           pass; enters the round-trip light time of range measurements.
+       * - ``downlink_delay_bias_[tag]``
+         - Ground station
+         - 1
+         - Time
+         - sec
+         - Electronic delay correction at t3 (receive) for station ``[tag]``,
+           common to its passes; enters the round-trip light time of range
+           measurements.
        * - ``angular_bias_[tag]``
          - Optical navigation
          - dyn
@@ -194,6 +318,12 @@ class StateDefinition:
          - Dimensionless
          - deg/day
          - Prime-meridian rotation rate (IAU convention).
+       * - ``pole_w0``
+         - Body orientation
+         - 1
+         - Angle
+         - rad
+         - Prime-meridian angle at J2000 (IAU convention).
        * - ``A2_yark``
          - Small-body
          - 1
@@ -224,9 +354,34 @@ class StateDefinition:
          - per Time
          - 1/s
          - Piecewise FOGM correlation time; same sizing as ``a_pfogm``.
+       * - ``gamma_rel``
+         - Relativity
+         - 1
+         - Dimensionless
+         - --
+         - PPN parameter gamma in the light-time delay (Moyer 12-24).
+       * - ``solar_corona_scale``
+         - Media
+         - 1
+         - Dimensionless
+         - --
+         - Multiplicative scale on the solar-corona delay (Moyer 10-76).
+       * - ``a_fourier``
+         - Empirical accel.
+         - 3*(2N+1)
+         - Acceleration
+         - km/s^2
+         - Fourier series coefficients; dim = 3 x (2 x degree + 1).
+       * - ``a_ppoly``
+         - Empirical accel.
+         - 3*(N_b+p)
+         - Acceleration
+         - km/s^2
+         - Piecewise polynomial coefficients; order p = 0 or 1 over N_b batches.
 
     *dyn* in the Dim column means the dimension is inferred from the supplied initial value.
-    For ``a_pfogm`` / ``beta_pfogm`` it must be a multiple of 3.
+    For ``a_pfogm`` / ``beta_pfogm`` / ``a_fourier`` / ``a_ppoly`` it must be a
+    multiple of 3.
 
     Examples
     --------
@@ -304,6 +459,23 @@ class StateDefinition:
     # endregion Constructor #
     # -----------------------#
 
+    # Derived from ValueError: these replace the generic raises this class used
+    # before, and callers (including the test suite) catch ValueError.
+    class UnknownComponentError(ValueError):
+        """Raised when a component name matches no allowed (built-in or custom) pattern."""
+
+    class ReservedComponentNameError(ValueError):
+        """Raised when a custom parameter name collides with a built-in component."""
+
+    class CustomParameterConflictError(ValueError):
+        """Raised when a custom parameter is re-registered with a different definition."""
+
+    # Registry of user-defined state components, shared by every StateDefinition.
+    # Layout matches _generate_allowed_state_dictionary entries:
+    #     name -> [physical_type, size, compiled_pattern]
+    # ``physical_type`` may be None, which disables the unit-dimension check.
+    _custom_state_components: Dict[str, List] = {}
+
     # ----------------------#
     # region    Properties #
     # ----------------------#
@@ -338,7 +510,6 @@ class StateDefinition:
             Position vector with units (must be 3D with Length dimensions).
         estimation : str, optional
             Estimation mode: "estimated" or "considered". Defaults to "estimated".
-            Note: "considered" is not yet implemented.
         dynamics : str, optional
             Dynamics mode: "dynamic" or "static". Defaults to "dynamic".
 
@@ -352,8 +523,6 @@ class StateDefinition:
         ValueError
             If component validation fails (wrong dimension, physical type, etc.)
             or if duplicate component for the same owner exists.
-        NotImplementedError
-            If estimation="considered" is specified.
         """
         est, dyn = self._validate_modes(estimation, dynamics)
         self._enforce_global_order(est, dyn)
@@ -380,7 +549,6 @@ class StateDefinition:
             Velocity vector with units (must be 3D with Velocity dimensions).
         estimation : str, optional
             Estimation mode: "estimated" or "considered". Defaults to "estimated".
-            Note: "considered" is not yet implemented.
         dynamics : str, optional
             Dynamics mode: "dynamic" or "static". Defaults to "dynamic".
 
@@ -394,8 +562,6 @@ class StateDefinition:
         ValueError
             If velocity is not added immediately after position, if validation fails,
             or if duplicate component for the same owner exists.
-        NotImplementedError
-            If estimation="considered" is specified.
         """
         # Check that position was added immediately before
         if not self._last_component_was_position:
@@ -442,7 +608,6 @@ class StateDefinition:
             Parameter dimension/size. If None, inferred from value length. Defaults to None.
         estimation : str, optional
             Estimation mode: "estimated" or "considered". Defaults to "estimated".
-            Note: "considered" is not yet implemented.
         dynamics : str, optional
             Dynamics mode: "dynamic" or "static". Defaults to "dynamic".
 
@@ -456,8 +621,6 @@ class StateDefinition:
         ValueError
             If parameter name is not allowed, dimension/physical type mismatch,
             multiple delta-v maneuvers are specified, or duplicate component exists.
-        NotImplementedError
-            If estimation="considered" is specified.
         """
         dim = dimension if dimension is not None else value.shape[0]
         est, dyn = self._validate_modes(estimation, dynamics)
@@ -505,6 +668,176 @@ class StateDefinition:
         self._last_component_was_position = False
 
         return self
+
+    def custom_param(
+        self,
+        name,
+        owner,
+        value,
+        dimension=None,
+        estimation="estimated",
+        dynamics="static",
+        physical_type=None,
+    ):
+        """
+        Register and add a user-defined parameter in a single call.
+
+        Convenience wrapper around :meth:`register_custom_parameter` followed by
+        :meth:`param`, so a script can introduce a brand-new solve-for parameter
+        — one consumed by a :class:`~scarabaeus.CustomDynamicModel` — without
+        touching the library source.
+
+        Parameters
+        ----------
+        name : str
+            Parameter name (e.g. ``"drag_cd"``). Must not collide with a
+            built-in component name.
+        owner : Body, Spacecraft, GroundStation, or None
+            The body this parameter belongs to.
+        value : ArrayWUnits or ArrayWFrame
+            Initial value with units.
+        dimension : int, optional
+            Parameter dimension. Inferred from ``value`` when ``None``.
+        estimation : str, optional
+            ``"estimated"`` (default) or ``"considered"``.
+        dynamics : str, optional
+            ``"static"`` (default, constant parameter) or ``"dynamic"`` (the
+            parameter has its own ODE, supplied through
+            :class:`~scarabaeus.CustomParameter`).
+        physical_type : str, optional
+            Dimension name enforced on ``value`` (e.g. ``"Acceleration"``).
+            ``None`` (default) skips the check.
+
+        Returns
+        -------
+        StateDefinition
+            Self, for method chaining.
+
+        Examples
+        --------
+        .. code-block:: python
+
+            state_def = (scb.StateDefinition()
+                .position(sc, pos_0)
+                .velocity(sc, vel_0)
+                .custom_param("drag_cd", sc, scb.ArrayWFrame(2.2, None, None))
+            )
+        """
+        dim = dimension if dimension is not None else value.shape[0]
+        self.register_custom_parameter(name, dimension=dim, physical_type=physical_type)
+
+        return self.param(
+            name,
+            owner,
+            value,
+            dimension=dimension,
+            estimation=estimation,
+            dynamics=dynamics,
+        )
+
+    @classmethod
+    def register_custom_parameter(
+        cls, name: str, dimension=1, physical_type: str | None = None
+    ) -> None:
+        """
+        Declare a user-defined state component so it passes state validation.
+
+        Registration is global and idempotent: re-registering the same name with
+        the same dimension and physical type is a no-op, which lets a script
+        build several state definitions (truth, reference, filter) from the same
+        parameter declaration.
+
+        Parameters
+        ----------
+        name : str
+            Component name. Must be a plain identifier (letters, digits and
+            underscores) and must not match any built-in component pattern.
+        dimension : int or str, optional
+            Fixed component size, or ``"dynamic"`` to accept any size.
+            Defaults to 1.
+        physical_type : str, optional
+            Required unit-dimension name (e.g. ``"Acceleration"``,
+            ``"Dimensionless"``). ``None`` (default) disables the check.
+
+        Raises
+        ------
+        StateDefinition.ReservedComponentNameError
+            If ``name`` is not a valid identifier or collides with a built-in
+            component pattern.
+        StateDefinition.CustomParameterConflictError
+            If ``name`` was already registered with a different dimension or
+            physical type.
+
+        See Also
+        --------
+        scarabaeus.CustomParameter : Declares a parameter and registers it here.
+        scarabaeus.CustomDynamicModel : Consumes the registered parameter.
+        """
+        if not re.fullmatch(r"[A-Za-z_]\w*", str(name)):
+            raise cls.ReservedComponentNameError(
+                f"Custom parameter name '{name}' is not a valid identifier. "
+                "Use letters, digits and underscores, starting with a letter "
+                "or underscore."
+            )
+
+        # Built-in names are matched case-insensitively downstream (the STM
+        # partial keys are lower-cased), so guard against a case-only collision.
+        builtins = cls._generate_builtin_state_dictionary()
+        for key, (_, _, pattern) in builtins.items():
+            if pattern.match(name) or pattern.match(str(name).lower()):
+                raise cls.ReservedComponentNameError(
+                    f"Custom parameter name '{name}' collides with the built-in "
+                    f"state component '{key}'. Choose a different name."
+                )
+
+        lowered = str(name).lower()
+        for existing in cls._custom_state_components:
+            if existing != name and existing.lower() == lowered:
+                raise cls.CustomParameterConflictError(
+                    f"Custom parameter '{name}' differs from the already "
+                    f"registered '{existing}' only by case. Partial-derivative "
+                    "keys are case-insensitive, so the two cannot coexist."
+                )
+
+        entry = [physical_type, dimension, re.compile(rf"^({re.escape(name)})$")]
+
+        previous = cls._custom_state_components.get(name)
+        if previous is not None and (
+            previous[0] != entry[0] or previous[1] != entry[1]
+        ):
+            raise cls.CustomParameterConflictError(
+                f"Custom parameter '{name}' is already registered with "
+                f"physical_type={previous[0]!r} and dimension={previous[1]!r}; "
+                f"cannot re-register with physical_type={entry[0]!r} and "
+                f"dimension={entry[1]!r}."
+            )
+
+        cls._custom_state_components[name] = entry
+
+    @classmethod
+    def unregister_custom_parameter(cls, name: str) -> None:
+        """
+        Remove a previously registered custom state component.
+
+        Parameters
+        ----------
+        name : str
+            Name passed to :meth:`register_custom_parameter`. Unknown names are
+            ignored.
+        """
+        cls._custom_state_components.pop(name, None)
+
+    @classmethod
+    def custom_parameters(cls) -> Dict[str, List]:
+        """
+        Return a copy of the registered custom state components.
+
+        Returns
+        -------
+        dict
+            Mapping ``name -> [physical_type, size, pattern]``.
+        """
+        return dict(cls._custom_state_components)
 
     @classmethod
     def empty_pv(
@@ -587,6 +920,29 @@ class StateDefinition:
         """
         Generate a dictionary of components allowed in a StateArray.
 
+        Built-in components come first, followed by any component registered
+        through :meth:`register_custom_parameter`.
+
+        Returns
+        -------
+        dict
+            Dictionary mapping component patterns to their specifications.
+            Format: ``{name: [physicalType, size, regex_pattern]}``
+        """
+        state_allowed = cls._generate_builtin_state_dictionary()
+        state_allowed.update(cls._custom_state_components)
+
+        return state_allowed
+
+    @classmethod
+    def _generate_builtin_state_dictionary(cls) -> Dict[str, List]:
+        """
+        Generate the library-defined portion of the allowed-component dictionary.
+
+        Kept separate from :meth:`_generate_allowed_state_dictionary` so that
+        :meth:`register_custom_parameter` can detect collisions against built-in
+        names only.
+
         Returns
         -------
         dict
@@ -598,6 +954,9 @@ class StateDefinition:
             "velocity": ["Velocity", 3, re.compile(r"^(velocity)$")],
             # SRP
             "eta_srp": ["Dimensionless", 1, re.compile(r"^(eta_srp)$")],
+            # Spacecraft emission (thermal re-radiation, antenna/LIDAR recoil)
+            "eta_thermal": ["Dimensionless", 1, re.compile(r"^(eta_thermal)$")],
+            "eta_antenna": ["Dimensionless", 1, re.compile(r"^(eta_antenna)$")],
             # Finite burn estimable parameters
             # allows: k_thrust, k_thrust1, k_thrust2, ...
             "k_thrust": ["Dimensionless", 1, re.compile(r"^(k_thrust\d*)$")],
@@ -605,31 +964,100 @@ class StateDefinition:
             "dRA": ["Angle", 1, re.compile(r"^(dRA\d*)$")],
             # allows: dDEC, dDEC1, dDEC2, ...
             "dDEC": ["Angle", 1, re.compile(r"^(dDEC\d*)$")],
+            # Smoothed impulsive maneuver estimable parameters
+            # allows: dv_smooth, dv_smooth1, dv_smooth2, ...
+            "dv_smooth": ["Velocity", 3, re.compile(r"^(dv_smooth\d*)$")],
+            # Correction to the nominal maneuver epoch, NOT the epoch itself.
+            # allows: dt_dv, dt_dv1, dt_dv2, ...
+            "dt_dv": ["Time", 1, re.compile(r"^(dt_dv\d*)$")],
             # Ground station / tracking
             "gs_delta_location_ECEF": [
                 "Length",
                 3,
                 re.compile(r"^(gs_delta_location_ECEF)_(\w+)$"),
             ],
+            # Cylindrical station location, the parametrisation MONTE reports:
+            # (radius, east, Z), where east is the along-longitude arc r*dlon so
+            # all three carry length units. Convert a longitude sigma with
+            # east = radius * longitude_in_radians. The cylindrical basis is the
+            # Earth-fixed basis turned about Z by the station longitude, so the
+            # two forms differ by a rotation. A diagonal cylindrical covariance
+            # generally becomes correlated when rotated into Cartesian axes.
+            "gs_delta_location_CYL": [
+                "Length",
+                3,
+                re.compile(r"^(gs_delta_location_CYL)_(\w+)$"),
+            ],
+            # Earth-specific deltas against the loaded nominal orientation.
+            # Owner is Earth (global to registered Earth stations), or a station.
+            "eop_delta_pole_x": ["Angle", 1, re.compile(r"^eop_delta_pole_x$")],
+            "eop_delta_pole_y": ["Angle", 1, re.compile(r"^eop_delta_pole_y$")],
+            "eop_delta_ut1": ["Time", 1, re.compile(r"^eop_delta_ut1$")],
+            "eop_delta_celestial_pole_x": ["Angle", 1,
+                                           re.compile(r"^eop_delta_celestial_pole_x$")],
+            "eop_delta_celestial_pole_y": ["Angle", 1,
+                                           re.compile(r"^eop_delta_celestial_pole_y$")],
+            # Generic active body-fixed X/Y/Z station rotation, in radians.
+            "body_orientation_delta": ["Angle", 3, re.compile(r"^body_orientation_delta$")],
+            # Degree-2 tidal response of the deformed body. Global to the body,
+            # so no station tag: every station on it shares one solid tide.
+            "love_h2": [None, 1, re.compile(r"^love_h2$")],
+            "shida_l2": [None, 1, re.compile(r"^shida_l2$")],
+            # Potential Love numbers, one per (degree, order) like cnm/snm.
+            # Unlike h2 and l2, which a station feels directly, these reach
+            # the observable only by bending the trajectory, so their
+            # sensitivity comes through the STM.
+            "love_k": [None, 1, re.compile(r"^love_k_(\d+)_(\d+)$")],
+            # Estimated zenith path delays, per station. Additive on top of
+            # whatever MediaCorrections models, and mapped to the slant
+            # direction by the same elevation mapping the model uses.
+            "tropo_zenith_delay": ["Length", 1, re.compile(r"^tropo_zenith_delay_(\w+)$")],
+            "iono_zenith_delay": ["Length", 1, re.compile(r"^iono_zenith_delay_(\w+)$")],
+            # The lookaheads keep range_bias_RU_* and rangerate_bias_Hz_* from
+            # matching here first and being validated as a length / velocity.
             "range_bias": [
                 "Length",
                 "dynamic",
-                re.compile(r"^(range_bias)_(\w+)$"),
+                re.compile(r"^(range_bias)_(?!RU_)(\w+)$"),
             ],
             "rangerate_bias": [
                 "Velocity",
                 "dynamic",
-                re.compile(r"^(rangerate_bias)_(\w+)$"),
+                re.compile(r"^(rangerate_bias)_(?!Hz_)(\w+)$"),
             ],
             "range_bias_RU": [
                 "Dimensionless",
-                1,
+                "dynamic",
                 re.compile(r"^(range_bias_RU)_(\w+)$"),
             ],
             "rangerate_bias_Hz": [
                 "per Time",
-                1,
+                "dynamic",
                 re.compile(r"^(rangerate_bias_Hz)_(\w+)$"),
+            ],
+            # Range bias on the first station of a differential one-way range
+            "dor_bias": [
+                "Length",
+                "dynamic",
+                re.compile(r"^(dor_bias)_(\w+)$"),
+            ],
+            # Electronic delay corrections, none split by pass. The uplink (t1)
+            # and downlink (t3) delays are owned by the station; the
+            # transponder delay (t2) by the spacecraft, common to every station
+            "uplink_delay_bias": [
+                "Time",
+                1,
+                re.compile(r"^(uplink_delay_bias)_(\w+)$"),
+            ],
+            "transponder_delay_bias": [
+                "Time",
+                1,
+                re.compile(r"^(transponder_delay_bias)$"),
+            ],
+            "downlink_delay_bias": [
+                "Time",
+                1,
+                re.compile(r"^(downlink_delay_bias)_(\w+)$"),
             ],
             # Optical navigation — angular (RA/DEC) bias and pixel/sample biases
             "angular_bias": [
@@ -659,10 +1087,12 @@ class StateDefinition:
             # Spherical harmonics coefficients — cnm_n_m and snm_n_m (dimensionless)
             "cnm": ["Dimensionless", 1, re.compile(r"^(cnm_\d+_\d+)$")],
             "snm": ["Dimensionless", 1, re.compile(r"^(snm_\d+_\d+)$")],
-            # Pole orientation: RA and DEC in radians, PM rate in deg/day (dimensionless)
+            # Pole orientation: RA, DEC and the J2000 prime meridian in radians,
+            # PM rate in deg/day (dimensionless)
             "pole_ra":  ["Angle", 1, re.compile(r"^(pole_ra)$")],
             "pole_dec": ["Angle", 1, re.compile(r"^(pole_dec)$")],
             "pole_pm":  ["Dimensionless", 1, re.compile(r"^(pole_pm)$")],
+            "pole_w0":  ["Angle", 1, re.compile(r"^(pole_w0)$")],
             # Small-body perturbations
             "A2_yark": ["Length / Time^2", 1, re.compile(r"^(A2_yark)$")],
             # First-order Gauss-Markov empirical acceleration
@@ -671,6 +1101,17 @@ class StateDefinition:
             # Piecewise First-order Gauss-Markov empirical acceleration
             "a_pfogm": ["Acceleration", "dynamic", re.compile(r"^(a_pfogm)$")],
             "beta_pfogm": ["per Time", "dynamic", re.compile(r"^(beta_pfogm)$")],
+            # Light-time model parameters (Moyer Ch. 10, 12, 13). The zenith
+            # media delays are the per-station tropo/iono_zenith_delay above.
+            # PPN relativity parameter γ (Moyer 12-24: ∂ρ/∂γ = (RLT_dn + RLT_up)/(1+γ)).
+            # Uses the GR light-time components exposed from compute_precise_RTLT.
+            "gamma_rel": ["Dimensionless", 1, re.compile(r"^(gamma_rel)$")],
+            # Multiplicative scale on the solar-corona model (dimensionless, nominal 1).
+            # Partial uses the per-leg SC delays from compute_precise_RTLT (Moyer 10-76).
+            "solar_corona_scale": ["Dimensionless", 1, re.compile(r"^(solar_corona_scale)$")],
+            # Fourier empirical acceleration coefficients
+            "a_fourier": ["Acceleration", "dynamic", re.compile(r"^(a_fourier)$")],
+            "a_ppoly": ["Acceleration", "dynamic", re.compile(r"^(a_ppoly)$")],
         }
 
         return state_allowed
@@ -693,9 +1134,10 @@ class StateDefinition:
 
         Raises
         ------
+        StateDefinition.UnknownComponentError
+            If the component name matches no allowed (built-in or custom) pattern.
         ValueError
-            If component name is not allowed, dimension doesn't match,
-            or physical type is incorrect.
+            If the dimension doesn't match or the physical type is incorrect.
         """
         allowed = self._generate_allowed_state_dictionary()
 
@@ -717,6 +1159,21 @@ class StateDefinition:
                                 f"and must have dimension 3 * n_batches, "
                                 f"got {dimension}. Example: n_batches=2 -> dimension=6."
                             )
+                        if name == "a_fourier":
+                            raise ValueError(
+                                f"Component '{name}' holds one Fourier series per "
+                                f"axis and must have dimension 3 * (2 * degree + 1), "
+                                f"got {dimension}. Example: degree=1 -> dimension=9, "
+                                "degree=0 (constant) -> dimension=3."
+                            )
+                        if name == "a_ppoly":
+                            raise ValueError(
+                                f"Component '{name}' holds piecewise polynomial "
+                                f"coefficients and must have dimension 3 * n_batches "
+                                f"(order 0) or 3 * (n_batches + 1) (order 1), got "
+                                f"{dimension}. Example: n_batches=4 -> dimension=12 "
+                                "(order 0) or 15 (order 1)."
+                            )
                 else:
                     if dimension != expected_dim:
                         raise ValueError(
@@ -724,25 +1181,30 @@ class StateDefinition:
                             f"Expected {expected_dim}, got {dimension}"
                         )
 
-                # Check physical type (dimensions)
-                try:
-                    actual_dims = value.quantity.units.dimensions.name
-                    if actual_dims != phys_type:
-                        raise ValueError(
-                            f"Component '{name}' has incorrect physical type. "
-                            f"Expected '{phys_type}', got '{actual_dims}'"
-                        )
-                except AttributeError:
-                    # If we can't get dimensions, skip this check
-                    pass
+                # Check physical type (dimensions). Custom components may declare
+                # ``None`` to opt out of the check entirely.
+                if phys_type is not None:
+                    try:
+                        actual_dims = value.quantity.units.dimensions.name
+                        if actual_dims != phys_type:
+                            raise ValueError(
+                                f"Component '{name}' has incorrect physical type. "
+                                f"Expected '{phys_type}', got '{actual_dims}'"
+                            )
+                    except AttributeError:
+                        # If we can't get dimensions, skip this check
+                        pass
 
                 break
 
         if not matched:
             allowed_names = list(allowed.keys())
-            raise ValueError(
+            raise self.UnknownComponentError(
                 f"Component '{name}' is not allowed in StateArray. "
-                f"Allowed components: {allowed_names}"
+                f"Allowed components: {allowed_names}. "
+                "Register a user-defined parameter first with "
+                "StateDefinition.register_custom_parameter(), scarabaeus."
+                "CustomParameter(), or add it with .custom_param()."
             )
 
     def _check_duplicate_component(self, name: str, owner):
@@ -808,8 +1270,6 @@ class StateDefinition:
         ------
         ValueError
             If invalid mode values are provided
-        NotImplementedError
-            If estimation="considered" is specified
         """
         est = estimation.lower().strip()
         dyn = dynamics.lower().strip()
@@ -934,7 +1394,7 @@ class StateDefinition:
 
         Raises
         ------
-        ValueError / NotImplementedError
+        ValueError
             Propagates validation errors from position/velocity/param methods.
         """
         sd = cls()
@@ -1073,10 +1533,8 @@ class StateDefinition:
     @classmethod
     def as_state_definition(cls, obj) -> "StateDefinition":
         """
-        Accept either:
-          - an existing StateDefinition, or
-          - a legacy list of tuples (name, dim, est, dyn, owner, value),
-        and return a StateDefinition instance.
+        Return a StateDefinition from either an existing StateDefinition or a
+        legacy list of tuples ``(name, dim, est, dyn, owner, value)``.
         """
         if isinstance(obj, cls):
             return obj

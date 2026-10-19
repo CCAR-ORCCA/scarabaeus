@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Orbital Research Cluster for Celestial Applications (ORCCA) Lab, University of Colorado at Boulder
 # SPDX-License-Identifier: ISC
-from typing import Optional, Dict
+from typing import Optional, Dict, List, Union
 from scarabaeus import CovarianceMatrix, ProcessNoiseSettings, OutputSettings
 import numpy as np
 
@@ -22,23 +22,42 @@ class FilterSettings:
         Initial covariance matrix :math:`P_0`.
     initial_deviation : np.ndarray, optional
         Initial state deviation :math:`x_0`. ``None`` means zero deviation.
-    process_noise : ProcessNoiseSettings, optional
-        Process noise model configuration. ``None`` disables process noise.
+    process_noise : ProcessNoiseSettings or list of ProcessNoiseSettings, optional
+        Process noise model configuration, one per noised body (see
+        :attr:`~scarabaeus.ProcessNoiseSettings.body`). ``None`` disables
+        process noise.
     measurement_sigmas : dict, optional
-        Sigma overrides for measurement noise, keyed by dataset name.
+        Measurement sigmas keyed by dataset name, as ``ArrayWUnits`` (converted
+        to the dataset's units) or bare floats (taken to be in them already).
+        The filter sets them once, at construction, on the model that builds
+        each dataset, so they win over the sigma the model was built with and
+        ``model.sigma`` reports them; a sigma set on the model later wins over
+        them. Changing this dict after construction does nothing: use
+        :meth:`FilterOD.set_measurement_sigmas`. See that method for the rules
+        on models that build several datasets.
     covariance_analysis : bool
         If ``True``, run in covariance-analysis mode (no measurement updates).
         Defaults to ``False``.
     output : OutputSettings, optional
         Output configuration. Defaults to all-default :class:`~scarabaeus.OutputSettings`.
     editing_method : str, optional
-        Measurement editing mode: ``'lasso'``, ``'chi2'``, ``'date_range'``,
+        Measurement editing mode: ``'lasso'``, ``'lasso_all'``, ``'chi2'``,
+        ``'chi2_all'``, ``'kurtosis'``, ``'kurtosis_all'``, ``'date_range'``,
         or ``'interactive_date_range'``. ``None`` disables editing.
+        ``'lasso'``, ``'chi2'`` and ``'kurtosis'`` open one figure per dataset
+        in sequence; the ``'_all'`` variants open them all at once, which is
+        the usable option on remote/browser backends.
     editing_datasets : str or list, optional
         Which datasets to edit: ``None`` = all, a string = one by name,
         a list of strings = a specific subset.
     editing_kwargs : dict, optional
         Extra keyword arguments forwarded to the editing method.
+
+    See Also
+    --------
+    scarabaeus.FilterOD : Base filter class that consumes this settings object.
+    scarabaeus.ProcessNoiseSettings : Process noise model configuration.
+    scarabaeus.OutputSettings : Controls what the solution stores and writes.
 
     Notes
     -----
@@ -46,12 +65,6 @@ class FilterSettings:
     :class:`~scarabaeus.FilterOD` subclass constructor.  When ``output`` is
     omitted, an all-default :class:`~scarabaeus.OutputSettings` is created
     automatically.
-
-    See Also
-    --------
-    scarabaeus.FilterOD : Base filter class that consumes this settings object.
-    scarabaeus.ProcessNoiseSettings : Process noise model configuration.
-    scarabaeus.OutputSettings : Controls what the solution stores and writes.
     """
 
     # ------------------------------------------------------------------
@@ -77,17 +90,25 @@ class FilterSettings:
         self._initial_deviation = value
 
     @property
-    def process_noise(self) -> Optional["ProcessNoiseSettings"]:
-        """Process noise model configuration (:class:`~scarabaeus.ProcessNoiseSettings`)."""
+    def process_noise(
+        self,
+    ) -> Optional[Union["ProcessNoiseSettings", List["ProcessNoiseSettings"]]]:
+        """Process noise model configuration (:class:`~scarabaeus.ProcessNoiseSettings`),
+        or a list of them, one per noised body."""
         return self._process_noise
 
     @process_noise.setter
     def process_noise(self, value):
+        if isinstance(value, (list, tuple)):
+            # An empty list disables process noise, like None
+            value = list(value) or None
         self._process_noise = value
 
     @property
-    def measurement_sigmas(self) -> Optional[Dict[str, float]]:
-        """Measurement noise sigma overrides by dataset name."""
+    def measurement_sigmas(
+        self,
+    ) -> Optional[Dict[str, Union["ArrayWUnits", float]]]:
+        """Measurement sigmas by dataset name, set on the models at filter construction."""
         return self._measurement_sigmas
 
     @measurement_sigmas.setter
@@ -152,8 +173,10 @@ class FilterSettings:
         self,
         initial_covariance: "CovarianceMatrix",
         initial_deviation: Optional[np.ndarray] = None,
-        process_noise: Optional["ProcessNoiseSettings"] = None,
-        measurement_sigmas: Optional[Dict[str, float]] = None,
+        process_noise: Optional[
+            Union["ProcessNoiseSettings", List["ProcessNoiseSettings"]]
+        ] = None,
+        measurement_sigmas: Optional[Dict[str, Union["ArrayWUnits", float]]] = None,
         covariance_analysis: bool = False,
         output: Optional["OutputSettings"] = None,
         editing_method: Optional[str] = None,

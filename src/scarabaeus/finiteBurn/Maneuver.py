@@ -39,7 +39,7 @@ class Maneuver:
     where :math:`m(t)` is the spacecraft mass and
     :math:`\\hat{u}(t) = [u_x,\\,u_y,\\,u_z]^T` is the unit thrust-direction
     vector.  Thrust is stored internally in **kN** so that dividing by mass
-    in kg directly yields acceleration in km/s².
+    in kg directly yields acceleration in km/s^2.
 
     Parameters
     ----------
@@ -47,10 +47,10 @@ class Maneuver:
         Thrust magnitude polynomial (any force unit; stored internally in kN).
     mass_flow : ArrayWUnits, optional
         Propellant mass-flow rate polynomial (kg/s).
-    start_time : ArrayWUnits, optional
-        Burn start epoch (TDB seconds). Must be strictly less than ``end_time``.
-    end_time : ArrayWUnits, optional
-        Burn end epoch (TDB seconds). Must be strictly greater than ``start_time``.
+    start_time : EpochArray, optional
+        Burn start epoch. Must be strictly less than ``end_time``.
+    end_time : EpochArray, optional
+        Burn end epoch. Must be strictly greater than ``start_time``.
     ux : ArrayWUnits, optional
         X-component of the unit thrust-direction vector (unitless polynomial).
     uy : ArrayWUnits, optional
@@ -58,17 +58,18 @@ class Maneuver:
     uz : ArrayWUnits, optional
         Z-component of the unit thrust-direction vector (unitless polynomial).
 
-    Notes
-    -----
-    All polynomial coefficient arrays are zero-padded to length 7 (6th-order)
-    and stored in ascending degree order internally (index 0 = constant term).
-    Thrust is always converted to and stored in **kN** so that dividing by
-    spacecraft mass in kg yields acceleration directly in km/s².
-
     See Also
     --------
     scarabaeus.FiniteBurn : Force model that evaluates Maneuver polynomials during propagation.
     scarabaeus.ManeuverParser : Utility for loading Maneuver objects from a file.
+
+    Notes
+    -----
+    All polynomial coefficient arrays are zero-padded to length 7 (6th-order)
+    given in ascending degree order (index 0 = constant term) and stored in
+    descending order (index 0 = the :math:`t^6` coefficient).
+    Thrust is always converted to and stored in **kN** so that dividing by
+    spacecraft mass in kg yields acceleration directly in km/s^2.
     """
 
     def __init__(
@@ -95,12 +96,12 @@ class Maneuver:
         Thrust-magnitude polynomial stored in kN.
 
         The coefficient array is in **descending** degree order: index 0 holds
-        the highest-order (t⁶) coefficient and index 6 holds the constant term.
+        the highest-order (:math:`t^6`) coefficient and index 6 holds the constant term.
 
         Returns
         -------
         ArrayWUnits or None
-            7-element polynomial with units ``[kN/s⁶, kN/s⁵, …, kN]``
+            7-element polynomial with units ``[kN/s^6, kN/s^5, ..., kN]``
             (highest to lowest degree), or ``None`` if not set.
         """
         return self._thrust
@@ -111,8 +112,8 @@ class Maneuver:
         Set the thrust-magnitude polynomial, converting to kN.
 
         The input is unit-converted to **kN** so that dividing by spacecraft
-        mass (kg) directly yields acceleration in km/s².  The coefficient
-        array is zero-padded on the left to a length of 7 (6th-order
+        mass (kg) directly yields acceleration in km/s^2.  The coefficient
+        array is zero-padded at the high-order end to a length of 7 (6th-order
         polynomial) and reversed so that index 0 holds the highest-order term.
 
         Parameters
@@ -139,19 +140,19 @@ class Maneuver:
             pad_length = 7 - len(values)
             if pad_length > 0:
                 padded_values = np.pad(
-                    values, (pad_length, 0), mode="constant", constant_values=0
+                    values, (0, pad_length), mode="constant", constant_values=0
                 )
                 reversed_values = padded_values[::-1]
                 degree = len(reversed_values) - 1
                 reversed_units = [
-                    kN / (sec ** (degree - i)) for i in reversed(range(degree + 1))
+                    kN / (sec ** (degree - i)) for i in range(degree + 1)
                 ]
                 self._thrust = ArrayWUnits(reversed_values, reversed_units)
             else:
                 reversed_values = values[::-1]
                 degree = len(reversed_values) - 1
                 reversed_units = [
-                    kN / (sec ** (degree - i)) for i in reversed(range(degree + 1))
+                    kN / (sec ** (degree - i)) for i in range(degree + 1)
                 ]
                 self._thrust = ArrayWUnits(reversed_values, reversed_units)
 
@@ -161,12 +162,12 @@ class Maneuver:
         Propellant mass-flow rate polynomial (kg/s).
 
         The coefficient array is in **descending** degree order: index 0 holds
-        the highest-order (t⁶) coefficient and index 6 holds the constant term.
+        the highest-order (:math:`t^6`) coefficient and index 6 holds the constant term.
 
         Returns
         -------
         ArrayWUnits or None
-            7-element polynomial with units ``[kg/s⁷, kg/s⁶, …, kg/s]``
+            7-element polynomial with units ``[kg/s^7, kg/s^6, ..., kg/s]``
             (highest to lowest degree), or ``None`` if not set.
         """
         return self._mass_flow
@@ -177,8 +178,8 @@ class Maneuver:
         Set the propellant mass-flow rate polynomial (kg/s).
 
         Zero-pads the coefficient array to length 7, then reverses it so that
-        index 0 is the highest-order (s⁻⁷) coefficient.  Units are fixed to
-        ``kg / sⁿ`` for each polynomial degree ``n``.
+        index 0 is the highest-order coefficient, in kg/s^7.  Units are fixed to
+        ``kg/s^(n+1)`` for each polynomial degree ``n``.
 
         Parameters
         ----------
@@ -200,7 +201,7 @@ class Maneuver:
 
         if pad_length > 0:
             padded_values = np.pad(
-                values, (pad_length, 0), mode="constant", constant_values=0
+                values, (0, pad_length), mode="constant", constant_values=0
             )
             reversed_values = padded_values[::-1]
             degree = len(reversed_values) - 1
@@ -341,10 +342,10 @@ class Maneuver:
 
         if pad_length > 0:
             padded_values = np.pad(
-                values, (pad_length, 0), mode="constant", constant_values=0
+                values, (0, pad_length), mode="constant", constant_values=0
             )
             reversed_values = padded_values[::-1]
-            padded_units = [None] * pad_length + original_units
+            padded_units = original_units + [None] * pad_length
             reversed_units = padded_units[::-1]
 
             self._ux = ArrayWUnits(reversed_values, reversed_units)
@@ -392,10 +393,10 @@ class Maneuver:
 
         if pad_length > 0:
             padded_values = np.pad(
-                values, (pad_length, 0), mode="constant", constant_values=0
+                values, (0, pad_length), mode="constant", constant_values=0
             )
             reversed_values = padded_values[::-1]
-            padded_units = [None] * pad_length + original_units
+            padded_units = original_units + [None] * pad_length
             reversed_units = padded_units[::-1]
 
             self._uy = ArrayWUnits(reversed_values, reversed_units)
@@ -443,10 +444,10 @@ class Maneuver:
 
         if pad_length > 0:
             padded_values = np.pad(
-                values, (pad_length, 0), mode="constant", constant_values=0
+                values, (0, pad_length), mode="constant", constant_values=0
             )
             reversed_values = padded_values[::-1]
-            padded_units = [None] * pad_length + original_units
+            padded_units = original_units + [None] * pad_length
             reversed_units = padded_units[::-1]
 
             self._uz = ArrayWUnits(reversed_values, reversed_units)

@@ -17,18 +17,30 @@ Physical Constants
    * - ``Stefan_Boltzmann``
      - 5.670374419e-08
      - kg/sec^3
+   * - ``TT_minus_TAI``
+     - 32.184
+     - sec
    * - ``c``
      - 299792.458
      - km/sec
+   * - ``earth_rotation_rate``
+     - 7.292115e-05
+     - Hz
    * - ``gamma_GR``
      - 1.0
      - unitless
+   * - ``omega_Earth``
+     - 7.292115e-05
+     - rad/sec
    * - ``srp_constant1``
      - 102115339416981.84
      - (kg*km)/sec^2
    * - ``srp_constant2``
      - 101979437570000.0
      - (kg*km)/sec^2
+   * - ``zero_Celsius``
+     - 273.15
+     - unitless
 
 Major Bodies
 ^^^^^^^^^^^^^

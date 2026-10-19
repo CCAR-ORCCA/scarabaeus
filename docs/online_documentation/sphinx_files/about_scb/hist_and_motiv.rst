@@ -1,5 +1,6 @@
 .. SPDX-FileCopyrightText: 2026 Orbital Research Cluster for Celestial Applications (ORCCA) Lab, University of Colorado at Boulder
 .. SPDX-License-Identifier: ISC
+
 .. meta::
     :description lang=en:
         Scarabaeus history and motivation. Origin of the name.
@@ -15,9 +16,9 @@
 
 .. role:: gold
 
-=========================
+==============================
 :gold:`History and Motivation`
-=========================
+==============================
 Scarabaeus (SCB) is an open-source software package for the interplanetary navigation of spacecraft.
 Inspired by the successful development and use of the `Basilisk <https://hanspeterschaub.info/basilisk/>`_ framework
 at the University of Colorado, SCB is developed by the `ORCCA laboratory <https://www.colorado.edu/faculty/mcmahon/orcca>`_
