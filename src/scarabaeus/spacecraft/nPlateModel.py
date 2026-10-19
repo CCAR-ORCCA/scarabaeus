@@ -2,7 +2,8 @@
 # SPDX-License-Identifier: ISC
 from scarabaeus import Units, ArrayWUnits, EpochArray, SpiceManager
 
-import json, warnings
+import copy
+import json, os
 
 import numpy as np
 import spiceypy as spice
@@ -34,13 +35,31 @@ class nPlateModel:
     :math:`c` is the speed of light, :math:`\\hat{\\ell}` is the unit
     sun-direction vector, and :math:`\\hat{n}` is the outward plate normal.
     The total SRP force on the spacecraft is the vector sum over all
-    illuminated plates.
+    illuminated plates. A double-sided plate lit from behind is illuminated
+    on its back face, so it acts as a plate with the opposite normal and the
+    same coefficients; a single-sided plate lit from behind contributes
+    nothing.
 
     Parameters
     ----------
-    plates_config_path : str
+    plates_config_path : str or os.PathLike, optional
         Path to a JSON file containing all necessary information to configure the N-plate model. See
         Notes section for more information on configuration file formatting.
+    plates_data : dict, optional
+        The same configuration already in memory, with the keys the file would
+        have held. Use this when the plate layout is assembled in a script,
+        pulled from a database, or varied across a study, rather than living in
+        a file on disk. Supply this or ``plates_config_path``, not both.
+
+        The dictionary is copied, so the model does not alias the caller's
+        lists and later edits to it cannot silently change the spacecraft.
+
+    Raises
+    ------
+    ConfigurationError
+        If neither or both sources are supplied, the configuration's columns
+        disagree on how many plates there are, or a ``frames`` or
+        ``double sided`` entry is invalid.
 
     See Also
     --------
@@ -66,14 +85,35 @@ class nPlateModel:
       vector (u vector) for each plate in the configuration. For CK frames, the array defines the
       normal vector to be rotated by the quaternion derived from its respective C-kernel.
     * ``types``: an array of strings where
-        * ``"Fixed"`` defines a static plate.
-        * ``"CK"`` defines a time-variant plate with associated reference frame defined by a
-          SPICE C-matrix kernel.
+
+      * ``"Fixed"`` defines a plate whose normal is constant in the frame given by ``frames``,
+        by default the spacecraft body frame. That frame is oriented by the Spacecraft
+        ``attitudeMode``; it is not an inertial frame.
+      * ``"CK"`` defines a time-variant plate with associated reference frame defined by a
+        SPICE C-matrix kernel.
+
     * ``ids``: an array of integers and/or nulls, where
-        * a null defines a Fixed plate — it has no NAIF integer code.
-        * an integer defines the NAIF ID of a CK plate.
+
+      * a null defines a Fixed plate — it has no NAIF integer code.
+      * an integer defines the NAIF ID of a CK plate.
+
+    * ``frames`` (optional): an array of strings, integers and/or nulls giving the frame a Fixed
+      plate's normal is constant in, where
+
+      * a null is the spacecraft body frame (the default for every plate).
+      * a string or integer is a SPICE frame name or frame ID; the normal is rotated out of
+        that frame at each epoch, whatever the Spacecraft ``attitudeMode``. Use this when a
+        CK (through its frame kernel) or any other SPICE frame defines the bus orientation.
+        CK plates must leave it null.
+
+    * ``double sided`` (optional): an array of booleans, true for a plate that is also
+      illuminated from behind (e.g. a solar array). Defaults to false for every plate, the
+      right choice for bus faces, which would otherwise double their area seen from the Sun.
 
     .. note:: The ``abs``, ``dref``, and ``sref`` must sum to unity for each plate.
+
+    .. note:: The two faces of a double-sided plate share its coefficients. A back face with
+       different optical properties is a second, single-sided plate with the opposite normal.
 
     .. dropdown:: Following this format, an example plate configuration file looks like:
         :open:
@@ -89,30 +129,71 @@ class nPlateModel:
                 "sref coeffs"    : [0.34     , 0.34      , 0.34     ],
                 "normal vectors" : [[1, 0, 0], [-1, 0, 0], [1, 0, 0]],
                 "types"          : ["Fixed"  , "Fixed"   , "CK"     ],
-                "ids"            : [null     , null      , -64001   ]
+                "ids"            : [null     , null      , -64001   ],
+                "frames"         : [null     , null      , null     ],
+                "double sided"   : [false    , false     , true     ]
             }
-
-    References
-    ----------
     """
+
+    # ------------------#
+    # region   Errors  #
+    # ------------------#
+    class ConfigurationError(ValueError):
+        """Raised when a plate configuration cannot define an N-plate model."""
+
+    class PlateOrientationError(Exception):
+        """Raised when SPICE cannot orient a CK plate or a plate defined in a named frame."""
+
+    # endregion Errors #
+    # ------------------#
 
     # -------------#
     # Constructor #
     # -------------#
-    def __init__(self, plates_config_path: str):
-        # read in plate config file
-        with open(plates_config_path, "r") as file:
-            config = json.load(file)
+    def __init__(self, plates_config_path=None, plates_data: dict = None):
+        # A configuration is either on disk or already in hand; taking both
+        # would leave which one won up to the reader.
+        if (plates_config_path is None) == (plates_data is None):
+            raise self.ConfigurationError(
+                "specify exactly one of 'plates_config_path' (a JSON file) or "
+                "'plates_data' (the same configuration as a dict); received "
+                f"plates_config_path={plates_config_path!r}, "
+                f"plates_data={type(plates_data).__name__ if plates_data is not None else None}."
+            )
+
+        if plates_config_path is not None:
+            source = os.fspath(plates_config_path)
+            with open(source, "r") as file:
+                config = json.load(file)
+        else:
+            if not isinstance(plates_data, dict):
+                raise self.ConfigurationError(
+                    "'plates_data' must be a dict holding the same keys the "
+                    f"configuration file would; received {type(plates_data).__name__}."
+                )
+            source = "the supplied plates_data"
+            # Copied so the model does not alias the caller's lists: a
+            # configuration edited afterwards must not change this spacecraft.
+            config = copy.deepcopy(plates_data)
 
         # validate data in config
+        if "names" not in config:
+            raise self.ConfigurationError(
+                f'Configuration from {source} has no "names" property, so the '
+                "number of plates it describes is undefined. Expected keys: "
+                '"names", "areas", "ref coeffs", "abs coeffs", "dref coeffs", '
+                '"sref coeffs", "normal vectors", "types", "ids", and optionally '
+                '"frames", "double sided".'
+            )
+
         for key in config:
             if len(config[key]) != len(config["names"]):
                 bad_config_err = (
-                    f"Mismatched column count in file {plates_config_path}. "
+                    f"Mismatched column count in {source}. "
                     f'Property "names" contains data for {len(config["names"])} '
                     f'plates while property "{key}" contains data for {len(config[key])}.'
                 )
-                raise ValueError(bad_config_err)
+                raise self.ConfigurationError(bad_config_err)
 
         # assign properties
         self.names = config["names"]
@@ -124,6 +205,9 @@ class nPlateModel:
         self.normals = config["normal vectors"]
         self.plate_types = config["types"]
         self.plate_ids = config["ids"]
+        # optional columns: older configurations predate them
+        self.frames = config.get("frames", [None] * len(self.names))
+        self.double_sided = config.get("double sided", [False] * len(self.names))
 
     # ----------------------#
     # region    Properties #
@@ -301,6 +385,71 @@ class nPlateModel:
         # valid input -> assign property
         self._ck_ids = input_val
 
+    @property
+    def frames(self) -> list[str | int | None]:
+        """
+        The frame each plate's normal is constant in: ``None`` for the
+        spacecraft body frame (oriented by the Spacecraft ``attitudeMode``),
+        otherwise a SPICE frame name or frame ID. Always ``None`` for CK
+        plates, whose orientation comes from their C-kernel.
+        """
+        return self._frames
+
+    @frames.setter
+    def frames(self, input_val):
+        for name, plate_type, frame in zip(self.names, self.plate_types, input_val):
+            # bool is an int subclass, but True/False is never a frame ID
+            if frame is not None and (
+                isinstance(frame, bool) or not isinstance(frame, (str, int, np.integer))
+            ):
+                raise self.ConfigurationError(
+                    f'Plate "{name}" has frame {frame!r}; a "frames" entry must be a '
+                    "SPICE frame name (str), a SPICE frame ID (int), or null for the "
+                    "spacecraft body frame."
+                )
+            if plate_type == "CK" and frame is not None:
+                raise self.ConfigurationError(
+                    f'CK plate "{name}" has frame {frame!r}; a CK plate is oriented by '
+                    'its C-kernel, so its "frames" entry must be null. Use a "Fixed" '
+                    "plate to fix a normal in a named frame."
+                )
+
+        # valid input -> assign property
+        self._frames = list(input_val)
+
+    @property
+    def double_sided(self) -> list[bool]:
+        """
+        Whether each plate is double-sided: lit from behind, it acts as a
+        plate with the opposite normal. Single-sided plates lit from behind
+        contribute nothing.
+        """
+        return self._double_sided
+
+    @double_sided.setter
+    def double_sided(self, input_val):
+        for name, flag in zip(self.names, input_val):
+            if not isinstance(flag, (bool, np.bool_)):
+                raise self.ConfigurationError(
+                    f'Plate "{name}" has "double sided" entry {flag!r}; it must be '
+                    "true or false."
+                )
+
+        # valid input -> assign property
+        self._double_sided = [bool(flag) for flag in input_val]
+
+    @property
+    def body_frame_plates(self) -> list[bool]:
+        """
+        Whether each plate's normal is given in the spacecraft body frame
+        (a Fixed plate with no frame). :meth:`get_all_normals` returns these
+        normals as configured and the others in an inertial frame.
+        """
+        return [
+            plate_type == "Fixed" and frame is None
+            for plate_type, frame in zip(self.plate_types, self.frames)
+        ]
+
     # endregion Properties #
     # ----------------------#
 
@@ -312,6 +461,51 @@ class nPlateModel:
         Overloading the printable representation operator for an nPlateModel object.
         """
         return f"N-Plate Model containing {len(self.names)} plates"
+
+    def to_dict(self) -> dict:
+        """
+        Serialize the plate configuration to a JSON-friendly dict.
+
+        The dict holds exactly the keys a configuration file would, so it can be
+        fed straight back to the constructor as ``plates_data`` (which is what
+        :meth:`from_dict` does). Areas are written as plain floats in
+        :math:`km^2`, the units the constructor expects.
+
+        Returns
+        -------
+        dict
+            Serialized plate configuration.
+        """
+        return {
+            "names": list(self.names),
+            "areas": [float(np.asarray(a.values).ravel()[0]) for a in self.areas],
+            "ref coeffs": list(self.ref_coeffs),
+            "abs coeffs": list(self.abs_ref_coeffs),
+            "dref coeffs": list(self.diff_ref_coeffs),
+            "sref coeffs": list(self.spec_ref_coeffs),
+            "normal vectors": [np.asarray(n).ravel().tolist() for n in self.normals],
+            "types": list(self.plate_types),
+            "ids": list(self.plate_ids),
+            "frames": [int(f) if isinstance(f, np.integer) else f for f in self.frames],
+            "double sided": list(self.double_sided),
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "nPlateModel":
+        """
+        Reconstruct an nPlateModel from a dict produced by :meth:`to_dict`.
+
+        Parameters
+        ----------
+        data : dict
+            Serialized plate configuration.
+
+        Returns
+        -------
+        nPlateModel
+            The reconstructed model.
+        """
+        return cls(plates_data=data)
 
     def _validate_numerical(self, list2check: list, prop2check: str):
         """
@@ -338,10 +532,51 @@ class nPlateModel:
                 )
                 raise TypeError(not_num_err)
 
-    def _get_ck_normals(self, epoch, sc_id: int, include_IDs: bool = False):
+    @staticmethod
+    def _epoch_to_et(epoch):
+        """
+        Raw ephemeris time (TDB seconds past J2000) of an epoch.
+
+        Accepts an EpochArray or a bare numeric ET, which avoids the wrapper
+        overhead on every ODE evaluation.
+
+        Parameters
+        ----------
+        epoch : EpochArray or float
+            The epoch in ephemeris time (TDB).
+
+        Returns
+        -------
+        float or np.ndarray
+            The ET value(s).
+
+        Raises
+        ------
+        ValueError
+            If ``epoch`` is an EpochArray not in TDB.
+        TypeError
+            If ``epoch`` is neither an EpochArray nor numeric.
+        """
+        if isinstance(epoch, EpochArray):
+            if epoch.system != "TDB":
+                raise ValueError(
+                    "Argument [epoch] must be given in ephemeris time (TDB). "
+                    f"Received {epoch.system}."
+                )
+            return epoch.times.values
+        if isinstance(epoch, (int, float, np.floating, np.ndarray)):
+            return epoch
+        raise TypeError(
+            f"Argument [epoch] must be an EpochArray or numeric ET value. "
+            f"Received {type(epoch)}."
+        )
+
+    def _get_ck_normals(
+        self, epoch, sc_id: int, include_IDs: bool = False, inertial_frame: str = "J2000"
+    ):
         """
         Queries the normal vectors of each C-Kernel-defined panel in the N-plate model at
-        a given epoch.
+        a given epoch, expressed in an inertial frame.
 
         Parameters
         ----------
@@ -357,6 +592,9 @@ class nPlateModel:
             Flag that signifies whether or not to include the SPICE ID(s) of queried C-kernel
             plates. Defaults to ``False``.
 
+        inertial_frame : str, optional
+            The frame the normals are returned in. Defaults to ``"J2000"``.
+
         Returns
         -------
         normals : list
@@ -366,33 +604,29 @@ class nPlateModel:
         ids_and_normals : list
             If ``include_IDs == True``, a list where each element is a list with the
             SPICE ID and normal for each CK type panel in the model.
+
+        Raises
+        ------
+        PlateOrientationError
+            If SPICE cannot convert ``epoch`` to spacecraft clock ticks for
+            ``sc_id`` (no SCLK kernel), or cannot orient a CK plate at
+            ``epoch`` (no CK for its ID, or no coverage at that epoch).
         """
-        # ------------------#
-        # input validation #
-        # ------------------#
-        # Extract raw ET value — accept EpochArray or bare numeric to avoid wrapper overhead
-        # on every ODE evaluation.  CK availability is validated implicitly: spice.ckgp raises
-        # if no appropriate kernel is loaded, and get_all_normals catches that exception.
-        if isinstance(epoch, EpochArray):
-            if epoch.system != "TDB":
-                raise ValueError(
-                    "Argument [epoch] must be given in ephemeris time (TDB). "
-                    f"Received {epoch.system}."
-                )
-            et_value = epoch.times.values
-        elif isinstance(epoch, (int, float, np.floating, np.ndarray)):
-            et_value = epoch
-        else:
-            raise TypeError(
-                f"Argument [epoch] must be an EpochArray or numeric ET value. "
-                f"Received {type(epoch)}."
-            )
+        et_value = self._epoch_to_et(epoch)
 
         # -----------------------------#
         # valid inputs -> get normals #
         # -----------------------------#
         # convert from ET to SCLK
-        epoch = SpiceManager.sce2c(sc_id, et_value)
+        try:
+            epoch = SpiceManager.sce2c(sc_id, et_value)
+        except spice.utils.exceptions.SpiceyError as err:
+            spice.reset()
+            reason = getattr(err, "short", None) or err
+            raise self.PlateOrientationError(
+                f"Unable to orient the CK plates at ET {et_value}: no spacecraft "
+                f"clock for spacecraft {sc_id} ({reason}). Load its SCLK kernel."
+            ) from err
 
         # get normals for each CK plate
         ck_id_inds = [i for i, e in enumerate(self.plate_types) if e == "CK"]
@@ -406,10 +640,23 @@ class nPlateModel:
             # get the SPICE ID of the plate
             plate_id = self.plate_ids[i]
 
-            # query its attitude from the C-kernel and convert to quaternion
-            dcm = spice.ckgp(plate_id, epoch, 0, "J2000")[0]
-            base_normal = self.normals[i]
-            rot_normal = np.array(dcm) @ base_normal
+            # query its attitude from the C-kernel: the C-matrix rotates
+            # inertial vectors into the plate frame, so its transpose takes the
+            # plate-frame normal out to the inertial frame
+            try:
+                cmat = spice.ckgp(plate_id, epoch, 0, inertial_frame)[0]
+            except spice.utils.exceptions.SpiceyError as err:
+                # spiceypy raises NotFoundError without clearing the SPICE
+                # error status, which would fail the next, unrelated, call
+                spice.reset()
+                reason = getattr(err, "short", None) or err
+                raise self.PlateOrientationError(
+                    f'Unable to orient CK plate "{self.names[i]}" (CK ID {plate_id}) '
+                    f"relative to {inertial_frame} at ET {et_value}: {reason}. "
+                    f"Load a CK for ID {plate_id} that covers this epoch."
+                ) from err
+            base_normal = np.asarray(self.normals[i], dtype=float)
+            rot_normal = np.asarray(cmat).T @ base_normal
 
             if include_IDs:
                 # bundle ID and normal as one entry
@@ -425,9 +672,66 @@ class nPlateModel:
             # return only normals
             return normals
 
-    def get_all_normals(self, epoch, sc_id: int):
+    def _get_frame_normals(self, epoch, inertial_frame: str = "J2000") -> list:
+        """
+        Queries the normal vectors of each Fixed panel defined in a named frame
+        at a given epoch, expressed in an inertial frame.
+
+        Parameters
+        ----------
+        epoch : EpochArray or float
+            The epoch in ephemeris time (TDB).
+        inertial_frame : str, optional
+            The frame the normals are returned in. Defaults to ``"J2000"``.
+
+        Returns
+        -------
+        list
+            The normal of each Fixed plate with a frame, in plate order.
+
+        Raises
+        ------
+        PlateOrientationError
+            If a frame ID is unknown to SPICE, or SPICE cannot rotate a frame
+            into ``inertial_frame`` at ``epoch`` (e.g. no CK coverage).
+        """
+        et = float(np.squeeze(self._epoch_to_et(epoch)))
+
+        normals = []
+        for name, plate_type, frame, normal in zip(
+            self.names, self.plate_types, self.frames, self.normals
+        ):
+            if plate_type != "Fixed" or frame is None:
+                continue
+            frame_name = frame
+            if not isinstance(frame, str):
+                # resolved per call, not cached: the frame kernel may be
+                # loaded after the model is built
+                frame_name = spice.frmnam(int(frame))
+                if not frame_name:
+                    raise self.PlateOrientationError(
+                        f'Plate "{name}" is fixed in frame ID {frame}, which no loaded '
+                        "kernel defines. Load the frame kernel (FK) that defines it."
+                    )
+            try:
+                dcm = SpiceManager.get_xfrm(frame_name, inertial_frame, et)
+            except spice.utils.exceptions.SpiceyError as err:
+                raise self.PlateOrientationError(
+                    f'Unable to orient plate "{name}" (fixed in frame {frame_name}) '
+                    f"relative to {inertial_frame} at ET {et}: {err.short or err}"
+                ) from err
+            normals.append(np.asarray(dcm) @ np.asarray(normal, dtype=float))
+
+        return normals
+
+    def get_all_normals(self, epoch, sc_id: int, inertial_frame: str = "J2000"):
         """
         Queries the normal vectors of each panel in the N-plate model at a given epoch.
+
+        Normals of plates in the spacecraft body frame (``body_frame_plates``)
+        are returned as configured; the others, CK plates and Fixed plates in a
+        named frame, are rotated into ``inertial_frame``. A caller that knows
+        the attitude maps the latter into the body frame with its transpose.
 
         Parameters
         ----------
@@ -439,38 +743,48 @@ class nPlateModel:
             NAIF spacecraft ID code for the craft C-kernel plates are attached to. Required to
             convert to encoded SCLK ticks.
 
+        inertial_frame : str, optional
+            The frame CK and named-frame normals are returned in. Defaults to
+            ``"J2000"``.
+
         Returns
         -------
         normals : list
             A list of normals for each panel in the model.
+
+        Raises
+        ------
+        PlateOrientationError
+            If a CK plate or a Fixed plate's named frame cannot be oriented at
+            ``epoch``.
         """
-        # check for C-kernel plates
-        if "CK" in self.plate_types:
-            # query normals for all C-kernel plates at the given time
-            try:
-                ck_normals = self._get_ck_normals(epoch, sc_id)
-            except:
-                cant_find_warn = (
-                    "Unable to retrieve orientation for one or more CK plates "
-                    f"at epoch {epoch}. Normals set to [1, 0, 0]."
-                )
-                warnings.warn(cant_find_warn)
-                ck_normals = [1, 0, 0] * np.ones((self.plate_types.count("CK"), 1))
-
-            normals = []
-            ck_ind = 0  # counter to grab from queried CK normals
-            for i, normal in enumerate(self.normals):
-                # constant for fixed plate -> pull from config file
-                if self.plate_types[i] == "Fixed":
-                    normals.append(normal)
-                # pull from queried normals
-                else:
-                    normals.append(ck_normals[ck_ind])
-                    ck_ind += 1
-
-            # return constant and non-constant normals
-            return normals
-
-        else:
+        if all(self.body_frame_plates):
             # return all normals
             return self.normals
+
+        # check for C-kernel plates
+        ck_normals = []
+        if "CK" in self.plate_types:
+            # query normals for all C-kernel plates at the given time
+            ck_normals = self._get_ck_normals(
+                epoch, sc_id, inertial_frame=inertial_frame
+            )
+        frame_normals = self._get_frame_normals(epoch, inertial_frame)
+
+        normals = []
+        ck_ind = 0  # counter to grab from queried CK normals
+        frame_ind = 0  # counter to grab from queried named-frame normals
+        for i, normal in enumerate(self.normals):
+            # constant in the body frame -> pull from config file
+            if self.body_frame_plates[i]:
+                normals.append(normal)
+            # pull from queried normals
+            elif self.plate_types[i] == "CK":
+                normals.append(ck_normals[ck_ind])
+                ck_ind += 1
+            else:
+                normals.append(frame_normals[frame_ind])
+                frame_ind += 1
+
+        # return constant and non-constant normals
+        return normals

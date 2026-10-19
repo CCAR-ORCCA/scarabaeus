@@ -1,5 +1,8 @@
 .. SPDX-FileCopyrightText: 2026 Orbital Research Cluster for Celestial Applications (ORCCA) Lab, University of Colorado at Boulder
 .. SPDX-License-Identifier: ISC
+
+:orphan:
+
 .. meta::
     :description lang=en:
         Guide detailing how to install and access the MongoDB database for Scarabaeus.
@@ -118,7 +121,7 @@ Windows
     you must escape them using a backslash (``\``) so the shell interprets them as literal characters.
 
     Common shell special characters include:
-    ``$``, ``"``, ``'``, ``\``, ``!``, ``*``, ``&``, ``(``, ``)``, ``|``, ``;``, ``<``, ``>``, ``~``, and ````` ``.
+    ``$``, ``"``, ``'``, ``\``, ``!``, ``*``, ``&``, ``(``, ``)``, ``|``, ``;``, ``<``, ``>``, ``~``, and :literal:`\``.
 
     **Examples**:
 

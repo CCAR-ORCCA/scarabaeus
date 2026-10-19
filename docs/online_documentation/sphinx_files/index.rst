@@ -1,5 +1,6 @@
 .. SPDX-FileCopyrightText: 2026 Orbital Research Cluster for Celestial Applications (ORCCA) Lab, University of Colorado at Boulder
 .. SPDX-License-Identifier: ISC
+
 .. meta::
     :description lang=en:
         Scarabaeus is an open-source navigation tool being developed by the Orbital Research 
@@ -77,7 +78,7 @@ to answer the needs of future deep-space exploration missions.
    .. grid-item-card::
       :text-align: center
       
-      | :fa:`file-lines, fa-file-lines fa-3x`
+      | :fas:`file-lines;fa-3x`
       |
       | **User Guide**
       ^^^^^^^^^^^^^^^^
@@ -99,7 +100,7 @@ to answer the needs of future deep-space exploration missions.
    .. grid-item-card::
       :text-align: center
       
-      | :fa:`file-code, fa-file-code fa-3x`
+      | :fas:`file-code;fa-3x`
       |
       | **API Reference**
       ^^^^^^^^^^^^^^^^^^^
@@ -123,7 +124,7 @@ to answer the needs of future deep-space exploration missions.
    .. grid-item-card::
       :text-align: center
       
-      | :fa:`terminal, fa-terminal fa-3x`
+      | :fas:`terminal;fa-3x`
       |
       | **Learn Scarabaeus**
       ^^^^^^^^^^^^^^^^^^^^^^
@@ -145,7 +146,7 @@ to answer the needs of future deep-space exploration missions.
    .. grid-item-card::
       :text-align: center
       
-      | :fa:`code-commit, fa-code-commit fa-3x`
+      | :fas:`code-commit;fa-3x`
       |
       | **Developer Guide**
       ^^^^^^^^^^^^^^^^^^^^^

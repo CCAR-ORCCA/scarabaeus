@@ -16,6 +16,7 @@ from scarabaeus import (
 
 import scarabaeus.utils.NumpyWrapper as np
 import warnings
+from scarabaeus.utils.Utils import Utils
 
 # ------------------#
 #  Generate Units  #
@@ -80,6 +81,10 @@ class ScenarioSetup:
         map_STM_to_t0: bool = False,
     ):
         self._mission_sequence = mission_sequence
+        # Static parameters carried through the segments that do not declare
+        # them, e.g. a thrust group resumed after a coast. Runs first: it can
+        # grow the per-segment states everything below is built from.
+        self._dormant_parameters = mission_sequence.carry_static_parameters()
         self._len_sequence = len(self.mission_sequence.names)
         self._map_STM_to_t0 = map_STM_to_t0
         self._propagator = self.mission_sequence.props[0]
@@ -325,7 +330,9 @@ class ScenarioSetup:
         Returns
         -------
         dict
-        key=(name,size,sid,frame_name,occ) -> meta dict with:
+            Keyed by ``(name, size, sid, frame_name, occ)``; each value is a
+            meta dict with:
+
             - name, size, sid, frame_name, occ
             - gs, ge (global slice)
             - units (from template awf)
@@ -403,12 +410,13 @@ class ScenarioSetup:
         definitions and a unified global state space.
 
         The process:
+
         1. Calculates the total size N of the global state vector from the scenario definition
         2. Iterates through each model in the mission sequence that has a 'state' attribute
         3. Builds a mapping of state keys (name, size, body SPICE ID, frame name, occurrence count)
-            to their corresponding state objects (awf - attitude/widget/frame objects)
+           to their corresponding state objects (awf - attitude/widget/frame objects)
         4. For each mapped state, retrieves its initial values from the model and places them
-            in the appropriate position within the global state vector
+           in the appropriate position within the global state vector
         5. Tracks which states have been filled to avoid duplicates
 
         Returns
@@ -609,22 +617,10 @@ class ScenarioSetup:
         If three variables are added with sizes [2, 3, 2], the returned offsets would be:
         {(var1_key, 0): (0, 2), (var2_key, 0): (2, 5), (var3_key, 0): (5, 7)}
         """
-        offsets = {}
-        cursor = 0
-        occ_counter = {}
-        for name, size, est_type, dyn_type, body, awf in state_def:
-            base = (
-                name,
-                int(size),
-                getattr(body, "spice_id", None),
-                getattr(getattr(awf, "frame", None), "name", None),
-            )
-            occ = occ_counter.get(base, 0)
-            occ_counter[base] = occ + 1
-            key = (*base, int(occ))
-            offsets[key] = (cursor, cursor + int(size))
-            cursor += int(size)
-        return offsets
+        return {
+            key: (start, start + size)
+            for key, start, size, _entry in Utils.enumerate_state_blocks(state_def)
+        }
 
     def _build_scenario_state_def(self):
         """
@@ -636,18 +632,21 @@ class ScenarioSetup:
         body spice_id, and frame name) and occurrence count. Components are deduplicated to
         prevent redundant state entries while maintaining the order in which they are first
         encountered across models.
+
         Returns
         -------
         StateDefinition
             A unified StateDefinition object constructed from the deduplicated union of all
             state components across all models in the mission sequence.
+
         Notes
         -----
         - Only models with a "state" attribute are considered.
         - Deduplication is based on component name, size, body spice_id, frame name, and
           occurrence count within each state list.
         - The deterministic order is preserved by iterating through models in sequence and
-          adding unseen components as they appear.
+          adding unseen components as they appear, then stably moving considered (and
+          static) components after estimated (and dynamic) ones.
         """
 
         # Gather all components across all segments that have a "state"
@@ -678,7 +677,30 @@ class ScenarioSetup:
                 seen.add(key)
                 union.append((name, size, est_type, dyn_type, body, awf))
 
-        return StateDefinition.from_components(union)
+        return StateDefinition.from_components(self._ordered_components(union))
+
+    @staticmethod
+    def _ordered_components(components):
+        """
+        Stably move considered (and static) components after estimated (and dynamic) ones.
+
+        A later leg can add estimated (or dynamic) components after an earlier
+        leg's considered (or static) ones, which StateDefinition rejects. An
+        already ordered list is returned unchanged; scenario components are
+        located by key, not position.
+
+        Parameters
+        ----------
+        components : list of tuple
+            ``(name, size, est_type, dyn_type, body, awf)`` components.
+
+        Returns
+        -------
+        list of tuple
+            The same components, estimated before considered and, within each,
+            dynamic before static.
+        """
+        return sorted(components, key=lambda c: (c[2] == "considered", c[3] == "static"))
 
     def _sid(self, body):
         return getattr(body, "spice_id", None)
@@ -746,9 +768,11 @@ class ScenarioSetup:
         epochs: EpochArray for that segment
         drop_last: drop endpoint to avoid duplication at nodes
         """
-        # Slice epochs
+        # Slice epochs. A one-sample slice yields a scalar, so keep it 1-D:
+        # short segments (a two-epoch leg with its endpoint dropped at a node)
+        # must accumulate like any other.
         e = epochs[:-1] if drop_last else epochs
-        e_vals = e.times.values
+        e_vals = np.atleast_1d(e.times.values)
         e_units = e.times.units
         e_frame = e.system
 
@@ -869,7 +893,7 @@ class ScenarioSetup:
         if not components:
             return self._propagated_state_array
 
-        sd = StateDefinition.from_components(components)
+        sd = StateDefinition.from_components(self._ordered_components(components))
         return StateArray(
             epoch=full_epochs,
             origin=self._origin,
@@ -884,16 +908,20 @@ class ScenarioSetup:
         as the single source of truth for initial conditions and continuity across segments.
 
         Key behaviors:
+
         - For each Leg/Finite Burn:
-            * build leg->global mapping
-            * extract leg IC from global vector
-            * apply any pending impulsive burn to BOTH (global and leg IC) consistently
-            * propagate
-            * update global vector from terminal propagated state
+
+          * build the leg-to-global mapping
+          * extract leg IC from global vector
+          * apply any pending impulsive burn to BOTH (global and leg IC) consistently
+          * propagate
+          * update global vector from terminal propagated state
+
         - For each Impulsive Burn:
-            * snapshot segment outputs
-            * store pending dv to be applied at next leg
-            * (global velocity is updated at the next leg, using that leg’s velocity key)
+
+          * snapshot segment outputs
+          * store pending dv to be applied at next leg
+          * (global velocity is updated at the next leg, using that leg's velocity key)
 
         Parameters
         ----------
@@ -945,6 +973,19 @@ class ScenarioSetup:
         last_leg_offsets = (
             None  # store offsets from last propagated leg (useful for dv routing)
         )
+
+        # Each leg starts from the mass profile the previous leg fitted onto the
+        # spacecraft, so a repeated propagation of this sequence (every filter
+        # iteration) must first rewind the spacecraft to its initial mass.
+        # Otherwise the first leg inherits the previous run's final mass.
+        reset_bodies = set()
+        for sequence in range(self.len_sequence):
+            if self.mission_sequence.types[sequence] not in ("Leg", "Finite Burn"):
+                continue
+            body = self.mission_sequence.props[sequence].primary_body
+            if id(body) not in reset_bodies:
+                reset_bodies.add(id(body))
+                body.reset_mass_history()
 
         # Loop through mission sequence
         for sequence in range(self.len_sequence):
@@ -1119,17 +1160,35 @@ class ScenarioSetup:
                             f"  {name:<12s} n={int(size):2d} sid={sid} frame={frame} vals[:6]={head}"
                         )
 
+                # A deferred segment declares only its bounds: integrate between
+                # them and let the integrator choose the samples in between.
+                deferred = bool(self.mission_sequence.deferred_grids[sequence])
+                tspan_leg = (epochs[0], epochs[-1]) if deferred else epochs
+
                 self.propagator.reinitialize(
                     state_vector=self._state_vector_old,
-                    tspan=epochs,
+                    tspan=tspan_leg,
                     STM0=new_STM,
                     atol=atol,
                     rtol=rtol,
+                    dormant_parameters=self._dormant_parameters[sequence],
                 )
 
                 self.propagator.propagate()
                 sa = self.propagator.propagated_state_array
                 self._propagated_state_array = sa
+
+                # Adopt the grid the integrator produced, so that everything
+                # downstream (SPK segments, measurements, filters) sees the
+                # epochs the states actually sit on.
+                if deferred:
+                    epochs = sa.epoch
+                    self.mission_sequence.adopt_propagated_grid(sequence, epochs)
+                    if verbose:
+                        print(
+                            f"[GRID] segment='{seg_name}' adopted {len(epochs)} "
+                            "integrator-chosen epochs"
+                        )
 
                 # -------------------------
                 # Update scenario-global vector from terminal propagated state
@@ -1138,11 +1197,12 @@ class ScenarioSetup:
 
                 # useful printout to know what the global state vector looks like at each node,
                 # and to verify the leg->global mapping is correct
-                print(f"\n[GLOBAL STATE after '{seg_name}']")
-                for key, (gs, ge) in self._scenario_index_map.items():
-                    print(
-                        f"  key={key} -> global[{gs}:{ge}] = {self._global_state_value[gs:ge]}"
-                    )
+                if verbose:
+                    print(f"\n[GLOBAL STATE after '{seg_name}']")
+                    for key, (gs, ge) in self._scenario_index_map.items():
+                        print(
+                            f"  key={key} -> global[{gs}:{ge}] = {self._global_state_value[gs:ge]}"
+                        )
 
                 # -------------------------
                 # Update legacy tracking variable
@@ -1342,10 +1402,12 @@ class ScenarioSetup:
         using a composite key of (parameter name, spice_id, size). For matched parameters, the
         previous quantity values are inherited; for new parameters, their initial condition values
         are used. All parameters are wrapped in new ArrayWFrame objects.
+
         Parameters
         ----------
         new_list : list
             A list of tuples, each containing:
+
             - cname (str): Parameter name
             - csize: Parameter size
             - cest: Parameter estimate
@@ -1490,8 +1552,8 @@ class ScenarioSetup:
         # Build old layout maps using the *existing* state_vector_old.state (previous definition)
         old_list = list(self._state_vector_old.state)
 
-        old_blocks, old_simple, old_size = _build_block_offsets(old_list)
-        new_blocks, new_simple, _ = _build_block_offsets(new_list)
+        # ``new_simple`` drives the dv_man MTM injection below.
+        _, new_simple, _ = _build_block_offsets(new_list)
 
         # Old STM numeric matrix (support ArrayWFrame/ArrayWUnits or ndarray)
         try:
@@ -1503,37 +1565,11 @@ class ScenarioSetup:
         if STM_old_mat.ndim != 2 or STM_old_mat.shape[0] != STM_old_mat.shape[1]:
             raise ValueError(f"STM_old must be square, got shape {STM_old_mat.shape}.")
 
-        # Copy matching blocks from old STM into new STM
-        # We match by (name,sid) and then by occurrence index if multiple.
-        for (name, sid), new_list_blocks in new_simple.items():
-            old_list_blocks = old_simple.get((name, sid), None)
-            if old_list_blocks is None:
-                continue
-            nmatch = min(len(new_list_blocks), len(old_list_blocks))
-            for k in range(nmatch):
-                n0, n1, nd = new_list_blocks[k]
-                o0, o1, od = old_list_blocks[k]
-                dd = min(nd, od)
-
-                # Diagonal block
-                new_STM[n0 : n0 + dd, n0 : n0 + dd] = STM_old_mat[
-                    o0 : o0 + dd, o0 : o0 + dd
-                ]
-
-                # Cross blocks: for every other parameter that also matches, copy cross-partials
-                for (name2, sid2), new_list_blocks2 in new_simple.items():
-                    old_list_blocks2 = old_simple.get((name2, sid2), None)
-                    if old_list_blocks2 is None:
-                        continue
-                    nmatch2 = min(len(new_list_blocks2), len(old_list_blocks2))
-                    for k2 in range(nmatch2):
-                        m0, m1, md = new_list_blocks2[k2]
-                        p0, p1, pd = old_list_blocks2[k2]
-                        dd_r = min(nd, od)
-                        dd_c = min(md, pd)
-                        new_STM[n0 : n0 + dd_r, m0 : m0 + dd_c] = STM_old_mat[
-                            o0 : o0 + dd_r, p0 : p0 + dd_c
-                        ]
+        # Reorder/select the old STM into the new layout: Phi' = Q Phi Q^T, with
+        # an identity block for any newly augmented states. The Q operator matches
+        # blocks on (name, spice_id, occurrence) — same convention as before.
+        Q, _q_n, q_new_blocks = Utils.build_reorder_operator(old_list, new_list)
+        new_STM = Utils.reorder_stm(Q, STM_old_mat, q_new_blocks)
 
         # dv_man -> MTM injection
         if self.delta_v is not None:
@@ -1567,6 +1603,7 @@ class ScenarioSetup:
         """
         Reinitialize the scenario state definition and propagate changes throughout the mission sequence.
         This method performs a comprehensive state schema migration that:
+
         1. Snapshots the current global state vector
         2. Installs the new state definition and associated index mapping
         3. Projects values from the old global state to the new one, preserving overlapping keys
@@ -1574,6 +1611,7 @@ class ScenarioSetup:
         5. Updates all StateArray models with new values from the global state vector
         6. Reinitializes ImpulsiveBurn models from their corresponding DV parameter blocks
         7. Resets cached state tracking variables (STM, state vector, state size)
+
         Parameters
         ----------
         new_state_def : StateDefinition
@@ -1588,9 +1626,7 @@ class ScenarioSetup:
         update_states_n : bool, optional
             If True, update the states_n tracking array with the new state dimensions for each
             rebuilt model. Default is False.
-        Returns
-        -------
-        None
+
         Notes
         -----
         - State key matching is based on (name, size, spice_id, frame_name, occurrence_index)
@@ -1623,20 +1659,10 @@ class ScenarioSetup:
 
         def _model_key_map(state_list):
             """key=(name,size,sid,frame,occ) -> (name,size,est_type,dyn_type,body,awf)"""
-            occ_counter = {}
-            m = {}
-            for name, size, est_type, dyn_type, body, awf in state_list:
-                base = (
-                    name,
-                    int(size),
-                    getattr(body, "spice_id", None),
-                    getattr(getattr(awf, "frame", None), "name", None),
-                )
-                occ = occ_counter.get(base, 0)
-                occ_counter[base] = occ + 1
-                key = (*base, int(occ))
-                m[key] = (name, size, est_type, dyn_type, body, awf)
-            return m
+            return {
+                key: entry
+                for key, _start, _size, entry in Utils.enumerate_state_blocks(state_list)
+            }
 
         # -------------------------
         # 1) Snapshot old global state/map (flattened!)

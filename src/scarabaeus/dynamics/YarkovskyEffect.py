@@ -25,7 +25,7 @@ class YarkovskyEffect(DynamicModel):
         \\mathbf{a}_\\text{Yark} =
             A_2 \\left(\\frac{r_0}{r}\\right)^2 \\hat{t}
 
-    where :math:`A_2` is the Yarkovsky parameter (km/s² at :math:`r_0`),
+    where :math:`A_2` is the Yarkovsky parameter (km/s^2 at :math:`r_0`),
     :math:`r_0` is a reference distance (default: 1 AU), :math:`r` is the
     heliocentric distance, and :math:`\\hat{t} = \\mathbf{v}/|\\mathbf{v}|`
     is the unit velocity vector.
@@ -36,8 +36,6 @@ class YarkovskyEffect(DynamicModel):
 
     Parameters
     ----------
-    state_vector : StateArray
-        State vector used to identify bodies carrying a Yarkovsky parameter.
     base_frame : Frame
         Reference frame in which accelerations are returned.
     param_name : str, optional
@@ -47,12 +45,11 @@ class YarkovskyEffect(DynamicModel):
         Reference distance for the inverse-square scaling.
         Defaults to 1 AU (``1.495978707e8`` km).
 
-    Notes
-    -----
-    The state vector must contain ``("position", spice_id)``,
-    ``("velocity", spice_id)``, and ``("A2_yark", spice_id)`` entries for
-    each Yarkovsky-active body.  State keys follow the
-    :meth:`~scarabaeus.StateArray._make_direct_representation` convention.
+    Raises
+    ------
+    ValueError
+        If any ``param_name`` entry in the propagated state belongs to an owner
+        without a ``spice_id`` attribute.
 
     See Also
     --------
@@ -60,17 +57,18 @@ class YarkovskyEffect(DynamicModel):
     scarabaeus.nPlateSRP : Multi-plate SRP model.
     scarabaeus.ForceModelTranslation : Aggregator that instantiates this model.
 
-    Raises
-    ------
-    ValueError
-        If any ``param_name`` entry in *state_vector* belongs to an owner
-        without a ``spice_id`` attribute.
+    Notes
+    -----
+    The state vector must contain ``("position", spice_id)``,
+    ``("velocity", spice_id)``, and ``("A2_yark", spice_id)`` entries for
+    each Yarkovsky-active body.  State keys follow the
+    :meth:`~scarabaeus.StateArray._make_direct_representation` convention.
 
     References
     ----------
-    Farnocchia, D., Chesley, S. R., Vokrouhlický, D., Milani, A., Spoto, F.,
-    & Bottke, W. F. (2013). Near Earth Asteroids with measurable Yarkovsky
-    effect. *Icarus*, 224(1), 1–13. https://doi.org/10.1016/j.icarus.2013.02.004
+    .. [1] Farnocchia, D., Chesley, S. R., Vokrouhlický, D., Milani, A., Spoto, F.,
+       & Bottke, W. F. (2013). Near Earth Asteroids with measurable Yarkovsky
+       effect. *Icarus*, 224(1), 1–13. https://doi.org/10.1016/j.icarus.2013.02.004
     """
 
     # -------------#
@@ -78,12 +76,10 @@ class YarkovskyEffect(DynamicModel):
     # -------------#
     def __init__(
         self,
-        state_vector: StateArray,
         base_frame: Frame,
         param_name: str = "A2_yark",
         r0: ArrayWUnits | None = None,
     ):
-        self._state_vector = state_vector
         self._ref_frame = base_frame
         self._param_name = param_name
 
@@ -93,17 +89,11 @@ class YarkovskyEffect(DynamicModel):
         else:
             self._r0_km = float(r0.to(km).values)
 
-        # Identify which bodies have A2_yark defined
+        # A body is Yarkovsky-active when the propagated state carries its
+        # parameter; that is checked per evaluation by _is_active, so no state
+        # vector is needed here. The set stays as an override hook for callers
+        # that want to force a body active.
         self._yarkovsky_bodies: set[int] = set()
-        for name, _, _, _, owner, _ in state_vector.state:
-            if name == self._param_name:
-                spice_id = getattr(owner, "spice_id", None)
-                if spice_id is None:
-                    raise ValueError(
-                        f"YarkovskyEffect: parameter '{self._param_name}' "
-                        f"requires an owner with 'spice_id'. Got {owner!r}."
-                    )
-                self._yarkovsky_bodies.add(spice_id)
 
     # -------------------------#
     #       Properties         #
@@ -126,35 +116,67 @@ class YarkovskyEffect(DynamicModel):
     # ----------------#
     #     Helpers     #
     # ----------------#
+    def _is_active(self, spice_id, current_state: dict) -> bool:
+        """
+        Report whether the Yarkovsky parameter applies to *spice_id*.
+
+        A body is active when the propagated state carries its parameter, or
+        when a caller has forced it into :attr:`yarkovsky_bodies`.
+
+        Parameters
+        ----------
+        spice_id : int or None
+            SPICE ID of the body being evaluated.
+        current_state : dict
+            Dictionary containing the current state parameters.
+
+        Returns
+        -------
+        bool
+            ``True`` when the model contributes for this body.
+        """
+        if spice_id is None:
+            return False
+
+        return (
+            (self._param_name, spice_id) in current_state
+            or spice_id in self._yarkovsky_bodies
+        )
+
     def _get_A2(self, current_state: dict, body: CelestialBody) -> float:
         """
-        Get A2 associated with `body` from current_state.
+        Return the Yarkovsky :math:`A_2` parameter of ``body``.
 
-        Expected key: (param_name, body.spice_id).
+        Parameters
+        ----------
+        current_state : dict
+            Current full-state representation from the integrator, keyed by
+            ``(name, spice_id)``.
+        body : CelestialBody
+            Body whose parameter is read.
 
-        Behavior
-        --------
-        - If body is NOT in `self._yarkovsky_bodies`:
-            returns 0.0 (no Yarkovsky effect).
-        - If body IS in `self._yarkovsky_bodies` but the parameter
-          is missing in `current_state`: raises ValueError.
+        Returns
+        -------
+        float
+            The value stored under ``(param_name, body.spice_id)``, or ``0.0``
+            when the body has no ``spice_id`` or the model is not active for it
+            (see :meth:`_is_active`).
+
+        Raises
+        ------
+        KeyError
+            If the body was forced into :attr:`yarkovsky_bodies` but the state
+            carries no parameter for it.
         """
         spice_id = getattr(body, "spice_id", None)
         if spice_id is None:
             return 0.0
 
-        if spice_id not in self._yarkovsky_bodies:
+        if not self._is_active(spice_id, current_state):
             return 0.0  # not configured for Yarkovsky
 
-        key = (self._param_name, spice_id)
-        if key not in current_state:
-            raise ValueError(
-                f"YarkovskyEffect: body with spice_id={spice_id} is marked as "
-                f"Yarkovsky-active but '{self._param_name}' is missing in current_state."
-            )
-
-        val = current_state[key]
-        return float(val.values if hasattr(val, "values") else val)
+        val = current_state[(self._param_name, spice_id)]
+        return self._scalar_from_state(val)
 
     def _get_velocity(self, current_state: dict, body: CelestialBody) -> np.ndarray:
         """
@@ -209,7 +231,7 @@ class YarkovskyEffect(DynamicModel):
             Zero if the body is not configured for Yarkovsky.
         """
         spice_id = getattr(body, "spice_id", None)
-        if spice_id not in self._yarkovsky_bodies:
+        if not self._is_active(spice_id, current_state):
             return np.zeros(3, dtype=float)
 
         r_vec = np.asarray(position, dtype=float)
@@ -246,7 +268,7 @@ class YarkovskyEffect(DynamicModel):
             Zero if the body is not Yarkovsky-active or data is insufficient.
         """
         spice_id = getattr(body, "spice_id", None)
-        if spice_id not in self._yarkovsky_bodies:
+        if not self._is_active(spice_id, current_state):
             return np.zeros(3, dtype=float)
 
         r_vec = np.asarray(position, dtype=float)
@@ -275,20 +297,38 @@ class YarkovskyEffect(DynamicModel):
         body: CelestialBody,
     ) -> np.ndarray:
         """
-        da_Yark / dr (3x3) for:
-            a = A2 * (r0/r)^2 * t_hat
-        where r = ||position|| and t_hat = v/||v||.
+        Compute the partial of the Yarkovsky acceleration with respect to position.
 
-        Here we treat v (thus t_hat) as independent of position for this partial
-        (i.e., the direct dependence through the model expression only).
+        For :math:`\\mathbf{a} = A_2 (r_0/r)^2\\,\\hat{\\mathbf{t}}` with
+        :math:`r = \\lVert\\mathbf{r}\\rVert` and
+        :math:`\\hat{\\mathbf{t}} = \\mathbf{v}/\\lVert\\mathbf{v}\\rVert`,
+
+        .. math::
+
+            \\frac{\\partial\\mathbf{a}}{\\partial\\mathbf{r}}
+            = -\\frac{2 A_2 r_0^2}{r^4}\\,\\hat{\\mathbf{t}}\\,\\mathbf{r}^{\\mathsf{T}},
+
+        treating :math:`\\hat{\\mathbf{t}}` as independent of position.
+
+        Parameters
+        ----------
+        position : np.ndarray
+            Current position vector, in km.
+        current_state : dict
+            The propagated state, keyed by ``(name, spice_id)``.
+        epoch : float
+            Current epoch, in TDB seconds past J2000. Unused.
+        body : CelestialBody
+            The propagated body.
 
         Returns
         -------
         np.ndarray
-            3x3 matrix.
+            ``(3, 3)`` partial, in 1/s^2; zeros when the body is not
+            Yarkovsky-active or the position or velocity is zero.
         """
         spice_id = getattr(body, "spice_id", None)
-        if spice_id not in self._yarkovsky_bodies:
+        if not self._is_active(spice_id, current_state):
             return np.zeros((3, 3), dtype=float)
 
         r_vec = np.asarray(position, dtype=float).reshape(3)
@@ -335,7 +375,7 @@ class YarkovskyEffect(DynamicModel):
             3x3 matrix.
         """
         spice_id = getattr(body, "spice_id", None)
-        if spice_id not in self._yarkovsky_bodies:
+        if not self._is_active(spice_id, current_state):
             return np.zeros((3, 3), dtype=float)
 
         r_vec = np.asarray(position, dtype=float).reshape(3)

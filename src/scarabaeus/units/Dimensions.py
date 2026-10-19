@@ -185,6 +185,10 @@ class Dimensions:
         return self.name
 
     def __eq__(self, other) -> bool:
+        # the same object: nothing to compare
+        if self is other:
+            return True
+
         ## input validation
         if not isinstance(other, self.__class__):
             bad_type_err = (

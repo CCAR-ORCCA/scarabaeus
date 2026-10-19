@@ -10,34 +10,28 @@ Setup includes:
 """
 
 import src.scarabaeus as scb
-from scarabaeus import ArrayWUnits as awu
-
 import json, os
-from pathlib import Path
-
 import pytest
-import numpy as np
-import spiceypy as spice
 
 J2000 = scb.Frame("J2000")
 kg, km, sec, rad = scb.Units.get_units(["kg", "km", "sec", "rad"])
 
 
-@pytest.fixture(scope="session", autouse=True)
+@pytest.fixture(scope="module", autouse=True)
 def setup(tmp_path_factory):
     """
     Initialization fixture for all tests. Loads neccesary
     files and ensure a clear kernel pool.
     """
     # clear kernel pool
-    spice.kclear()
+    scb.SpiceManager.clear_kernels()
 
     # generate meta kernel and load
     meta_kernel = meta_kernels(tmp_path_factory)
-    spice.furnsh(str(meta_kernel))
+    scb.SpiceManager.load_kernel_from_mkfile(str(meta_kernel))
 
     # load everything else
-    spice.furnsh(str(earth_bplane_(tmp_path_factory)))
+    scb.SpiceManager.load_kernel(str(earth_bplane_(tmp_path_factory)))
     json.load(open(nplate_config_json(tmp_path_factory)))
     json.load(open(trk_data_json(tmp_path_factory)))
     json.load(open(earth_config_json(tmp_path_factory)))
@@ -107,45 +101,99 @@ def nplate_config_file(tmp_path_factory):
 
 
 def trk_data_json(tmp_path_factory):
-    """Generate tracking config used in measurement tests."""
+    """
+    Generate tracking config used in measurement tests.
+
+    Three constraints this has to respect, each of which it used to break. They
+    went unnoticed because the fixtures that consume this file load the JSON and
+    assemble an aux dict from its blocks by hand -- nothing drove it through
+    ``observed_measurements``, so no time in it was ever parsed.
+
+    * ``sec`` is seconds **of day**, so 0 to 86400. The measurement blocks and
+      aux_SFDU_9/0 used ``[134516, 180000, 225501]``, which SpiceManager.YDS2et
+      turns into "2018-102::37:21:56", "50:00:00" and "62:38:21" -- all rejected
+      with SPICE(BADTIMESTRING). They now share the one valid grid the other aux
+      blocks already used, which is also how a real TRK-2-34 file reads: the
+      measurement tags and the aux tags describe the same observations.
+    * The ramp table has to **span** the observation window, and it is queried at
+      the uplink transmit time ``t1 = t3 - RTLT``, one round-trip light time
+      before the first measurement's tag. aux_SFDU_9 was on the same grid as the
+      measurements, so the first observation fell outside it
+      (RampTableManager.RampCoverageError). It now starts well before and ends
+      after.
+    * ``meas`` of -1 is the TRK-2-34 no-data sentinel, not a measurement.
+      2W_sranging was ``[-1, -1, -1]``, so a real read flags every row as an
+      outlier and leaves nothing to fit. It now carries ranging values, inside
+      the 1048576 RU modulo that aux_SFDU_7 declares.
+    """
+    # One time grid for the whole file: seconds of day, 124 s apart.
+    obs_sec = [59320.0, 59444.0, 59568.0]
+    # The ramp table brackets that window with room for a round trip either side.
+    ramp_sec = [56000.0, 59000.0, 62000.0]
+    ramp_freq = 6184394368.0
+
+    # Per-observation calibration and delay fields, which _read_aux expects to
+    # find inside the measurement block. This file originally carried them only
+    # in separate aux_SFDU_* blocks, an older layout: a read of it got past the
+    # time tags and then died on KeyError: 'exc_scalar_den'. The aux_SFDU_*
+    # blocks are kept as they were, because two fixtures assemble their own aux
+    # dict out of them, and the same values appear here so the file agrees with
+    # itself whichever way it is read.
+    radiometric = {
+        "spice_id": [35, 35, 35],
+        "outlier_flag": [0, 0, 0],
+        "ul_freq": [ramp_freq] * 3,
+        "ul_stn_cal": [0.0, 0.0, 0.0],
+        "dl_stn_cal": [0.0, 0.0, 0.0],
+        "ul_zheight_corr": [0.0, 0.0, 0.0],
+        "dl_zheight_corr": [0.0, 0.0, 0.0],
+        "transmit_time_tag_delay": [0.0, 0.0, 0.0],
+        "rcv_time_tag_delay": [0.0, 0.0, 0.0],
+        "array_delay": [0.0, 0.0, 0.0],
+        "exc_scalar_num": [221, 221, 221],
+        "exc_scalar_den": [23968, 23968, 23968],
+    }
+
     data = {
         "name": "beno",
         "2W_doppler": {
             "year": [2018, 2018, 2018],
             "doy": [102, 102, 102],
-            "sec": [134516, 180000, 225501],
+            "sec": list(obs_sec),
             "meas": [-8445848561.5, -8445848522.9, -8445848484.3],
-            "spice_id": [35, 35, 35],
-            "outlier_flag": [0, 0, 0],
             "scft_transpd_delay": [0.0, 0.0, 0.0],
-            "array_delay": [0.0, 0.0, 0.0],
-            "rcv_time_tag_delay": [0.0, 0.0, 0.0],
-            "transmit_time_tag_delay": [0.0, 0.0, 0.0],
+            **radiometric,
         },
         "2W_sranging": {
             "year": [2018, 2018, 2018],
             "doy": [102, 102, 102],
-            "sec": [134516, 180000, 225501],
-            "meas": [-1, -1, -1],
-            "spice_id": [35, 35, 35],
-            "outlier_flag": [0, 0, 0],
+            "sec": list(obs_sec),
+            "meas": [123456.0, 123789.0, 124122.0],
+            # Sequential ranging has no separate SFDU-7 block of its own: these
+            # are the SFDU-7 fields, which is why _read_aux reads them from here.
+            "rng_modulo": [1048576, 1048576, 1048576],
+            "rng_type": [1, 1, 1],
+            "version_num": [2, 2, 2],
+            "scft_transpd_turn_num": [880, 880, 880],
+            "scft_transpd_turn_den": [749, 749, 749],
+            **radiometric,
         },
         "aux_SFDU_9": {
             "year": [2018, 2018, 2018],
             "doy": [102, 102, 102],
-            "sec": [134516, 180000, 225501],
+            "sec": list(ramp_sec),
             "ramp_freq": [
                 6184394368.0,
                 6184394368.0,
-                76184394368.0,
+                6184394368.0,
             ],
             "ramp_rate": [0.0, 0.0, 0.0],
-            "ramp_type": [3, 0, 1],
+            "ramp_type": [1, 1, 1],
         },
         "aux_SFDU_0": {
             "year": [2018, 2018, 2018],
             "doy": [102, 102, 102],
-            "sec": [134516, 180000, 225501],
+            "sec": list(obs_sec),
             "exc_scalar_num": [1, 1, 1],
             "exc_scalar_den": [16, 16, 16],
             "rng_modulo": [1, 1, 1],
@@ -154,7 +202,7 @@ def trk_data_json(tmp_path_factory):
         "aux_SFDU_7": {
             "year": [2018, 2018, 2018],
             "doy": [102, 102, 102],
-            "sec": [59320.0, 59444.0, 59568.0],
+            "sec": list(obs_sec),
             "rng_modulo": [1048576, 1048576, 1048576],
             "exc_scalar_num": [221, 221, 221],
             "exc_scalar_den": [23968, 23968, 23968],
@@ -167,7 +215,7 @@ def trk_data_json(tmp_path_factory):
         "aux_SFDU_16": {
             "year": [2018, 2018, 2018],
             "doy": [102, 102, 102],
-            "sec": [59320.0, 59444.0, 59568.0],
+            "sec": list(obs_sec),
             "Tc": [60.0, 60.0, 60.0],
             "M2_num": [880, 880, 880],
             "M2_den": [749, 749, 749],
@@ -176,14 +224,14 @@ def trk_data_json(tmp_path_factory):
         "aux_SFDU_2": {
             "year": [2018, 2018, 2018],
             "doy": [102, 102, 102],
-            "sec": [59320.0, 59444.0, 59568.0],
+            "sec": list(obs_sec),
             "ul_zheight_corr": [0.0, 0.0, 0.0],
             "ul_cal_freq": [0.0, 0.0, 0.0],
         },
         "aux_SFDU_3": {
             "year": [2018, 2018, 2018],
             "doy": [102, 102, 102],
-            "sec": [59320.0, 59444.0, 59568.0],
+            "sec": list(obs_sec),
             "dl_zheight_corr": [0.0, 0.0, 0.0],
         },
     }

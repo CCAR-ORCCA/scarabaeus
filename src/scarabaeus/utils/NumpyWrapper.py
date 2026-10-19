@@ -71,6 +71,7 @@ if "UseAutoGrad" in os.environ.keys() and os.environ["UseAutoGrad"] == "TRUE":
 else:
     # Maintain identical public API/usage: export numpy-like symbols via star import.
     from numpy import *  # noqa: F401,F403
+    from numpy import max, min, abs, round # These are not in numpy.__all__ and need to be explicitly imported
 
     # Preserve name and meaning exactly.
     autograd_types = ()
