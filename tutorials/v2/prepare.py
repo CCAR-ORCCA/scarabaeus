@@ -27,6 +27,7 @@ PRODUCTS = {
         for dss in ("DSS-14", "DSS-43", "DSS-63")
         for kind in ("range", "range-rate")
     ],
+    "06_first_od_solution.ipynb": ["outputs/06_first_od_solution/solution.json"],
 }
 
 # Chapter -> notebooks whose products it reads, in the order they must run.
@@ -35,6 +36,7 @@ REQUIRES = {
     "04": ["02_truth_dynamics.ipynb"],
     "05": ["02_truth_dynamics.ipynb", "03_tracking_data.ipynb"],
     "06": ["02_truth_dynamics.ipynb", "03_tracking_data.ipynb"],
+    "07": ["02_truth_dynamics.ipynb", "03_tracking_data.ipynb", "06_first_od_solution.ipynb"],
 }
 
 
