@@ -47,8 +47,8 @@ IV.  How-tos          maneuvers, B-plane, media corrections, n-plate and attitud
 | Chapter | Status |
 |---|---|
 | Quickstart, 1–6 | draft, in review |
-| 7 | draft |
-| 8–9 | planned |
+| 7–8 | draft |
+| 9 | planned |
 | Fundamentals, catalogs, how-tos | planned |
 
 ## Where the current notebooks go

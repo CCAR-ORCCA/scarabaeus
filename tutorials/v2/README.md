@@ -16,7 +16,7 @@ One scenario, start to finish: OSIRIS-REx on approach to Bennu, June 1–8, 2018
 | 5 | [The filter's measurement model](05_filter_measurements.ipynb) | draft |
 | 6 | [Your first OD solution](06_first_od_solution.ipynb) | draft |
 | 7 | [Sequential filtering & process noise](07_sequential_filtering.ipynb) | draft |
-| 8 | Estimating more: parameters, consider, editing | planned |
+| 8 | [Estimating more: parameters, consider, editing](08_estimating_more.ipynb) | draft |
 | 9 | Tracking data II: real DSN data | planned |
 
 ## Running
@@ -31,7 +31,7 @@ Each notebook writes its products to `outputs/<notebook>/` (git-ignored).
 
 ### Starting at a later chapter
 
-Chapters 3–7 read files produced by earlier chapters (chapter 2's truth trajectory, chapter 3's tracking data, chapter 6's batch solution). To start at a later chapter, generate those inputs first:
+Chapters 3–8 read files produced by earlier chapters (chapter 2's truth trajectory, chapter 3's tracking data, chapter 6's batch solution). To start at a later chapter, generate those inputs first:
 
 ```bash
 python prepare.py 06            # runs chapters 2 and 3 headlessly (about 15 s)

@@ -37,6 +37,7 @@ REQUIRES = {
     "05": ["02_truth_dynamics.ipynb", "03_tracking_data.ipynb"],
     "06": ["02_truth_dynamics.ipynb", "03_tracking_data.ipynb"],
     "07": ["02_truth_dynamics.ipynb", "03_tracking_data.ipynb", "06_first_od_solution.ipynb"],
+    "08": ["02_truth_dynamics.ipynb", "03_tracking_data.ipynb"],
 }
 
 
