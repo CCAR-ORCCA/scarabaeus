@@ -48,7 +48,7 @@ IV.  How-tos          maneuvers, B-plane, media corrections, n-plate and attitud
 |---|---|
 | Quickstart, 1–6 | draft, in review |
 | 7–8 | draft |
-| 9 | planned |
+| 9 | draft: model validation done; real-data fit blocked by `DopplerReal` partials |
 | Fundamentals, catalogs, how-tos | planned |
 
 ## Where the current notebooks go
