@@ -17,10 +17,11 @@ One scenario, start to finish: OSIRIS-REx on approach to Bennu, June 1–8, 2018
 | 6 | [Your first OD solution](06_first_od_solution.ipynb) | draft |
 | 7 | [Sequential filtering & process noise](07_sequential_filtering.ipynb) | draft |
 | 8 | [Estimating more: parameters, consider, editing](08_estimating_more.ipynb) | draft |
-| 9 | [Tracking data II: real DSN data](09_real_dsn_data.ipynb) | draft (fit blocked, see chapter) |
+| 9 | [Tracking data II: real DSN data](09_real_dsn_data.ipynb) | draft (ranging offset open, see chapter) |
 
 ## Running
 
+0. The notebooks target **Scarabaeus 2.0** (currently on `origin/sync/internal-2026-10-19`); they no longer run on 1.x. On recent macOS, build the Rust extension with `CARGO_PROFILE_RELEASE_STRIP=none` (see PLAN.md).
 1. Download the tutorial data once (the existing loader in `tutorials/supplementary` fetches the kernels):
    ```bash
    cd tutorials && python -c "import supplementary as s; s.load_data()"
