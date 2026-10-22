@@ -47,10 +47,6 @@ To get started with Scarabaeus, follow the [Installation Guide](https://ccar-orc
 
 Contributions are welcome. Please read [CONTRIBUTING.md](CONTRIBUTING.md) and the [developer guide](https://ccar-orcca.github.io/scarabaeus-docs/development/development_frontpage.html) before opening a pull request.
 
-### Reporting issues
-
-Open a GitHub Issue and include: a short title, steps to reproduce (minimal working example preferred), expected vs. actual behaviour, and your Scarabaeus version, Python version, and OS. For security vulnerabilities, contact the maintainers directly.
-
 ---
 
 ## Citing Scarabaeus
