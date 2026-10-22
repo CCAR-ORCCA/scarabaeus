@@ -140,7 +140,7 @@ Rules:
 I. Core series — "Navigating OSIRIS-REx" (in order)
    1  Scenario & truth             kernels, epochs, spacecraft; propagate the truth; force-model fidelity; SPK
    2  Tracking data                stations and visibility; simulate range/range-rate; measurement files; noise check
-   3  Your first OD solution       a-priori and P0; SRIFB fit; residuals; errors vs. 3σ; covariance shape; June 8 prediction
+   3  First OD solution            a-priori and P0; SRIFB fit; residuals; errors vs. 3σ; covariance shape; June 8 prediction
    4  Validating a model           what fit() linearizes: STM, partials, HΦδx₀; a checklist for any new model
    5  Sequential filtering         SRIF/LKF, smoothing, equivalence with batch
    6  When the dynamics are wrong  one SRP mismodel, four responses: ignore, SNC, estimate η, consider η
@@ -182,7 +182,7 @@ Draft 03, plus the station-visibility plot from draft 01 (it belongs next to the
 
 **Produces:** six measurement files.
 
-### 3. Your first OD solution
+### 3. First OD solution
 
 Draft 06, with the a-priori state and P₀ from draft 04 set up inline (about 10 lines; the flags table moves to *Fundamentals: Defining a state*). Keep: iteration table, pre/post-fit residuals, error vs. 3σ, line-of-sight vs. plane-of-sky covariance, the LSB swap. Replace the June 10 prediction with the **first scoreboard** at `t_pass`.
 
