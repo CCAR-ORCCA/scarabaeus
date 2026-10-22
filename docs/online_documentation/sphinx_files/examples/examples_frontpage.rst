@@ -14,7 +14,12 @@
 :gold:`Scarabaeus Examples`
 ============================
 
-Hands-on Jupyter notebooks that walk through Scarabaeus from first principles to
+.. note::
+    Tutorials are currently undergoing a major overhaul and therefore the following are not guaranteed to function properly. 
+
+    This overhaul will be published soon.
+
+Jupyter notebooks that walk through Scarabaeus from first principles to
 full orbit-determination campaigns. Notebooks are organized in three tiers — **Basics**,
 **Intermediate**, and **Advanced** — and can be run in order or consulted independently.
 

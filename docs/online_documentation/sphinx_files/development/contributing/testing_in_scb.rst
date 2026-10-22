@@ -22,6 +22,11 @@
 =================================
 Last revised on 2026 MAY 28 by G. Fereoli.
 
+.. note::
+    The SCB testing suite is currently undergoing a major overhaul and therefore the following are not guaranteed to function properly. 
+
+    This overhaul will be published soon.
+
 Scarabaeus (SCB) uses `pytest <https://docs.pytest.org>`_ for automated testing. The test
 suite lives in ``tests/`` at the repository root and is split into unit and system
 tests. The system tests are further divided into functional, integration, V&V, and 
