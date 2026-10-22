@@ -21,38 +21,6 @@
 
 .. note:: Scarabaeus has not been added to PyPi yet. You will need to compile Rust source code in order for it to function correctly, see :ref:`the developer guide <devenviron>` for further instructions.
 
-------------------------
-:gold:`Requirements`
-------------------------
-
-.. list-table::
-   :header-rows: 1
-   :widths: 30 20 50
-
-   * - Dependency
-     - Version
-     - Notes
-   * - Python
-     - 3.11+
-     - Required
-   * - NumPy
-     - latest
-     - Array mathematics
-   * - SciPy
-     - latest
-     - Integrators and linear algebra
-   * - SpiceyPy
-     - latest
-     - SPICE toolkit Python wrapper
-   * - matplotlib
-     - latest
-     - Plotting utilities
-   * - Rust / Cargo
-     - 1.75+
-     - **Developer builds only** — not required for users
-
-The full dependency list is managed in ``pyproject.toml`` and is installed automatically by ``pip``.
-
 ------------------------------
 :gold:`User Installation`
 ------------------------------
@@ -68,36 +36,14 @@ The full dependency list is managed in ``pyproject.toml`` and is installed autom
 
 .. code-block:: bash
 
-   python -m venv .venv
    # macOS / Linux
-   source .venv/bin/activate
-   # Windows
-   .venv\Scripts\activate
+  python3 -m venv .venv
+  source .venv/bin/activate
+
+  # Windows
+  python -m venv .venv
+  .venv\Scripts\activate
 
 **3. Install Scarabaeus**
 
-.. .. code-block:: bash
-
-..    pip install .
-
-Currently, Scarabaeus can only be installed in developer mode, see :ref:`the Dev Environment Guide <devenviron>` for more on how to do this.
-
-.. Once the package is published on PyPI, users will also be able to install with:
-
-.. .. code-block:: bash
-
-..    pip install scarabaeus
-
-.. .. note::
-
-..    **SPICE kernels** — Scarabaeus uses SPICE kernels for ephemeris, reference frames, and
-..    spacecraft clock data. These are not distributed with the package. Load them in your
-..    script with:
-
-..    .. code-block:: python
-
-..       import scarabaeus as scb
-..       scb.SpiceManager.load_kernel_from_mkfile("path/to/metakernel.tm")
-
-..    See `NAIF's kernel guide <https://naif.jpl.nasa.gov/naif/toolkit.html>`_ for details on
-..    obtaining and configuring kernels.
+Currently, Scarabaeus can only be installed in developer mode, see :ref:`the Dev Environment Guide <devenviron>` for more on how to do this. Developer mode includes all SCB functionality in addition to tools for developing tests and Rust binding.

@@ -11,11 +11,11 @@
 .. role:: gold
 
 ============================
-:gold:`Scarabaeus Tutorials`
+:gold:`Scarabaeus Examples`
 ============================
 
 Hands-on Jupyter notebooks that walk through Scarabaeus from first principles to
-full orbit-determination campaigns.  Notebooks are organized in three tiers — **Basics**,
+full orbit-determination campaigns. Notebooks are organized in three tiers — **Basics**,
 **Intermediate**, and **Advanced** — and can be run in order or consulted independently.
 
 Before starting, see the :ref:`tutorials primer <tuts-setup>` for setup instructions and

@@ -3,15 +3,10 @@
 # SPDX-License-Identifier: ISC
 set -e
 
-# Build the docs locally only: no dependency install, no push to the
-# public scarabaeus-docs repo.
-# Assumes sphinx and the doc extensions are already installed in the
-# active env. Output goes to docs/online_documentation/_build/, which is
-# gitignored.
+# Build the docs locally only
 cd "$(dirname "$0")/.."
 
 python3 docs/online_documentation/sphinx_files/release_notes/release_gen.py
 python3 -m sphinx -b html docs/online_documentation/sphinx_files docs/online_documentation/_build
 
 echo "Docs built at $(pwd)/docs/online_documentation/_build/index.html"
-echo "Serve with: scbdoc"
