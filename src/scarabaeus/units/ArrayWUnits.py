@@ -7,10 +7,7 @@ import numpy
 import numpy.typing as npt
 
 import sys
-if sys.version_info >= (3, 11):
-    from typing import Self
-else:
-    from typing_extensions import Self
+from typing import Self
 import operator
 import warnings
 
@@ -111,6 +108,77 @@ class ArrayWUnits:
         
         self._shape = shape
         self._size  = size
+
+    @classmethod
+    def from_trusted(cls, values: np.ndarray, units: "Units") -> "ArrayWUnits":
+        """
+        Construct an ``ArrayWUnits`` without input validation (fast path).
+
+        This bypasses the ``__init__`` type checks and the validating ``values`` /
+        ``units`` setters. It is intended for hot inner loops (force-model partial
+        collection, the propagation RHS) where the caller can already guarantee
+        the inputs are well-formed; everywhere else use the normal constructor.
+
+        Parameters
+        ----------
+        values : numpy.ndarray
+            Numeric array. **Must** already be a ``numpy.ndarray`` of a numeric
+            dtype (no list/scalar conditioning is performed).
+        units : Units or numpy.ndarray
+            A single homogeneous :class:`~scarabaeus.Units` object applied to all
+            elements, or an object array of per-element ``Units`` shaped like
+            ``values`` that are **not** all equal (the validating setter would
+            collapse equal ones into a single ``Units``). The array is stored,
+            not copied, so pass one the caller does not reuse.
+
+        Returns
+        -------
+        ArrayWUnits
+            An instance equivalent to ``ArrayWUnits(values, units)``, but built
+            without validation overhead.
+        """
+        obj = cls.__new__(cls)
+        obj._values = values
+        if isinstance(units, numpy.ndarray):
+            obj._units = units
+            obj._homogeneous_units = False
+        else:
+            obj._units = numpy.array(units)
+            obj._homogeneous_units = True
+        obj._shape = values.shape
+        obj._size = values.size
+        return obj
+
+    @classmethod
+    def from_row_units(cls, values: np.ndarray, row_units) -> "ArrayWUnits":
+        """
+        Attach one unit to each row of a numeric array, without validation.
+
+        A state ``[r, v]`` has km rows and km/s rows, and a Jacobian of it has
+        the same rows divided by the units of each column's parameter. This
+        builds the per-element unit array that :meth:`from_trusted` takes, so a
+        numeric result can be returned as an ``ArrayWUnits`` at the cost of one
+        object array.
+
+        Parameters
+        ----------
+        values : numpy.ndarray
+            Numeric array, as :meth:`from_trusted` requires. Every element of a
+            row gets that row's unit.
+        row_units : sequence of Units
+            One unit per row, ``len(values)`` of them, not all equal.
+
+        Returns
+        -------
+        ArrayWUnits
+            ``values`` with the units of its rows. The unit array is new, so a
+            caller can change single elements of it, e.g. one column whose
+            parameter has other units.
+        """
+        units = numpy.empty(values.shape, dtype=object)
+        for row, unit in enumerate(row_units):
+            units[row] = unit
+        return cls.from_trusted(values, units)
 
     # region Properties
     @property
@@ -385,13 +453,10 @@ class ArrayWUnits:
         if not ArrayWUnits._is_array_numerical(awu_in._values):
             raise TypeError("The input ArrayWUnits must contain only numerical values.")
 
-        # If the input array has the same units as the queried array,
+        # If the target slot(s) already have the same units as the input,
         # then only the values in the queried array need to be updated
-        same_units = (self._units == awu_in._units)
-
-        if isinstance(same_units, bool):
-            # make iterable for single values
-            same_units = numpy.array([same_units])
+        current_units = self.units if self.homogeneous_units else self._units[key]
+        same_units = numpy.all(current_units == awu_in.units)
 
         if same_units:
             self._values = np.set(self._values,key,awu_in.values)
@@ -403,44 +468,16 @@ class ArrayWUnits:
 
             # Update units array
             if isinstance(self.units, Units):
-                # singular unit -> assign without index
-                self.units = awu_in.units
+                # singular unit -> build a full per-element array so only
+                # the target slot(s) get the new unit; untouched elements
+                # keep their original unit instead of being relabeled
+                new_units = numpy.full(self.shape, self.units, dtype=object)
+                new_units[key] = awu_in.units
+                self.units = new_units
 
             else:
                 # array of units -> assign to given index
                 self.units[key] = awu_in.units
-
-    # Compute output powers array, depending on the operator
-    def units_arithmetic(self, other, operation):
-        """ Internal method holding all """
-        if isinstance(self._units, numpy.ndarray):
-            # ensure compatible objects
-            if not isinstance(other, ArrayWUnits):
-                compatible_err = ('Mathematical operations only valid for ArrayWunits objects with '
-                                  f'other objects of type ArrayWUnits. Received: {type(other)}.')
-                raise TypeError(compatible_err)
-            
-            # perform necessary math depending on the operation type
-            match operation:
-                case operator.mul:
-                    # multiply units
-                    new_units = self.units * other.units
-
-                    # multiply values
-                    new_vals  = self.values * other.values
-
-                    # return new AWU object
-                    return ArrayWUnits(new_vals, new_units)
-                
-                case operator.truediv:
-                    # divide units
-                    new_units = self.units / other.units
-
-                    # multiply values
-                    new_vals  = self.values / other.values
-
-                    # return new AWU object
-                    return ArrayWUnits(new_vals, new_units)
 
     def __add__(self, other):
         ## input validation
@@ -451,8 +488,8 @@ class ArrayWUnits:
             raise TypeError(not_awu_err)
 
         # can only add compatible matrix shapes
-        if not self._are_shapes_compatible(other):
-            raise ValueError('Shapes are incompatible for addition.')
+        # (_are_shapes_compatible raises its own exception on mismatch)
+        self._are_shapes_compatible(other)
 
         # can only add AWU's with the same dimensions
         if self._units.size == 1:
@@ -747,74 +784,60 @@ class ArrayWUnits:
         if self.homogeneous_units:
             # all units the same -> keep them
             new_units = self.units
-
         else:
             ## units are not the same -> reassign their positions
-            # initialize dimensions and scales
-            new_dims = numpy.zeros((m, n, self.units.dimensions.powers.shape[-1]), dtype = numpy.integer)
-            new_scls = numpy.zeros((m, n, self.units.dimensions.powers.shape[-1]), dtype = numpy.floating)
             if n == 1:
-                for col in range(m):
-                    new_dims[col][0] = self.units.dimensions.powers[col]
-                    new_scls[col][0] = self.units.scales[col]
+                new_units = self._units.reshape((-1, 1))
             else:
-                for row in range(n):
-                    for col in range(m):
-                        new_dims[col][row] = self.units.dimensions.powers[row, col, :]
-                        new_scls[col][row] = self.units.scales[row, col, :]
-
-            new_units = Units(Dimensions(new_dims), new_scls)
+                new_units = self._units.transpose()
 
         # then the values
         if n == m == 1:
+            new_units = self.units if self.homogeneous_units else self._units
             return ArrayWUnits(self.values, new_units)
-        
+
         elif n == 1 and m > 1:
+            new_units = self.units if self.homogeneous_units else self._units.reshape((-1, 1))
             return ArrayWUnits(self.values.reshape((-1, 1)), new_units)
-        
+
         elif len(self.shape) > 1:
             if m == 1:
+                new_units = self.units if self.homogeneous_units else self._units.transpose()[0]
                 return ArrayWUnits(self.values.transpose()[0], new_units)  # Work with row vectors
             else:
+                new_units = self.units if self.homogeneous_units else self._units.transpose()
                 return ArrayWUnits(self.values.transpose(), new_units)  # Work with matrices and col vectors
             
     T = transpose
-    """ Same as self.transpose()
-
-        See Also
-        --------
-        scarabaeus.ArrayWUnits.transpose
-    """
 
     def inverse(self) -> Self:
         """ Inverse operator for ArrayWUnits objects.
 
             Only valid for square matrices.
         """
-        if isinstance(self.units, Units):
-            ## input validation
-            # can't invert non-homogeneous awu's
-            if not self.homogeneous_units:
-                non_hom_err = ('Inverse operation is only defined for ArrayWUnits '
-                               'objects with homogeneous units.')
-                raise ValueError(non_hom_err)
-            
-            # can't invert non-square matrices
-            if self.shape[0] != self.shape[1]:
-                non_sqr_err = ('Inverse operation is only defined for square '
-                               'matrices.')
-                raise ValueError(non_sqr_err)
-            
-            # invert and return
-            # units first
-            inv_dims  = Dimensions(-self.units.dimensions.powers)       # inverted powers
-            inv_units = Units(inv_dims, self.units.scales)              # same scaling
+        ## input validation
+        # can't invert non-homogeneous awu's
+        if not self.homogeneous_units:
+            non_hom_err = ('Inverse operation is only defined for ArrayWUnits '
+                           'objects with homogeneous units.')
+            raise ValueError(non_hom_err)
 
-            # now values
-            inv_vals  = np.linalg.inv(self.values)
+        # can't invert non-square matrices
+        if self.shape[0] != self.shape[1]:
+            non_sqr_err = ('Inverse operation is only defined for square '
+                           'matrices.')
+            raise ValueError(non_sqr_err)
 
-            # return
-            return ArrayWUnits(inv_vals, inv_units)
+        # invert and return
+        # units first
+        inv_dims  = Dimensions(-self.units.dimensions.powers)       # inverted powers
+        inv_units = Units(inv_dims, self.units.scales)              # same scaling
+
+        # now values
+        inv_vals  = np.linalg.inv(self.values)
+
+        # return
+        return ArrayWUnits(inv_vals, inv_units)
 
     def pseudo_inverse(self) -> Self:
         """ Pseudo-inverse operator for ArrayWUnits objects. """
@@ -1026,15 +1049,15 @@ class ArrayWUnits:
               https://numpy.org/doc/stable/reference/generated/numpy.atleast_2d.html
         """
         ## input validation and conditioning
-        # given an object to recast -> must be a an awu
-        if (not isinstance(awu_in, ArrayWUnits)) and (awu_in != None):
+        # no object passed -> recast self
+        if awu_in is None:
+            awu_in = self
+
+        # given an object to recast -> must be an awu
+        elif not isinstance(awu_in, ArrayWUnits):
             not_awu_err = ('Cannot cast a non-ArrayWUnits object as '
                            'an ArrayWUnits object of two dimensions.')
             raise TypeError(not_awu_err)
-        
-        # no object passed -> recast self
-        else:
-            awu_in = self
 
         # recast and return
         if awu_in.homogeneous_units:
@@ -1164,24 +1187,6 @@ class ArrayWUnits:
             raise Exception('The shapes of the ArrayWUnits operands are not compatible to perform operations')
 
         return True
-
-    # def homogenize(self) -> None:
-    #     """ Convert this ArrayWUnits to a homogeneous-units representation.
-
-    #         When all elements share the same unit, the internal storage can be
-    #         compacted to a single scalar unit rather than an array of per-element
-    #         units, which improves performance for arithmetic operations.
-
-    #         Returns
-    #         -------
-    #         None
-    #             Modifies the object in place.
-
-    #         Notes
-    #         -----
-    #         Not yet implemented — raises ``NotImplementedError`` when called.
-    #     """
-    #     pass
        
     def append(self, other : Self, axis : int = None) -> Self:
         """ Return an ArrayWUnits object with given ArrayWUnits object 
@@ -1276,25 +1281,6 @@ class ArrayWUnits:
         else:
             # valid append -> return appended awu
             return ArrayWUnits(new_vals, new_units)
-
-    # NOTE: redundant?
-    def _get_shape(self):
-        """ Retrieve the shape of an input ArrayWUnits. """
-        ## input validation
-        if len(self.shape) == 0:
-            # Scalars
-            n = 1
-            m = 1
-        elif len(self.shape) == 1:
-            # Only applicable to 1D row vectors defined from np.array()
-            n = 1
-            m = self.shape[0]
-        elif len(self.shape) == 2:
-            # Column vectors and matrices
-            n = self.shape[0]
-            m = self.shape[1]
-
-        return (n, m)
 
     def angle_between(self, other):
         # NOTE: CONSIDER REMOVING THIS FROM AWU AS IT IS NOT DEPENDENT ON AWU
@@ -1484,7 +1470,7 @@ class ArrayWUnits:
         )
             try:
                 # Attempt conversion to the expected units
-                quantity_converted = quantity.to(target_units)
+                quantity_converted = quantity.convert_to(target_units)
                 if quantity_converted.units == target_units:
                     value = quantity_converted.values
                 else: 
@@ -1495,5 +1481,65 @@ class ArrayWUnits:
                 raise ValueError(
                     f"Automatic conversion attempted but failed."
                 )
-        
+
         return value
+
+    @staticmethod
+    def values_in(quantity, units) -> numpy.ndarray:
+        """Strip a quantity to bare numbers in the given units.
+
+        Public methods take :class:`ArrayWUnits` or
+        :class:`~scarabaeus.ArrayWFrame` input, strip it here once, run their
+        numeric core on plain arrays and attach units to the result again.
+        Unlike :meth:`get_value_in_target_units`, a quantity in other units of
+        the same dimension is converted without a warning, since it is valid
+        input.
+
+        Parameters
+        ----------
+        quantity : ArrayWUnits, ArrayWFrame, array_like, float or None
+            Value to strip. An ArrayWFrame gives its quantity; bare numbers are
+            taken to be in ``units`` already. None, an optional argument left
+            out, is returned as None.
+        units : Units or array_like of Units
+            Target units: one for every element, one per element, or one per
+            row, e.g. the km and km/s rows of a state Jacobian.
+
+        Returns
+        -------
+        numpy.ndarray or None
+            A new float array in ``units``, shaped like the quantity. Elements
+            already in their target units are copied, not converted, so their
+            numbers are unchanged to the last bit.
+
+        Raises
+        ------
+        ValueError
+            If ``units`` matches neither the elements nor the rows of the
+            quantity, or, from :meth:`convert_to`, if a unit has different
+            dimensions from its target.
+        """
+        if quantity is None:
+            return None
+        quantity = getattr(quantity, "quantity", quantity)
+        if not isinstance(quantity, ArrayWUnits):
+            return numpy.array(quantity, dtype=float)
+        values = numpy.array(quantity._values, dtype=float)
+        if quantity._homogeneous_units:
+            have = (quantity._units.flat[0],) * values.size
+        else:
+            have = quantity._units.flat
+        if isinstance(units, Units):
+            want = (units,) * values.size
+        else:
+            want = numpy.asarray(units, dtype=object)
+            if want.shape != values.shape:
+                # One unit per row: every element of a row shares it.
+                want = numpy.broadcast_to(
+                    want.reshape((-1,) + (1,) * (values.ndim - 1)), values.shape)
+            want = want.flat
+        flat = values.reshape(-1)
+        for index, (unit, target) in enumerate(zip(have, want, strict=True)):
+            if unit is not target and unit != target:
+                flat[index] = ArrayWUnits(flat[index], unit).convert_to(target).values
+        return values

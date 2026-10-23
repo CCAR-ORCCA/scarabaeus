@@ -7,8 +7,6 @@ import scarabaeus.utils.NumpyWrapper as np
 import sys
 if sys.version_info >= (3, 11):
     from typing import Self
-else:
-    from typing_extensions import Self
 
 # class definition
 class ArrayWFrame():
@@ -54,9 +52,13 @@ class ArrayWFrame():
 
     # region Constructor
     def __init__(self, array : ArrayWUnits | np.ndarray | float, units_or_frame : Units | Frame, frame : Frame = None):
-        # Get list of common frames
         from scarabaeus import SpiceManager
-        common_frames = SpiceManager.list_all_frames()
+
+        # Validate a single frame name in O(1) via SPICE (name -> id, 0 == unknown)
+        # rather than scanning every frame ID — this constructor is on a hot path.
+        def _is_recognized_frame(frame_name: str) -> bool:
+            """Return True if SPICE recognizes ``frame_name`` (O(1) id lookup)."""
+            return SpiceManager.frame_name_to_frame_id(frame_name) != 0
 
         # Check if frame is None
         if frame is None:
@@ -66,7 +68,7 @@ class ArrayWFrame():
                 )
 
             if isinstance(units_or_frame, Frame):
-                if units_or_frame.name not in common_frames:
+                if not _is_recognized_frame(units_or_frame.name):
                     raise ValueError(
                         f"'{units_or_frame.name}' is not in the list of recognized frames. "
                         "Please create a new frame."
@@ -86,9 +88,9 @@ class ArrayWFrame():
                 raise TypeError("frame must be a Frame object.")
             if not isinstance(units_or_frame, Units):
                 raise TypeError(
-                    "units_or_frame must be an ArrayWUnits object when frame is specified."
+                    "units_or_frame must be a Units object when frame is specified."
                 )
-            if frame.name not in common_frames:
+            if not _is_recognized_frame(frame.name):
                 raise ValueError(
                     f"'{frame.name}' is not in the list of recognized frames. "
                     "Please create a new frame."
@@ -126,7 +128,7 @@ class ArrayWFrame():
             performing operations.
         """
         if self.frame != other.frame:
-            incomp_frm_err = (f'Frame {self.frame} incompatible for mathematical operations with frame ', 
+            incomp_frm_err = (f'Frame {self.frame} incompatible for mathematical operations with frame '
                               f'{other.frame}.')
             raise ValueError(incomp_frm_err)
         
@@ -136,7 +138,7 @@ class ArrayWFrame():
         if isinstance(item, ArrayWFrame):
             if self.frame != item.frame:
                 # frames must be the same
-                bad_frm_err = (f'Cannot assign ArrayWFrame with associated frame {item.frame} ',
+                bad_frm_err = (f'Cannot assign ArrayWFrame with associated frame {item.frame} '
                                f'to ArrayWFrame with associated frame {self.frame}.')
                 raise ValueError(bad_frm_err)
         else:
@@ -154,7 +156,7 @@ class ArrayWFrame():
     def __add__(self, other : Self):
         # can only add AWF with AWF
         if not isinstance(other, ArrayWFrame):
-            not_awf_err = ('Cannot add ArrayWFrame with object of type ',
+            not_awf_err = ('Cannot add ArrayWFrame with object of type '
                            f'{type(other)}.')
             raise TypeError(not_awf_err)
 
@@ -196,7 +198,7 @@ class ArrayWFrame():
         
         else:
             cant_mul_err = (f'Cannot multiply ArrayWFrame by object of type {type(other)}. '
-                             'Multiplication is only valid by an integer, float, numpy array ',
+                             'Multiplication is only valid by an integer, float, numpy array '
                              'of equal size, or another ArrayWFrame associated with the same Frame.')
             raise TypeError(cant_mul_err)
 
@@ -211,9 +213,9 @@ class ArrayWFrame():
             array =  self.quantity @ other.quantity
         
         else:
-            cant_mul_err = ( 'Cannot perform matrix multiplication of ArrayWFrame by ',
-                            f'object of type {type(other)}. Matrix multiplication is ',
-                             'only valid between another ArrayWFrame associated with the ',
+            cant_mul_err = ( 'Cannot perform matrix multiplication of ArrayWFrame by '
+                            f'object of type {type(other)}. Matrix multiplication is '
+                             'only valid between another ArrayWFrame associated with the '
                              'same Frame.')
             raise TypeError(cant_mul_err)
         
@@ -235,7 +237,7 @@ class ArrayWFrame():
     def __eq__(self, other : Self):
         # can only equate AWF with AWF
         if not isinstance(other, ArrayWFrame):
-            not_awf_err = ('Cannot equate ArrayWFrame with object of type ',
+            not_awf_err = ('Cannot equate ArrayWFrame with object of type '
                            f'{type(other)}.')
             raise TypeError(not_awf_err)
 
@@ -255,7 +257,7 @@ class ArrayWFrame():
     def __gt__(self, other):
         # can only compare AWF with AWF
         if not isinstance(other, ArrayWFrame):
-            not_awf_err = ('Cannot compare ArrayWFrame with object of type ',
+            not_awf_err = ('Cannot compare ArrayWFrame with object of type '
                            f'{type(other)}.')
             raise TypeError(not_awf_err)
 
@@ -268,7 +270,7 @@ class ArrayWFrame():
     def __ge__(self, other):
         # can only compare AWF with AWF
         if not isinstance(other, ArrayWFrame):
-            not_awf_err = ('Cannot compare ArrayWFrame with object of type ',
+            not_awf_err = ('Cannot compare ArrayWFrame with object of type '
                            f'{type(other)}.')
             raise TypeError(not_awf_err)
 
@@ -281,7 +283,7 @@ class ArrayWFrame():
     def __lt__(self, other):
         # can only compare AWF with AWF
         if not isinstance(other, ArrayWFrame):
-            not_awf_err = ('Cannot compare ArrayWFrame with object of type ',
+            not_awf_err = ('Cannot compare ArrayWFrame with object of type '
                            f'{type(other)}.')
             raise TypeError(not_awf_err)
 
@@ -294,7 +296,7 @@ class ArrayWFrame():
     def __le__(self, other):
         # can only compare AWF with AWF
         if not isinstance(other, ArrayWFrame):
-            not_awf_err = ('Cannot compare ArrayWFrame with object of type ',
+            not_awf_err = ('Cannot compare ArrayWFrame with object of type '
                            f'{type(other)}.')
             raise TypeError(not_awf_err)
 
@@ -307,8 +309,8 @@ class ArrayWFrame():
     def cross(self, other : Self) -> Self:
         """ Cross product operation between two ArrayWFrame objects. """
         # can only cross with other AWFs
-        if not isinstance(self, ArrayWFrame):
-            cant_cross_err = ( 'Cannot perform cross product between ArrayWFrame and ',
+        if not isinstance(other, ArrayWFrame):
+            cant_cross_err = ( 'Cannot perform cross product between ArrayWFrame and '
                               f'{type(other)} object. Cross product is only defined '
                                'between two ArrayWFrame objects.')
             raise TypeError(cant_cross_err)
@@ -327,13 +329,18 @@ class ArrayWFrame():
         # return as AWF
         return ArrayWFrame(array, self.frame)
 
-    def norm(self) -> Self:
-        """ Matrix or vector norm operator for ArrayWFrame objects. """
-        # perform operation on AWU
-        array = self.quantity.norm()
+    def norm(self) -> ArrayWUnits:
+        """ Matrix or vector norm operator for ArrayWFrame objects.
 
-        # return as AWF
-        return ArrayWFrame(array, self.frame)
+            Returns an :class:`~scarabaeus.ArrayWUnits`, not an ``ArrayWFrame``:
+            a norm is a magnitude with no direction, so there is no frame for it
+            to be expressed in. Rotating the input leaves it unchanged, which is
+            precisely what makes a frame label meaningless here — unlike
+            :meth:`unitary` or :meth:`transpose`, whose results do live in the
+            frame and so keep it.
+        """
+        # perform operation on AWU; the result is frameless by construction
+        return self.quantity.norm()
 
     def unitary(self) -> Self:
         """ Converts a given ArrayWFrame vector into a unit vector with the same units.
@@ -471,7 +478,7 @@ class ArrayWFrame():
         # can only append AWF in the same frame
         if isinstance(other, ArrayWFrame):
             if self.frame != other.frame:
-                bad_frm_err = (f'Cannot append ArrayWFrame with associated frame {other.frame} ',
+                bad_frm_err = (f'Cannot append ArrayWFrame with associated frame {other.frame} '
                                f'to ArrayWFrame with associated frame {self.frame}.')
                 raise ValueError(bad_frm_err)
         
@@ -508,12 +515,15 @@ class ArrayWFrame():
                     "Epoch array should have exactly one element for (3,) vector conversion."
                 )
 
-            # Compute the rotation matrix
-            R = Frame.get_DCM(
-                self.frame,
-                frame_target,
-                epoch[0] if epoch is not None else self.frame.epoch,
-            )
+            # Compute the rotation matrix. A single epoch reaches here either as
+            # a length-1 array or already as the 0-d EpochArray that
+            # StateArray.epoch holds; only the former can be indexed.
+            if epoch is None:
+                epoch_single = self.frame.epoch
+            else:
+                epoch_single = epoch if epoch.ndim == 0 else epoch[0]
+
+            R = Frame.get_DCM(self.frame, frame_target, epoch_single)
 
             # Apply transformation
             transformed_quantity = R @ self.quantity.values

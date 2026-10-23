@@ -11,6 +11,9 @@ from scarabaeus import  (
 import scarabaeus.utils.NumpyWrapper as np
 kg, km, sec, N = Units.get_units(["kg", "km", "sec", "N"])
 
+# Constant 3x3 identity, built once (used in the per-RHS gravity-gradient partial).
+_I3 = np.identity(3)
+
 
 #######################################################################
 class PointMassGravity(DynamicModel):
@@ -32,9 +35,8 @@ class PointMassGravity(DynamicModel):
 
     Parameters
     ----------
-    state_vector : StateArray
-        State vector whose ``origin`` provides the central-body name,
-        gravitational parameter, and SPICE ID.
+    origin : CelestialBody
+        Central body: supplies the name, gravitational parameter and SPICE ID.
     base_frame : Frame
         Reference frame in which accelerations are returned.
 
@@ -44,19 +46,19 @@ class PointMassGravity(DynamicModel):
 
     References
     ----------
-    Vallado, D. A. (2013). *Fundamentals of Astrodynamics and Applications*, 4th Ed.
-    Montenbruck, O., & Gill, E. (2000). *Satellite Orbits: Models, Methods, and Applications*.
+    .. [1] Vallado, D. A. (2013). *Fundamentals of Astrodynamics and Applications*, 4th Ed.
+    .. [2] Montenbruck, O., & Gill, E. (2000). *Satellite Orbits: Models, Methods, and Applications*.
     """
     # -------------#
     # Constructor  #
     # -------------#
     def __init__(self,
-                 state_vector : StateArray,
+                 origin : CelestialBody,
                  base_frame: Frame):
-        self._origin_name = state_vector.origin.name
+        self._origin_name = origin.name
         self._ref_frame = base_frame
-        self._origin_mu = ArrayWUnits.get_value_in_target_units(state_vector.origin.grav_param,km**3/sec**2)
-        self._origin_spice_id = getattr(state_vector.origin, 'spice_id', None)
+        self._origin_mu = ArrayWUnits.get_value_in_target_units(origin.grav_param,km**3/sec**2)
+        self._origin_spice_id = getattr(origin, 'spice_id', None)
 
     # ----------------------#
     # region    Properties #
@@ -84,7 +86,7 @@ class PointMassGravity(DynamicModel):
         Parameters
         ----------
         input_val : float, np.ndarray, or None
-            Gravitational parameter in km³·s⁻². If ``None``, defaults to
+            Gravitational parameter, in km^3/s^2. If ``None``, defaults to
             ``ArrayWUnits(0, 'km**3/s**2')``.
         """
         if input_val is None:
@@ -146,7 +148,7 @@ class PointMassGravity(DynamicModel):
             key = ("gm", self._origin_spice_id)
             if key in current_state:
                 val = current_state[key]
-                gm = float(val.values if hasattr(val, 'values') else val)
+                gm = self._scalar_from_state(val)
 
         # Compute the norm of the position vector
         position_norm = np.linalg.norm(position)
@@ -191,11 +193,8 @@ class PointMassGravity(DynamicModel):
             position. Assumed in units of :math:`\\frac{1}{s^2}`.
         """
 
-        # Initialize the total partial derivative matrix
-        partial_a_by_pos = np.zeros((3, 3))
-
-        # Identity matrix
-        identity_matrix = np.eye(3)
+        # Identity matrix (module-level constant; not mutated below)
+        identity_matrix = _I3
 
         # Compute the norm of the position vector
         position_norm = np.linalg.norm(position)
@@ -209,7 +208,7 @@ class PointMassGravity(DynamicModel):
             key = ("gm", self._origin_spice_id)
             if key in current_state:
                 val = current_state[key]
-                gm = float(val.values if hasattr(val, 'values') else val)
+                gm = self._scalar_from_state(val)
         C = -gm
 
         # Compute the partial derivative

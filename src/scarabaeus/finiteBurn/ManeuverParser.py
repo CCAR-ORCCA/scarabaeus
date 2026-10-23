@@ -1,7 +1,6 @@
 # SPDX-FileCopyrightText: 2026 Orbital Research Cluster for Celestial Applications (ORCCA) Lab, University of Colorado at Boulder
 # SPDX-License-Identifier: ISC
 import numpy as np
-import os
 
 from scarabaeus import (
     Units,
@@ -19,10 +18,6 @@ from scarabaeus import (
 
 kg, km, sec, N = Units.get_units(["kg", "km", "sec", "N"])
 
-SpiceManager.clear_kernels()
-furnshKernelFilename = os.getcwd() + "/data/kernels/locked/locked_generic.tm"
-# SpiceManager.load_kernel_from_mkfile(furnshKernelFilename)
-
 
 class ManeuverParser:
     """ Parses and manages an ordered list of finite-burn :class:`~scarabaeus.Maneuver` objects.
@@ -36,16 +31,16 @@ class ManeuverParser:
     ----------
     None
 
+    See Also
+    --------
+    scarabaeus.Maneuver : Finite-burn maneuver data container parsed by this class.
+    scarabaeus.FiniteBurn : Force model that consumes Maneuver objects during propagation.
+
     Notes
     -----
     The internal burn list is accessible and replaceable via :meth:`get_burns`
     and :meth:`set_burns`.  The file-based parser expects a specific
     comma-delimited column layout; see :meth:`_parse_maneuver_spec` for details.
-
-    See Also
-    --------
-    scarabaeus.Maneuver : Finite-burn maneuver data container parsed by this class.
-    scarabaeus.FiniteBurn : Force model that consumes Maneuver objects during propagation.
 
     Examples
     --------

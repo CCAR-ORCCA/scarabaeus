@@ -1,27 +1,22 @@
-.. SPDX-FileCopyrightText: 2026 Orbital Research Cluster for Celestial Applications (ORCCA) Lab, University of Colorado at Boulder
-.. SPDX-License-Identifier: ISC
-.. meta::
-    :description lang=en:
-        Scarabaeus release notes and history.
-    :keywords:
-        Scarabaeus, release notes
-
-.. _dev-guide:
-
-.. create a gold color role
-.. raw:: html
-
-    <style> .gold {color:rgb(207 184 124)} </style>
-
-.. role:: gold
-
-=======================
-:gold:`Release Notes`
-=======================
-List of changes to Scarabaeus between each release.
+Release Notes
+=============
 
 .. toctree::
-    :maxdepth: 1
-    :glob:
-    
-    releases/*
+   :maxdepth: 2
+   :hidden:
+
+   versions/2-0
+   versions/1-0
+   versions/2-0/2-0-0
+   versions/1-0/1-0-0
+
+2.0.x
+-----
+
+- :doc:`2.0.0 <versions/2-0/2-0-0>`
+
+1.0.x
+-----
+
+- :doc:`1.0.0 <versions/1-0/1-0-0>` - 2026-06-01
+

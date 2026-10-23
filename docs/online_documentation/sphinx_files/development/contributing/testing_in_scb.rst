@@ -1,5 +1,6 @@
 .. SPDX-FileCopyrightText: 2026 Orbital Research Cluster for Celestial Applications (ORCCA) Lab, University of Colorado at Boulder
 .. SPDX-License-Identifier: ISC
+
 .. meta::
     :description lang=en:
         Overview of testing set up in Scarabaeus.
@@ -21,6 +22,11 @@
 =================================
 Last revised on 2026 MAY 28 by G. Fereoli.
 
+.. note::
+    The SCB testing suite is currently undergoing a major overhaul and therefore the following are not guaranteed to function properly. 
+
+    This overhaul will be published soon.
+
 Scarabaeus (SCB) uses `pytest <https://docs.pytest.org>`_ for automated testing. The test
 suite lives in ``tests/`` at the repository root and is split into unit and system
 tests. The system tests are further divided into functional, integration, V&V, and 
@@ -29,22 +35,23 @@ performance tests, which themselves include code profiling and code coverage.
 .. code-block:: text
 
    tests/
-   ├── unit_testing/          # isolated tests per class/module
-   │   ├── body_tests/
-   │   ├── dynamics_tests/
-   │   ├── environment_tests/
-   │   ├── guidance_tests/
-   │   ├── measurements_tests/
-   │   ├── orbitDetermination_tests/
-   │   ├── spacecraft_tests/
-   │   ├── timeAndFrame_tests/
-   │   ├── units_tests/
-   │   └── utils_tests/
-   └── system_testing/
-       ├── functional_testing/    # functional verification tests
-       ├── integration_testing/   # end-to-end scenario tests
-       ├── performance_testing/   # profiling and code coverage
-       └── V&V                    # validation & verification tests
+   └── python_tests/
+       ├── unit_testing/          # isolated tests per class/module
+       │   ├── body_tests/
+       │   ├── dynamics_tests/
+       │   ├── environment_tests/
+       │   ├── guidance_tests/
+       │   ├── measurements_tests/
+       │   ├── orbitDetermination_tests/
+       │   ├── spacecraft_tests/
+       │   ├── timeAndFrame_tests/
+       │   ├── units_tests/
+       │   └── utils_tests/
+       └── system_testing/
+           ├── functional_testing/    # functional verification tests
+           ├── integration_testing/   # end-to-end scenario tests
+           ├── performance_testing/   # profiling and code coverage
+           └── V&V                    # validation & verification tests
 
 ----------------------------
 :gold:`Running All Tests`
@@ -60,18 +67,18 @@ To run only a specific tier:
 
 .. code-block:: bash
 
-   pytest tests/unit_testing/
-   pytest tests/system_testing/integration_testing/
+   pytest tests/python_tests/unit_testing/
+   pytest tests/python_tests/system_testing/integration_testing/
 
 To run a single test file:
 
 .. code-block:: bash
 
-   pytest tests/unit_testing/body_tests/test_CelestialBody.py
+   pytest tests/python_tests/unit_testing/body_tests/test_CelestialBody.py
 
------
+-----------------------------------
 :gold:`Adding to the Testing Suite`
------
+-----------------------------------
 Whenever you add any new functionality to Scarabaeus, you must also include this functionality in the testing suite. 
 
 Depending on the complexity and depth of your addition, you may need to create multiple tests across different levels of the suite. For example, 
@@ -80,47 +87,47 @@ interacts with other SCB classes would require integration tests in addition to 
 
 The following sections provide more information on each of the different levels of testing and their expected use cases.
 
------
+------------------
 :gold:`Unit Tests`
------
+------------------
 Unit tests verify the behaviour of individual Scarabaeus classes and methods in isolation.
 Each test file maps to one class (e.g. ``test_CelestialBody.py`` tests :class:`~scarabaeus.CelestialBody`)
-and lives under the matching module subdirectory of ``tests/unit_testing/``.
+and lives under the matching module subdirectory of ``tests/python_tests/unit_testing/``.
 
 **Running unit tests:**
 
 .. code-block:: bash
 
-   pytest tests/unit_testing/
+   pytest tests/python_tests/unit_testing/
 
 **Running a single module's tests:**
 
 .. code-block:: bash
 
-   pytest tests/unit_testing/body_tests/
+   pytest tests/python_tests/unit_testing/body_tests/
 
 
-^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^^
 Writing a New Unit Test
-^^^^^^
+^^^^^^^^^^^^^^^^^^^^^^^
 Whenever you create a new class or add a new method to an existing class, you must also include a test or tests 
 for it in the testing suite:
 
-1. Create ``tests/unit_testing/<module>_tests/test_ClassName.py``.
+1. Create ``tests/python_tests/unit_testing/<module>_tests/test_ClassName.py``.
 2. For new classes, ensure that initialization functions properly.
 
------
+-------------------------
 :gold:`Integration Tests`
------
+-------------------------
 Integration tests run end-to-end OD scenarios to verify that the full pipeline—propagation,
 measurement simulation, filtering, and output—produces correct results. They live in
-``tests/integration_testing/`` and typically require SPICE kernels and data files.
+``tests/python_tests/integration_testing/`` and typically require SPICE kernels and data files.
 
 **Running integration tests:**
 
 .. code-block:: bash
 
-   pytest tests/integration_testing/
+   pytest tests/python_tests/integration_testing/
 
 .. note::
 

@@ -1,5 +1,8 @@
 .. SPDX-FileCopyrightText: 2026 Orbital Research Cluster for Celestial Applications (ORCCA) Lab, University of Colorado at Boulder
 .. SPDX-License-Identifier: ISC
+
+:orphan:
+
 .. _external-libs:
 
 .. create a gold color role
@@ -19,7 +22,7 @@
 =================
 :gold:`Libraries`
 =================
-Last revised by M. Pugliatti on 2025 FEB 4
+Last revised: 2026 SEP 9
 
 One of the pillars of the software design principles of SCB is to not reinvent the wheel and to make use of existing libraries whenever possible. To that end, the following python, C++ libraries and software are extensively used by SCB.
 
@@ -28,6 +31,9 @@ One of the pillars of the software design principles of SCB is to not reinvent t
 ------------------------------
 
 - SpiceyPy: `Online documentation <https://spiceypy.readthedocs.io/en/main/index.html#>`__
+
+- PyERFA (``pyerfa>=2.0``, imported as ``erfa``): SOFA-derived Earth orientation
+  routines; `ERFA documentation <https://github.com/liberfa/erfa>`__.
 
 - Trimesh: `Online documentation <https://trimesh.org/>`__
 

@@ -21,18 +21,18 @@ class Instrument(Spacecraft):
     measurement_type : str
         The type of measurement the instrument performs.
 
+    See Also
+    --------
+    scarabaeus.Antenna : Radiometric instrument (Doppler, range).
+    scarabaeus.Camera : Optical instrument (centroiding, OpNav).
+    scarabaeus.Spacecraft : Parent class providing SPICE body registration.
+
     Notes
     -----
     Instrument is a lightweight subclass of :class:`~scarabaeus.Spacecraft`
     that adds a ``measurement_type`` tag.  Concrete subclasses
     (:class:`~scarabaeus.Antenna`, :class:`~scarabaeus.Camera`) extend it
     with sensor-specific geometry.
-
-    See Also
-    --------
-    scarabaeus.Antenna : Radiometric instrument (Doppler, range).
-    scarabaeus.Camera : Optical instrument (centroiding, OpNav).
-    scarabaeus.Spacecraft : Parent class providing SPICE body registration.
     """
 
     # --------------------#

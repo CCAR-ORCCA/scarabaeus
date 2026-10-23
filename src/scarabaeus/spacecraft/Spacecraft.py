@@ -8,9 +8,11 @@ from scarabaeus import (
     EpochArray,
     SpiceManager,
     nPlateModel,
+    DynamicalUtils,
 )
 import scarabaeus.utils.NumpyWrapper as np
 import spiceypy as spice
+import warnings
 
 # ------------------#
 #  Generate Units  #
@@ -24,16 +26,6 @@ m, km, sec = Units.get_units(["m", "km", "sec"])
 class Spacecraft(Body):
     """ Represents a spacecraft body.
 
-    The total spacecraft mass at epoch :math:`t` is the sum of dry mass
-    and remaining propellant:
-
-    .. math::
-
-        m(t) = m_{dry} + m_{DV}(t) + m_{FB}(t)
-
-    where :math:`m_{DV}` and :math:`m_{FB}` are the remaining delta-V and
-    finite-burn propellant masses respectively.
-
     Parameters
     ----------
     name : str
@@ -42,43 +34,88 @@ class Spacecraft(Body):
     spice_id : int | str
         The NAIF ID code of the object. May be given as an integer ID or as a string.
 
-    dry_mass : ArrayWUnits
-        The overall mass of the spacecraft excluding the propellant. Recommend expressed in units of kilograms.
-
-    dv_fuel_mass : ArrayWUnits
-        The mass of the spacecraft's fuel used for delta-v burns. Recommend expressed in units of kilograms.
-
-    fb_fuel_mass : ArrayWUnits
-        The mass of the spacecraft's fuel used for finite burns. Recommend expressed in units of kilograms.
+    tot_mass : ArrayWUnits or SCBPolynomial, optional
+        The total (wet) mass of the spacecraft, passed to
+        :class:`~scarabaeus.Body` as its ``mass``: an
+        :class:`~scarabaeus.ArrayWUnits` for a constant mass or an
+        :class:`~scarabaeus.SCBPolynomial` of time. Recommend expressed in
+        units of kilograms. Defaults to ``None``.
 
     area : ArrayWUnits, optional
-        The cross-sectional area of the spacecraft. Recommend expressed in units of :math:`m^2`. Defaults to ``None``.
+        The cross-sectional area of the spacecraft, used by
+        :class:`~scarabaeus.CannonballSRP`. Recommend expressed in units of
+        :math:`m^2`. Defaults to ``None``.
 
     ref_coeff : float, optional
-        The reflectivity coefficient of the spacecraft. Defaults to ``None``.
+        The reflectivity coefficient of the spacecraft, used by
+        :class:`~scarabaeus.CannonballSRP`. Defaults to ``None``.
 
     n_plate_model : nPlateModel, optional
-        The n-plate model that describes the shape and physical parameters of the spacecraft. Defaults to ``None``.
+        The n-plate model that describes the shape and physical parameters of
+        the spacecraft, used by :class:`~scarabaeus.nPlateSRP`. Defaults to
+        ``None``.
 
-    thruster : Thruster, optional
-        The thruster object attached to the spacecraft. Defaults to ``None``.
+    thruster : Actuator, optional
+        The thruster attached to the spacecraft. Defaults to ``None``.
 
     instrument_list : list[Instrument], optional
-        The Instrument objects attached to the spacecraft. Defaults to ``[]``.
+        The Instrument objects attached to the spacecraft (cameras, antennas).
+        Defaults to ``[]``.
+
+    body_fixed_frame_id : int, optional
+        The SPICE ID of the spacecraft-fixed frame. Defaults to ``None``.
+
+    attitudeMode : str, optional
+        How the surface-force models (:class:`~scarabaeus.nPlateSRP`,
+        :class:`~scarabaeus.ThermalRadiation`,
+        :class:`~scarabaeus.AntennaRadiationPressure`) orient the
+        spacecraft-fixed frame. One of
+        :attr:`DynamicalUtils.ATTITUDE_MODES <scarabaeus.DynamicalUtils.ATTITUDE_MODES>`:
+
+        * ``"CK"``: from the loaded C-kernel, whose frame ID is
+          ``spice_id * 1000`` (:meth:`get_attitude`).
+        * ``"inertialFixedAttitude"``: the constant rotation
+          ``fixedInertialAttitude``.
+        * ``"nadirPointingSun"``: the :math:`-X` axis points at the Sun and
+          :math:`+Z` along the heliocentric orbit normal, from the heliocentric
+          position and velocity
+          (:meth:`~scarabaeus.DynamicalUtils.nadirPointingSun`).
+
+        Any other value raises
+        :class:`~scarabaeus.DynamicalUtils.InvalidAttitudeModeError` when one
+        of those models first needs the attitude. Models that need none
+        (gravity, :class:`~scarabaeus.CannonballSRP`, an
+        :class:`~scarabaeus.nPlateModel` whose plates all sit in their own
+        SPICE frames) accept the default. Defaults to ``None``.
+
+    fixedInertialAttitude : numpy.ndarray, optional
+        The ``(3, 3)`` spacecraft-fixed to inertial rotation, required by
+        ``attitudeMode="inertialFixedAttitude"``. Defaults to ``None``.
+
+    nadirPointingAxis : numpy.ndarray, optional
+        The spacecraft-fixed axis meant to point at the Sun. It is stored and
+        serialized only: the ``"nadirPointingSun"`` attitude always points
+        :math:`-X` at the Sun. Defaults to ``None``.
+
+    See Also
+    --------
+    scarabaeus.nPlateModel : Geometric surface model for SRP computation.
+    scarabaeus.DynamicalUtils : Turns ``attitudeMode`` into the spacecraft-fixed to inertial rotation.
+    scarabaeus.Instrument : Generic instrument class (cameras, antennas).
+    scarabaeus.Body : Parent class providing SPICE ephemeris object management.
 
     Notes
     -----
     Spacecraft is the primary vehicle representation in Scarabaeus.  It holds
     physical properties needed for force-model evaluation (mass, area,
-    reflectivity) and the optional :class:`~scarabaeus.nPlateModel` for
-    high-fidelity SRP modeling.  Instruments and thrusters are registered
-    via :meth:`addInstrument`.
+    reflectivity), the optional :class:`~scarabaeus.nPlateModel` for
+    high-fidelity SRP modeling and the attitude the surface-force models
+    orient it with.  Instruments are registered via :meth:`add_instrument`.
 
-    See Also
-    --------
-    scarabaeus.nPlateModel : Geometric surface model for SRP computation.
-    scarabaeus.Instrument : Generic instrument class (cameras, antennas).
-    scarabaeus.Body : Parent class providing SPICE ephemeris object management.
+    A propagation with maneuvers integrates the mass and replaces
+    ``tot_mass`` with a polynomial fit of the mass history, which
+    :meth:`~scarabaeus.Body.mass` then evaluates;
+    :meth:`~scarabaeus.Body.reset_mass_history` restores ``tot_mass``.
     """
 
     # --------------------#
@@ -221,8 +258,8 @@ class Spacecraft(Body):
         self, from_frame: Frame, epoch: EpochArray, tol: int = 0
     ) -> np.ndarray:
         """
-        Computes the Direction Cosine Matrix (DCM) to transform vectors from a given inertial
-        frame to the spacecraft-fixed frame.
+        Computes the rotation from a given inertial frame to the spacecraft-fixed
+        frame, from the C-kernel of frame ID ``spice_id * 1000``.
 
         Parameters
         ----------
@@ -240,8 +277,9 @@ class Spacecraft(Body):
 
         Returns
         -------
-        DCM : numpy.ndarray
-            The DCM for transforming inertial vectors to spacecraft-fixed coordinates.
+        quat : numpy.ndarray
+            The ``(4,)`` SPICE quaternion (``spice.m2q``) of the rotation from
+            ``from_frame`` to spacecraft-fixed coordinates.
 
         Notes
         -----
@@ -277,7 +315,7 @@ class Spacecraft(Body):
         dcm, _, _ = SpiceManager.get_attitude(self.spice_id, epoch, from_frame, tol)
         return spice.m2q(dcm)
 
-    def inertial_to_body_DCM_nadir_pointing_to_sun(
+    def inertial_to_body_DCM_nadirPointingSun(
         self,
         origin_name,
         frame,
@@ -290,6 +328,12 @@ class Spacecraft(Body):
         Computes the Direction Cosine Matrix (DCM) that points the body frame's
         -X axis toward the Sun (nadir-to-sun), using inertial quantities.
 
+        .. deprecated:: 2026.0.0
+            Use :meth:`~scarabaeus.DynamicalUtils.nadirPointingSun`, which
+            returns the spacecraft-fixed to inertial DCM (the transpose of this
+            one) and, on request, its position and velocity derivatives. This
+            method now delegates to it.
+
         Parameters
         ----------
         origin_name : str
@@ -299,9 +343,10 @@ class Spacecraft(Body):
         sun2body_pos : ArrayWUnits
             Position of the body w.r.t. SUN (km).
         current_state : dict
-            State of the body w.r.t. the origin. Accepts either:
-            - {('velocity', spice_id): Array/ArrayWUnits or 'velocity': Array/ArrayWUnits}
-                (and similarly for 'position' if ever needed)
+            State of the body w.r.t. the origin, keyed either by
+            ``('velocity', spice_id)`` or by ``'velocity'``, with an array or
+            ``ArrayWUnits`` value (and similarly for ``'position'`` if ever
+            needed).
         epoch : float
             Epoch (TDB seconds past J2000) at which the state is computed.
         body : CelestialBody or Spacecraft
@@ -311,65 +356,29 @@ class Spacecraft(Body):
         -------
         DCM_inertial_to_body : (3,3) ndarray
             DCM that rotates inertial vectors into the body-fixed frame realizing the nadir-to-sun pointing.
+
+        Raises
+        ------
+        DynamicalUtils.MissingVelocityError
+            If `current_state` holds no velocity for `body` (a ``KeyError``).
         """
-        # Normalize frame name
-        frame_name = frame.name if hasattr(frame, "name") else str(frame)
-
-        # Get SUN->origin velocity in `frame`
-        sun2origin_vel = SpiceManager.get_vel(
-            trgt_bdy=origin_name,  # origin wrt SUN
-            epoch_time=epoch,
-            reference_frame=frame_name,
-            obsvr_bdy="SUN",
+        warnings.warn(
+            "Spacecraft.inertial_to_body_DCM_nadirPointingSun is deprecated; "
+            "use DynamicalUtils.nadirPointingSun, which returns the "
+            "spacecraft-fixed to inertial DCM (the transpose of this one).",
+            DeprecationWarning,
+            stacklevel=2,
         )
-
-        # Extract body's velocity wrt origin from current_state, keyed by spice_id if available
-        sid = getattr(body, "spice_id", None)
-
-        def _as_values_awu(x, default_units=None):
-            # Accept raw ndarray/list or ArrayWUnits
-            if hasattr(x, "values"):
-                return x.values
-            return np.asarray(x, dtype=float)
-
-        vel_vals = None
-        if isinstance(current_state, dict):
-            # Prefer keyed-by-(name, spice_id)
-            if sid is not None and ("velocity", sid) in current_state:
-                vel_vals = _as_values_awu(current_state[("velocity", sid)])
-            elif "velocity" in current_state:
-                vel_vals = _as_values_awu(current_state["velocity"])
-        if vel_vals is None:
-            raise KeyError(
-                "Velocity not found in current_state. Expected ('velocity', spice_id) "
-                f"for spice_id={sid} or a plain 'velocity' key."
-            )
-
-        # Compose SUN->body velocity in `frame`
-        # sun2origin_vel is an ArrayWUnits; take .values. vel_vals should be km/s in same frame.
-        sun2body_vel_vals = sun2origin_vel.values + vel_vals
-
-        # Build body axes (body frame defined such that -X points to Sun).
-        # x_b points from Sun to Body (i.e., along sun2body_pos)
-        x_b = sun2body_pos.values
-        x_b = x_b / np.linalg.norm(x_b)
-
-        # y_b along instantaneous velocity (inertial)
-        y_b = sun2body_vel_vals / np.linalg.norm(sun2body_vel_vals)
-
-        # z_b completes right-handed triad
-        z_b = np.cross(x_b, y_b)
-        z_b = z_b / np.linalg.norm(z_b)
-
-        # Re-orthogonalize y_b to ensure orthonormality
-        y_b = np.cross(z_b, x_b)
-
-        # Columns of DCM_body2inertial are body axes expressed in inertial
-        DCM_body2inertial = np.column_stack((x_b, y_b, z_b))
-
-        # Return inertial->body, consistent with function name
-        DCM_inertial_to_body = DCM_body2inertial.T
-        return DCM_inertial_to_body
+        vel = np.asarray(
+            DynamicalUtils.velocity_from_state(current_state, body), dtype=float
+        )
+        sun2body_vel = (
+            DynamicalUtils.sun_to_origin_velocity(origin_name, frame, epoch) + vel
+        )
+        dcm_body2inertial, _, _ = DynamicalUtils.nadirPointingSun(
+            np.asarray(sun2body_pos.values, dtype=float), sun2body_vel
+        )
+        return dcm_body2inertial.T
 
     def add_instrument(self, instruments) -> None:
         """
@@ -377,8 +386,8 @@ class Spacecraft(Body):
 
         Parameters
         ----------
-        instruments : Instrument or list of Instrument
-            The instrument or instruments to be attached to the spacecraft.
+        instruments : list of Instrument
+            The instruments to be attached to the spacecraft.
 
         Returns
         -------

@@ -1,7 +1,7 @@
 cff-version: 1.2.0
 message: "If you use Scarabaeus in academic work, please cite the paper below."
 title: "Scarabaeus: An Open-Source Tool for Interplanetary Spacecraft Navigation"
-version: "2026.0.0"
+version: "2026.2.0"
 date-released: "2026-06-01"
 license: ISC
 url: "https://www.researchgate.net/publication/404941039_Scarabaeus_An_Open-Source_Tool_for_Interplanetary_Spacecraft_Navigation"
