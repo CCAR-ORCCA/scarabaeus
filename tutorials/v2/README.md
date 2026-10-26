@@ -26,7 +26,9 @@ One scenario, start to finish: OSIRIS-REx on approach to Bennu, June 1–8, 2018
    ```bash
    cd tutorials && python -c "import supplementary as s; s.load_data()"
    ```
-2. Run the notebooks **from this folder** (`tutorials/v2/`): the metakernel `orex_approach.tm` uses paths relative to it.
+2. Run the notebooks **from this folder** (`tutorials/v2/`): the metakernel `orex_approach.tm` and `scenario.py` use paths relative to it.
+
+The objects chapters 1–5 build on the page (epochs, spacecraft, stations, measurement models, a-priori state and covariance) are collected in `scenario.py`. From chapter 2 on, setup cells import from it what earlier chapters built (chapters 2–5 still build their own new objects on the page; chapters 6–9 import everything they reuse). Keep the module in sync with the chapter code.
 
 Each notebook writes its products to `outputs/<notebook>/` (git-ignored).
 
@@ -39,7 +41,7 @@ python prepare.py 06            # runs chapters 2 and 3 headlessly (about 15 s)
 python prepare.py 06 --force    # regenerate even if the outputs already exist
 ```
 
-The prerequisite notebooks are executed in memory and are not modified. If the inputs are missing, the chapter's setup cell stops with a message pointing here.
+The prerequisite notebooks are executed in memory and are not modified. If the inputs are missing, the chapter's setup cell stops with a message pointing here (chapter 6: a comment in the setup cell, and a `SPICE` / file-not-found error).
 
 ## Review notes
 
