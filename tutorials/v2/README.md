@@ -21,7 +21,7 @@ One scenario, start to finish: OSIRIS-REx on approach to Bennu, June 1–8, 2018
 
 ## Running
 
-0. The notebooks target **Scarabaeus 2.0** (currently on `origin/sync/internal-2026-10-19`); they no longer run on 1.x. On recent macOS, build the Rust extension with `CARGO_PROFILE_RELEASE_STRIP=none` (see PLAN.md).
+0. The notebooks target **Scarabaeus 2.0** (on `main` since #10); they no longer run on 1.x. On recent macOS, build the Rust extension with `CARGO_PROFILE_RELEASE_STRIP=none` (see PLAN.md).
 1. Download the tutorial data once (the existing loader in `tutorials/supplementary` fetches the kernels):
    ```bash
    cd tutorials && python -c "import supplementary as s; s.load_data()"
