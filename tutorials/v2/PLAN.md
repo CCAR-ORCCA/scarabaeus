@@ -37,9 +37,9 @@ I. Core series — "Navigating OSIRIS-REx" (in order)
    4  Filter dynamics model     reference spacecraft, a-priori state and covariance, reference trajectory and STM
    5  Filter measurement model  pre-fit residuals, measurement partials, linearized measurement equation, MeasurementSpec
    6  First OD solution         batch filter, SolutionOD, errors vs. 3σ
-   7  Sequential filtering      SRIF/LKF, process noise (SNC/DMC), smoothing
-   8  Estimating more           SRP scale, consider parameters, measurement editing, covariance analysis
-   9  Tracking data II          real DSN data, light-time models, media corrections
+   7  Sequential filtering      SRIF/LKF, process noise (SNC/DMC), smoothing, covariance analysis
+   8  Estimating parameters     SRP scale factor, consider parameters
+   9  Tracking data II          real DSN data, light-time models, media corrections, measurement editing, range bias
 
 II.  Fundamentals     units, frames, time, SPICE and bodies, state definition, trajectories and SPKs, measurement files
 III. Model catalogs   dynamics models, integrators, measurement types, filters, process noise, measurement editing, filter outputs

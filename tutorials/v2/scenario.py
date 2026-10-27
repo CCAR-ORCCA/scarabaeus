@@ -74,11 +74,11 @@ P0 = scb.CovarianceMatrix(apriori_sigmas, epochs[0], from_list=True)
 
 # 🔵 TODO: filters update the propagator they are given, so every fit needs a fresh one built from
 # the a-priori. Remove this function once they stop doing so (v3/PLAN.md, API change 3).
-def reference_propagator(spacecraft=reference, state=apriori_state, cannonball_SRP=True):
+def reference_propagator(spacecraft=reference, state=apriori_state, cannonball_SRP=True, tspan=epochs):
     return scb.Propagator(
         primary_body=spacecraft,
-        state_vector=scb.StateArray(epoch=epochs[0], origin=sun, state=state),
-        tspan=epochs,
+        state_vector=scb.StateArray(epoch=tspan[0], origin=sun, state=state),
+        tspan=tspan,
         force_models=scb.ForceModelTranslation(spacecraft, third_bodies=planets, cannonball_SRP=cannonball_SRP),
         display_progress=False,
     )
