@@ -36,6 +36,12 @@ plot_tracking_timeline(stations, target, epochs, ...)
 plot_editing(editor, ...)
     The preview the Huber/MAD editing filter lacks: residuals with the per-pass robust trend, the
     acceptance band, the points it would flag and those already flagged, and the re-estimated σ.
+plot_prior_posterior(source, ...)
+    Corner plot of the a priori and the posterior of selected state elements (Gaussian, no
+    samples): ellipses per pair, densities on the diagonal, the truth when known.
+plot_monte_carlo(errors, covariances, ...)
+    Corner plot of the errors of many fits (Monte Carlo over noise and a-priori draws) against the
+    filter's covariance, with the NEES test of covariance realism and a bias test per axis.
 plot_consistency(errors, ...)
     Is the error consistent with the covariance? Errors inside ±3σ, normalized errors e/σ, and
     the Mahalanobis χ² against its bounds, with the tracking periods and the data cutoff marked.
@@ -1728,4 +1734,279 @@ def plot_editing(editor, n_sigma=5.0, mad_scale=1.4826, dataset_names=None, unit
                      x=0.125, ha="left", y=top, fontsize=11)
         fig.legend(handles=handles, loc="upper right", bbox_to_anchor=(0.9, top - 0.2 / height), ncol=5,
                    handletextpad=0.3, columnspacing=1.0, fontsize=7.5)
+    return fig
+
+
+# ------------------------------------------------------------------------------------------------
+# Corner plots: a priori vs posterior, and Monte Carlo
+# ------------------------------------------------------------------------------------------------
+
+def _corner_axes(fig, n, top, bottom, left=0.1, right=0.97):
+    """Lower-triangle grid of axes: ``{(row, col): Axes}`` for row >= col, shared columns."""
+    grid = fig.add_gridspec(n, n, wspace=0.08, hspace=0.08, top=top, bottom=bottom, left=left, right=right)
+    axes = {}
+    for i in range(n):
+        for j in range(i + 1):
+            ax = fig.add_subplot(grid[i, j])
+            axes[i, j] = ax
+    for (i, j), ax in axes.items():
+        if i < n - 1:
+            ax.tick_params(labelbottom=False)
+        if j > 0 or i == 0:
+            ax.tick_params(labelleft=False)
+        ax.tick_params(labelsize=7.5)
+    return axes
+
+
+def _gaussian(x, mean, sigma):
+    return np.exp(-0.5 * ((x - mean) / sigma) ** 2) / (sigma * np.sqrt(2 * np.pi))
+
+
+def _display(component, label):
+    """(subtract the a priori?, factor, unit) for a state element in the corner plots."""
+    name = component["name"]
+    if name == "position":
+        return True, 1.0, "km"
+    if name == "velocity":
+        return True, 1e6, "mm/s"
+    unit = "RU" if "RU" in name else ("" if component["units"]["name"] == "unitless" else component["units"]["name"])
+    return False, 1.0, unit
+
+
+def plot_prior_posterior(source, variables=None, truth=None, truth_values=None, view="posterior", frame="RTN",
+                         center="EARTH", origin="SUN", title=None, size=None):
+    """Corner plot of the a priori and the posterior of a saved solution (Gaussian, no samples).
+
+    Each pair of variables shows the a-priori 1σ and 3σ ellipses (gray, dashed for 3σ), the
+    posterior ones (filled 1σ, outlined 3σ), the estimate (dot) and the truth (star) when known,
+    with the posterior correlation ρ in the corner. The diagonal shows the two 1-D Gaussians and
+    σ_post / σ_prior. Position and velocity are changes from the a priori, in RTN about ``center``;
+    parameters are absolute values.
+
+    Parameters
+    ----------
+    source : str, Path or dict
+        A saved solution (Scarabaeus 2.0 JSON).
+    variables : list of str, optional
+        Short labels to include (``"pos R"``, ``"vel T"``, ``"eta_srp"``, ...). Default: the
+        position axes and every parameter, at most 6.
+    truth, truth_values
+        As in :func:`plot_parameter_learning`.
+    view : {"posterior", "prior"}
+        Frame each axis on the posterior (±4σ; the shape and the degeneracies show) or on the a
+        priori (±3.5σ; how much the data reduced it shows).
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+    """
+    if isinstance(source, (str, Path)):
+        with open(source) as f:
+            source = json.load(f)
+    state = _solution_at_epoch(source, frame, center, origin, truth, truth_values)
+    labels, groups = _short_labels(state["components"], state["axes"])
+    component_of = [c for c in state["components"] for _ in range(c["dim"])]
+    if variables is None:
+        variables = [l for l, g in zip(labels, groups) if g == "position"] + \
+                    [l for l, g in zip(labels, groups) if g not in ("position", "velocity")]
+        variables = variables[:6]
+    idx = [labels.index(v) for v in variables]
+    n = len(idx)
+    prior_x, prior_P, post_x, post_P, true_x = (state[k] for k in ("prior_x", "prior_P", "post_x", "post_P", "true_x"))
+
+    # Display transform: position and velocity relative to the estimate (posterior view) or to the
+    # a priori (prior view), in units set by the spread shown; parameters as absolute values
+    center_x = post_x if view == "posterior" else prior_x
+    spread = np.sqrt(np.diag(post_P if view == "posterior" else prior_P))
+    ref, fac, units, axis_labels = np.zeros(n), np.ones(n), [], []
+    for a, i in enumerate(idx):
+        relative, _, unit = _display(component_of[i], labels[i])
+        if relative:
+            quantity = "velocity" if component_of[i]["name"] == "velocity" else "position"
+            fac[a], unit = _scale_unit(4 * spread[i], quantity)
+            ref[a] = center_x[i]
+            axis_labels.append(f"{labels[i]} − {'estimate' if view == 'posterior' else 'a priori'}")
+        else:
+            axis_labels.append(labels[i])
+        units.append(unit)
+    def shown(x):
+        return (np.asarray(x)[idx] - ref) * fac
+    prior_m, post_m, true_m = shown(prior_x), shown(post_x), shown(true_x)
+    S = np.diag(fac)
+    prior_C = S @ prior_P[np.ix_(idx, idx)] @ S
+    post_C = S @ post_P[np.ix_(idx, idx)] @ S
+    prior_s, post_s = np.sqrt(np.diag(prior_C)), np.sqrt(np.diag(post_C))
+    if view == "posterior":
+        lims = [(post_m[a] - 4 * post_s[a], post_m[a] + 4 * post_s[a]) for a in range(n)]
+    else:
+        lims = [(prior_m[a] - 3.5 * prior_s[a], prior_m[a] + 3.5 * prior_s[a]) for a in range(n)]
+    post_color, prior_color, truth_color = "#0072B2", "#9a9a9a", "#D55E00"
+
+    with plt.rc_context(STYLE):
+        side = size or min(10.0, 1.9 * n + 1.2)
+        fig = plt.figure(figsize=(side, side))
+        axes = _corner_axes(fig, n, top=1.0 - 0.9 / side, bottom=0.6 / side + 0.05, left=0.12)
+        for (i, j), ax in axes.items():
+            if i == j:
+                grid_x = np.linspace(*lims[i], 400)
+                ax.fill_between(grid_x, _gaussian(grid_x, post_m[i], post_s[i]), color=post_color, alpha=0.25, lw=0)
+                ax.plot(grid_x, _gaussian(grid_x, post_m[i], post_s[i]), color=post_color, lw=1.3)
+                prior_curve = _gaussian(grid_x, prior_m[i], prior_s[i])
+                ax2 = ax.twinx()  # the prior is far flatter: its own scale
+                ax2.plot(grid_x, prior_curve, color=prior_color, lw=1.2, ls="--")
+                ax2.set_yticks([])
+                ax2.set_ylim(0, 1.15 * max(prior_curve.max(), 1e-300))
+                ax2.grid(False)
+                for spine in ax2.spines.values():
+                    spine.set_visible(False)
+                ax.set_ylim(0, 1.15 * _gaussian(post_m[i], post_m[i], post_s[i]))
+                ax.set_yticks([])
+                if np.isfinite(true_m[i]):
+                    ax.axvline(true_m[i], color=truth_color, lw=1.0)
+                ax.set_title(f"{variables[i]}\nσ post/prior {post_s[i] / prior_s[i]:.2g}", fontsize=8, color="#333333")
+            else:
+                for k, style in [(3, "--"), (1, "-")]:
+                    e = _ellipse(prior_C[np.ix_([j, i], [j, i])], k) + prior_m[[j, i]]
+                    ax.plot(e[:, 0], e[:, 1], color=prior_color, lw=0.9, ls=style)
+                one = _ellipse(post_C[np.ix_([j, i], [j, i])], 1) + post_m[[j, i]]
+                three = _ellipse(post_C[np.ix_([j, i], [j, i])], 3) + post_m[[j, i]]
+                ax.fill(one[:, 0], one[:, 1], color=post_color, alpha=0.3, lw=0)
+                ax.plot(three[:, 0], three[:, 1], color=post_color, lw=1.0)
+                ax.plot(post_m[j], post_m[i], "o", ms=4, color=post_color, mec="white", mew=0.5, zorder=4)
+                if np.isfinite(true_m[j]) and np.isfinite(true_m[i]):
+                    ax.plot(true_m[j], true_m[i], "*", ms=9, color=truth_color, mec="white", mew=0.5, zorder=5)
+                rho = post_C[i, j] / (post_s[i] * post_s[j])
+                ax.text(0.04, 0.95, f"ρ {rho:+.2f}".replace("-", "−"), transform=ax.transAxes, fontsize=7.5,
+                        va="top", color="#333333", bbox=dict(facecolor="white", edgecolor="none", alpha=0.7, pad=1))
+                ax.set_ylim(*lims[i])
+            ax.set_xlim(*lims[j])
+            if i == n - 1:
+                ax.set_xlabel(f"{axis_labels[j]}" + (f" [{units[j]}]" if units[j] else ""), fontsize=8)
+            if j == 0 and i > 0:
+                ax.set_ylabel(f"{axis_labels[i]}" + (f" [{units[i]}]" if units[i] else ""), fontsize=8)
+            ax.ticklabel_format(useOffset=False, style="plain") if ax.get_xscale() == "linear" else None
+        handles = [plt.Rectangle((0, 0), 1, 1, color=post_color, alpha=0.4, label="posterior 1σ (3σ outlined)"),
+                   Line2D([], [], color=prior_color, lw=1.0, label="a priori 1σ, 3σ dashed")]
+        if np.any(np.isfinite(true_m)):
+            handles.append(Line2D([], [], ls="", marker="*", ms=9, color=truth_color, label="truth"))
+        fig.legend(handles=handles, loc="upper right", bbox_to_anchor=(0.97, 1.0 - 0.95 / side), fontsize=8)
+        frame_text = ("position, velocity in RTN about Earth (R = line of sight), relative to the "
+                      + ("estimate" if view == "posterior" else "a priori")) if frame == "RTN" else "J2000"
+        fig.suptitle(title or f"A priori and posterior  ·  {view} view", x=0.12, ha="left",
+                     y=1.0 - 0.12 / side, fontsize=11)
+        fig.text(0.12, 1.0 - 0.42 / side, frame_text, fontsize=8, color="#555555")
+    return fig
+
+
+def plot_monte_carlo(errors, covariances, labels=None, title=None, size=None):
+    """Monte Carlo test of covariance realism: the errors of many fits against the filter covariance.
+
+    Each run (new measurement noise and a-priori error) gives one estimation error. Every pair
+    panel shows the runs as points, the 1σ and 3σ ellipses of the filter's average covariance and
+    the sample mean (cross); the diagonal shows each error's histogram against N(0, σ).
+
+    The header gives two tests:
+
+    - **NEES** (normalized estimation error squared) eᵀP⁻¹e, averaged over the runs: for a
+      consistent filter it follows χ²(N·d)/N, so its mean lies near d (the number of variables)
+      with the 95 % interval shown. Above it, the covariance is optimistic; below, pessimistic;
+    - **bias** per axis: the sample mean against its standard error σ/√N. Beyond 3, the errors are
+      biased (a systematic error the covariance cannot describe), flagged in vermillion. The spread
+      (sample standard deviation / filter σ) separates the two failure modes: a wrong spread is a
+      wrong covariance, a right spread with an offset mean is an unmodeled systematic error.
+
+    Parameters
+    ----------
+    errors : array (N, d)
+        One error per run, e.g. ``state_errors(...)["error"][0]`` of each fit, in RTN.
+    covariances : array (N, d, d) or (d, d)
+        The filter's covariance of each run (or one for all).
+    labels : list of str, optional
+        Variable names; default ``R, T, N`` position then velocity.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+    """
+    from scipy.stats import chi2 as chi2_dist
+
+    errors = np.asarray(errors, dtype=float)
+    covariances = np.asarray(covariances, dtype=float)
+    if covariances.ndim == 2:
+        covariances = np.broadcast_to(covariances, (errors.shape[0],) + covariances.shape)
+    N, d = errors.shape
+    labels = labels or ["pos R", "pos T", "pos N", "vel R", "vel T", "vel N"][:d]
+    mean_cov = covariances.mean(axis=0)
+    sigma = np.sqrt(np.diag(mean_cov))
+    nees = np.einsum("ni,ni->n", errors, np.linalg.solve(covariances, errors[..., None])[..., 0])
+    nees_mean = float(np.mean(nees))
+    nees_low, nees_high = chi2_dist.ppf([0.025, 0.975], N * d) / N
+    sample_mean = errors.mean(axis=0)
+    bias_z = sample_mean / (sigma / np.sqrt(N))
+    spread = errors.std(axis=0, ddof=1) / sigma
+
+    # Display units per variable: positions km -> m or km, velocities km/s -> mm/s
+    fac, units = np.ones(d), []
+    for a, label in enumerate(labels):
+        quantity = "velocity" if label.startswith("vel") else "position"
+        factor, unit = _scale_unit(max(3 * sigma[a], np.max(np.abs(errors[:, a]))), quantity)
+        fac[a] = factor
+        units.append(unit)
+    E = errors * fac
+    C = mean_cov * np.outer(fac, fac)
+    s = sigma * fac
+    m = sample_mean * fac
+    lims = [(min(-3.6 * s[a], E[:, a].min()) * 1.05, max(3.6 * s[a], E[:, a].max()) * 1.05) for a in range(d)]
+    point_color, cov_color, flag = "#0072B2", "#222222", "#D55E00"
+
+    with plt.rc_context(STYLE):
+        side = size or min(10.5, 1.6 * d + 1.6)
+        fig = plt.figure(figsize=(side, side))
+        axes = _corner_axes(fig, d, top=1.0 - 1.15 / side, bottom=0.6 / side + 0.05, left=0.12)
+        for (i, j), ax in axes.items():
+            biased_j = abs(bias_z[j]) > 3
+            if i == j:
+                bins = np.linspace(*lims[i], 25)
+                ax.hist(E[:, i], bins=bins, density=True, color=point_color, alpha=0.45, lw=0)
+                grid_x = np.linspace(*lims[i], 300)
+                ax.plot(grid_x, _gaussian(grid_x, 0.0, s[i]), color=cov_color, lw=1.1)
+                ax.axvline(m[i], color=flag if biased_j else point_color, lw=1.2, ls="--")
+                ax.set_yticks([])
+                bias_text = f"{bias_z[i]:+.1f}" if abs(bias_z[i]) < 1e3 else f"{bias_z[i]:+.1e}"
+                ax.set_title(f"{labels[i]}\nmean {bias_text} σ/√N\nspread {spread[i]:.2f}σ", fontsize=7.5,
+                             color=flag if biased_j else "#333333")
+            else:
+                ax.plot(E[:, j], E[:, i], "o", ms=2.6, color=point_color, alpha=0.6, mew=0)
+                for k, style in [(1, "-"), (3, "--")]:
+                    e = _ellipse(C[np.ix_([j, i], [j, i])], k)
+                    ax.plot(e[:, 0], e[:, 1], color=cov_color, lw=1.0, ls=style)
+                biased = biased_j or abs(bias_z[i]) > 3
+                ax.plot(m[j], m[i], "X", ms=7, color=flag if biased else point_color, mec="white", mew=0.6, zorder=5)
+                ax.set_ylim(*lims[i])
+            ax.set_xlim(*lims[j])
+            if i == d - 1:
+                ax.set_xlabel(f"{labels[j]} [{units[j]}]", fontsize=8)
+            if j == 0 and i > 0:
+                ax.set_ylabel(f"{labels[i]} [{units[i]}]", fontsize=8)
+
+        biased_axes = [labels[a] for a in range(d) if abs(bias_z[a]) > 3]
+        consistent = nees_low <= nees_mean <= nees_high
+        if biased_axes:
+            verdict = "biased: the errors are offset, which no covariance describes"
+        elif consistent:
+            verdict = "consistent"
+        else:
+            verdict = "covariance optimistic" if nees_mean > nees_high else "covariance pessimistic"
+        lines = [f"{N} runs  ·  mean NEES {_fmt(nees_mean)} (consistent: {d}, 95 % interval {nees_low:.2f}–{nees_high:.2f})"
+                 f"  ·  {verdict}",
+                 f"biased axes (|mean| > 3 σ/√N): {', '.join(biased_axes) if biased_axes else 'none'}"
+                 "  ·  spread: sample std / filter σ (consistent: about 1)"]
+        fig.suptitle(title or "Monte Carlo: errors against the filter covariance", x=0.12, ha="left",
+                     y=1.0 - 0.12 / side, fontsize=11)
+        fig.text(0.12, 1.0 - 0.62 / side, "\n".join(lines), fontsize=8.5,
+                 color="#222222" if consistent and not biased_axes else flag, linespacing=1.5)
+        handles = [Line2D([], [], ls="", marker="o", ms=5, color=point_color, label="one run"),
+                   Line2D([], [], color=cov_color, lw=1.0, label="filter 1σ (3σ dashed)"),
+                   Line2D([], [], ls="", marker="X", ms=7, color=point_color, label="sample mean")]
+        fig.legend(handles=handles, loc="upper right", bbox_to_anchor=(0.97, 1.0 - 1.2 / side), fontsize=8)
     return fig
