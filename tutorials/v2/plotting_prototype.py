@@ -43,8 +43,9 @@ plot_monte_carlo(errors, covariances, ...)
     Corner plot of the errors of many fits (Monte Carlo over noise and a-priori draws) against the
     filter's covariance, with the NEES test of covariance realism and a bias test per axis.
 plot_consistency(errors, ...)
-    Is the error consistent with the covariance? Errors inside ±3σ, normalized errors e/σ, and
-    the Mahalanobis χ² against its bounds, with the tracking periods and the data cutoff marked.
+    Is the error consistent with the covariance? Position and velocity errors inside ±3σ,
+    normalized errors e/σ, and the Mahalanobis χ² against its bounds, with the tracking periods
+    and the data cutoff marked.
 """
 
 import json
@@ -457,16 +458,20 @@ def _passes(t_meas, gap):
     return [(seg[0], seg[-1]) for seg in np.split(t_meas, breaks)]
 
 
-def plot_consistency(errors, quantity="position", physical=True, time_unit="auto", title=None, label=None,
-                     width=11.0):
+def plot_consistency(errors, quantity="both", physical=True, style="line", time_unit="auto", title=None,
+                     label=None, width=11.0):
     """Is the estimation error consistent with the covariance?
 
-    Rows, sharing the time axis:
+    Rows, sharing the time axis, for position and velocity (``quantity="both"``, the default) or
+    one of them:
 
-    1. (``physical=True``) the error of each axis inside its ±3σ band, in display units;
-    2. the normalized errors e/σ of the three axes, with ±1σ and ±3σ bands and their histogram;
-    3. the Mahalanobis distance χ² = δᵀ P⁻¹ δ of the 3-D error, against the χ²(3) mean (3) and its
-       95 % and 99.73 % bounds, with its histogram against the χ²(3) density.
+    1. (``physical=True``) the error of each axis inside its ±3σ band, in display units, one row
+       per quantity;
+    2. the normalized errors e/σ of the three axes, with ±1σ and ±3σ bands and their histogram,
+       one row per quantity;
+    3. the Mahalanobis distance χ² = δᵀ P⁻¹ δ of the 3-D error of each quantity (position solid,
+       velocity dashed), against the χ²(3) mean (3) and its 95 % and 99.73 % bounds, with its
+       histogram against the χ²(3) density.
 
     Tracking periods (from the solution's measurement epochs) are shaded and the last measurement
     is marked, so the data arc and the prediction read at a glance. The samples are correlated in
@@ -476,9 +481,14 @@ def plot_consistency(errors, quantity="position", physical=True, time_unit="auto
     ----------
     errors : dict
         The output of :func:`state_errors`.
-    quantity : {"position", "velocity"}
+    quantity : {"both", "position", "velocity"}
     physical : bool
-        Include the row of physical errors.
+        Include the rows of physical errors.
+    style : {"line", "scatter"}
+        Lines through the evaluated epochs (default), or markers only. Scatter shows the tracking
+        pattern when ``errors`` is evaluated at the measurement epochs, but the statistics are then
+        averaged over those epochs, weighting the tracked periods; a uniform grid weights every
+        epoch equally.
     time_unit : {"auto", "day", "hr", "min"}
     title, label : str, optional
         Figure title, and a short name of the solution for the default title.
@@ -487,17 +497,25 @@ def plot_consistency(errors, quantity="position", physical=True, time_unit="auto
     -------
     matplotlib.figure.Figure
     """
-    block = slice(0, 3) if quantity == "position" else slice(3, 6)
-    t, e = errors["t"], errors["error"][:, block]
-    P = errors["covariance"][:, block, block]
-    sigma = np.sqrt(np.einsum("nii->ni", P))
-    z = e / sigma
-    chi2 = np.einsum("ni,ni->n", e, np.linalg.solve(P, e[..., None])[..., 0])
+    style_name = style
+    draw = {"line": dict(lw=1.4),
+            "scatter": dict(lw=0, marker="o", ms=2.6, mew=0, ls="")}[style]
+    quantities = ["position", "velocity"] if quantity == "both" else [quantity]
+    t = errors["t"]
+    data = {}
+    for q in quantities:
+        block = slice(0, 3) if q == "position" else slice(3, 6)
+        e = errors["error"][:, block]
+        P = errors["covariance"][:, block, block]
+        sigma = np.sqrt(np.einsum("nii->ni", P))
+        data[q] = dict(e=e, sigma=sigma, z=e / sigma,
+                       chi2=np.einsum("ni,ni->n", e, np.linalg.solve(P, e[..., None])[..., 0]))
     t0, t_scale, t_label = _time_axis(t, time_unit)
     x = (t - t0) / t_scale
     passes = _passes(errors["measurement_epochs"], gap=3 * 3600.0)
     cutoff = (np.max(errors["measurement_epochs"]) - t0) / t_scale
     axis_colors = PALETTE[:3]
+    chi2_styles = {"position": ("#000000", "-"), "velocity": ("#555555", "--")}
     shade = "#4d4d4d"
 
     def mark_data(ax):
@@ -506,88 +524,105 @@ def plot_consistency(errors, quantity="position", physical=True, time_unit="auto
         if cutoff < x.max():
             ax.axvline(cutoff, color="#333333", lw=0.9, ls="--", zorder=1)
 
+    n_q = len(quantities)
     with plt.rc_context(STYLE):
-        n_rows = 3 if physical else 2
-        height = 0.9 + (2.0 if physical else 0.0) + 2.0 + 2.2
+        heights = ([1.0] * n_q if physical else []) + [1.0] * n_q + [1.15]
+        height = 0.9 + 2.0 * sum(heights)
         fig = plt.figure(figsize=(width, height))
-        outer = fig.add_gridspec(n_rows, 1, hspace=0.6, top=1.0 - 0.95 / height)
-        lower = [outer[r].subgridspec(1, 2, width_ratios=[6, 1], wspace=0.02) for r in range(n_rows)]
+        outer = fig.add_gridspec(len(heights), 1, height_ratios=heights, hspace=0.75, top=1.0 - 0.95 / height,
+                                 bottom=0.45 / height)
+        lower = [outer[r].subgridspec(1, 2, width_ratios=[6, 1], wspace=0.02) for r in range(len(heights))]
         row = 0
         shared = None
 
         if physical:
+            for q in quantities:
+                e, sigma = data[q]["e"], data[q]["sigma"]
+                for j, name in enumerate(errors["axes"]):
+                    factor, unit = _length_unit(np.concatenate([e[:, j], 3 * sigma[:, j]]), q)
+                    ax = fig.add_subplot(outer[row].subgridspec(1, 3, wspace=0.3)[0, j], sharex=shared)
+                    shared = shared or ax
+                    mark_data(ax)
+                    ax.fill_between(x, -3 * sigma[:, j] * factor, 3 * sigma[:, j] * factor, color=shade, alpha=0.10,
+                                    lw=0)
+                    ax.plot(x, e[:, j] * factor, color=axis_colors[j], **draw)
+                    ax.axhline(0, color=shade, lw=0.6)
+                    ax.set_title(f"{q} {name}  (±3σ shaded)", loc="left", fontsize=9.5, color="#222222")
+                    ax.set_ylabel(f"[{unit}]")
+                    plt.setp(ax.get_xticklabels(), visible=False)
+                row += 1
+
+        # Normalized errors, one row per quantity
+        histograms = []
+        for k, q in enumerate(quantities):
+            z = data[q]["z"]
+            ax_z = fig.add_subplot(lower[row][0, 0], sharex=shared)
+            shared = shared or ax_z
+            mark_data(ax_z)
+            for n_sig, alpha in [(3, 0.07), (1, 0.12)]:
+                ax_z.axhspan(-n_sig, n_sig, color=shade, alpha=alpha, lw=0, zorder=0)
+            ax_z.axhline(0, color=shade, lw=0.6)
             for j, name in enumerate(errors["axes"]):
-                factor, unit = _length_unit(np.concatenate([e[:, j], 3 * sigma[:, j]]), quantity)
-                ax = fig.add_subplot(outer[0].subgridspec(1, 3, wspace=0.3)[0, j], sharex=shared)
-                shared = shared or ax
-                mark_data(ax)
-                ax.fill_between(x, -3 * sigma[:, j] * factor, 3 * sigma[:, j] * factor, color=shade, alpha=0.10, lw=0)
-                ax.plot(x, e[:, j] * factor, color=axis_colors[j], lw=1.4)
-                ax.axhline(0, color=shade, lw=0.6)
-                ax.set_title(f"{name} error  (±3σ shaded)", loc="left", fontsize=9.5, color="#222222")
-                ax.set_ylabel(f"[{unit}]")
-                plt.setp(ax.get_xticklabels(), visible=False)
-            row = 1
+                ax_z.plot(x, z[:, j], color=axis_colors[j], label=name, **draw)
+            z_limit = max(4.0, 1.1 * np.nanmax(np.abs(z)))
+            ax_z.set_ylim(-z_limit, z_limit)
+            ax_z.set_ylabel("e / σ")
+            inside = np.mean(np.abs(z) <= 3, axis=0)
+            ax_z.set_title(f"Normalized {q} error", loc="left", fontsize=10, color="#222222", pad=15)
+            ax_z.text(0, 1.02, "  ·  ".join(f"{name}: max |e/σ| {np.nanmax(np.abs(z[:, j])):.1f}, "
+                                            f"{inside[j]:.0%} within 3σ" for j, name in enumerate(errors["axes"])),
+                      transform=ax_z.transAxes, fontsize=8, color="#555555", va="bottom")
+            if k == 0:
+                data_handles = [plt.Rectangle((0, 0), 1, 1, color="#56B4E9", alpha=0.25, label="tracking"),
+                                Line2D([], [], color="#333333", lw=0.9, ls="--", label="last measurement")]
+                ax_z.legend(handles=ax_z.get_legend_handles_labels()[0] + data_handles, loc="lower right", ncol=5,
+                            bbox_to_anchor=(1.0, 1.08), handlelength=1.5)
+            plt.setp(ax_z.get_xticklabels(), visible=False)
+            hz = fig.add_subplot(lower[row][0, 1], sharey=ax_z)
+            bins = np.linspace(-z_limit, z_limit, 41)
+            hz.hist(z.ravel(), bins=bins, orientation="horizontal", density=True, color="#9a9a9a", alpha=0.6, lw=0)
+            grid_z = np.linspace(-z_limit, z_limit, 300)
+            hz.plot(np.exp(-0.5 * grid_z**2) / np.sqrt(2 * np.pi), grid_z, color="#222222", lw=1.0)
+            for n_sig, alpha in [(3, 0.07), (1, 0.12)]:
+                hz.axhspan(-n_sig, n_sig, color=shade, alpha=alpha, lw=0)
+            histograms.append(hz)
+            row += 1
 
-        # Normalized errors
-        ax_z = fig.add_subplot(lower[row][0, 0], sharex=shared)
-        shared = shared or ax_z
-        mark_data(ax_z)
-        for k, alpha in [(3, 0.07), (1, 0.12)]:
-            ax_z.axhspan(-k, k, color=shade, alpha=alpha, lw=0, zorder=0)
-        ax_z.axhline(0, color=shade, lw=0.6)
-        for j, name in enumerate(errors["axes"]):
-            ax_z.plot(x, z[:, j], color=axis_colors[j], lw=1.4, label=name)
-        z_limit = max(4.0, 1.1 * np.nanmax(np.abs(z)))
-        ax_z.set_ylim(-z_limit, z_limit)
-        ax_z.set_ylabel("e / σ")
-        inside = np.mean(np.abs(z) <= 3, axis=0)
-        ax_z.set_title("Normalized error", loc="left", fontsize=10, color="#222222", pad=15)
-        ax_z.text(0, 1.02, "  ·  ".join(f"{name}: max |e/σ| {np.nanmax(np.abs(z[:, j])):.1f}, {inside[j]:.0%} within 3σ"
-                                        for j, name in enumerate(errors["axes"])),
-                  transform=ax_z.transAxes, fontsize=8, color="#555555", va="bottom")
-        data_handles = [plt.Rectangle((0, 0), 1, 1, color="#56B4E9", alpha=0.25, label="tracking"),
-                        Line2D([], [], color="#333333", lw=0.9, ls="--", label="last measurement")]
-        ax_z.legend(handles=ax_z.get_legend_handles_labels()[0] + data_handles, loc="lower right", ncol=5,
-                    bbox_to_anchor=(1.0, 1.08), handlelength=1.5)
-        plt.setp(ax_z.get_xticklabels(), visible=False)
-        hz = fig.add_subplot(lower[row][0, 1], sharey=ax_z)
-        bins = np.linspace(-z_limit, z_limit, 41)
-        hz.hist(z.ravel(), bins=bins, orientation="horizontal", density=True, color="#9a9a9a", alpha=0.6, lw=0)
-        grid_z = np.linspace(-z_limit, z_limit, 300)
-        hz.plot(np.exp(-0.5 * grid_z**2) / np.sqrt(2 * np.pi), grid_z, color="#222222", lw=1.0)
-        for k, alpha in [(3, 0.07), (1, 0.12)]:
-            hz.axhspan(-k, k, color=shade, alpha=alpha, lw=0)
-
-        # Mahalanobis χ²
-        ax_c = fig.add_subplot(lower[row + 1][0, 0], sharex=shared)
+        # Mahalanobis χ² of each quantity (3 dof each, so they share the bounds)
+        all_chi2 = np.concatenate([data[q]["chi2"] for q in quantities])
+        ax_c = fig.add_subplot(lower[row][0, 0], sharex=shared)
         mark_data(ax_c)
+        low = max(1e-2, 0.5 * np.nanmin(all_chi2[all_chi2 > 0])) if np.any(all_chi2 > 0) else 1e-2
+        c_range = (min(low, 0.3), max(30.0, 2.0 * np.nanmax(all_chi2)))
         ax_c.axhspan(CHI2_3["95%"], CHI2_3["99.73%"], color="#E69F00", alpha=0.10, lw=0)
-        ax_c.axhspan(CHI2_3["99.73%"], max(1e4, 2 * np.nanmax(chi2)), color="#D55E00", alpha=0.10, lw=0)
+        ax_c.axhspan(CHI2_3["99.73%"], c_range[1], color="#D55E00", alpha=0.10, lw=0)
         ax_c.axhline(CHI2_3["mean"], color=shade, lw=0.8, ls=":")
-        ax_c.plot(x, chi2, color="#000000", lw=1.4)
-        low = max(1e-2, 0.5 * np.nanmin(chi2[chi2 > 0])) if np.any(chi2 > 0) else 1e-2
-        c_range = (min(low, 0.3), max(30.0, 2.0 * np.nanmax(chi2)))
+        stats = []
+        for q in quantities:
+            chi2 = data[q]["chi2"]
+            color, line_style = chi2_styles[q]
+            ax_c.plot(x, chi2, color=color, label=q, **{**draw, "ls": "" if style_name == "scatter" else line_style})
+            stats.append(f"{q}: mean {np.nanmean(chi2):.3g}, {np.mean(chi2 <= CHI2_3['95%']):.0%} below 95 %, "
+                         f"max {np.nanmax(chi2):.3g}")
         ax_c.set_yscale("log")
         ax_c.set_ylim(*c_range)
         ax_c.set_ylabel("χ²  (3 dof)")
         ax_c.set_xlabel(t_label)
-        ax_c.set_title(f"Mahalanobis distance of the {quantity} error", loc="left", fontsize=10, color="#222222",
-                       pad=15)
-        below95 = np.mean(chi2 <= CHI2_3["95%"])
-        ax_c.text(0, 1.02, f"mean {np.nanmean(chi2):.2f} (consistent: 3)  ·  median {np.nanmedian(chi2):.2f} "
-                           f"(2.37)  ·  {below95:.0%} below the 95 % bound (95 %)  ·  max {np.nanmax(chi2):.3g}"
-                           f"  ·  shaded: beyond 95 % / 99.73 %",
-                  transform=ax_c.transAxes, fontsize=8, color="#555555", va="bottom")
-        hc = fig.add_subplot(lower[row + 1][0, 1], sharey=ax_c)
+        ax_c.set_title("Mahalanobis distance of the error", loc="left", fontsize=10, color="#222222", pad=27)
+        ax_c.text(0, 1.02, "  ·  ".join(stats) + "\nconsistent: mean 3, median 2.37, 95 % of epochs below the 95 % "
+                  "bound  ·  shaded: beyond 95 % / 99.73 %", transform=ax_c.transAxes, fontsize=8, color="#555555",
+                  va="bottom", linespacing=1.4)
+        if n_q > 1:
+            ax_c.legend(loc="lower right", ncol=2, handlelength=2.2)
+        hc = fig.add_subplot(lower[row][0, 1], sharey=ax_c)
         log_bins = np.logspace(np.log10(c_range[0]), np.log10(c_range[1]), 41)
-        hc.hist(np.clip(chi2, *c_range), bins=log_bins, orientation="horizontal", density=True, color="#9a9a9a",
+        hc.hist(np.clip(all_chi2, *c_range), bins=log_bins, orientation="horizontal", density=True, color="#9a9a9a",
                 alpha=0.6, lw=0)
         grid_c = np.logspace(np.log10(c_range[0]), np.log10(c_range[1]), 300)
         hc.plot(np.sqrt(grid_c / (2 * np.pi)) * np.exp(-grid_c / 2), grid_c, color="#222222", lw=1.0)  # χ²(3) pdf
         hc.axhspan(CHI2_3["95%"], CHI2_3["99.73%"], color="#E69F00", alpha=0.10, lw=0)
         hc.axhspan(CHI2_3["99.73%"], c_range[1], color="#D55E00", alpha=0.10, lw=0)
-        for h in (hz, hc):
+        for h in histograms + [hc]:
             h.set_xticks([])
             h.tick_params(axis="y", labelleft=False)
             h.grid(False)
@@ -597,8 +632,8 @@ def plot_consistency(errors, quantity="position", physical=True, time_unit="auto
         if title is None:
             frame_text = (f"RTN axes of the orbit about {errors['center'].title()}: R = line of sight"
                           if errors["axes"][0] == "R" else "J2000 axes")
-            title = "  ·  ".join(([label] if label else []) + [f"{quantity.title()} error vs. covariance",
-                                                               frame_text])
+            what = "State" if n_q > 1 else quantity.title()
+            title = "  ·  ".join(([label] if label else []) + [f"{what} error vs. covariance", frame_text])
         top = 1.0 - 0.1 / height
         fig.suptitle(title, x=0.125, ha="left", y=top, fontsize=11)
     return fig
