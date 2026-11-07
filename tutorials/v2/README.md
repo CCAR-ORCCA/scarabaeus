@@ -45,6 +45,15 @@ python prepare.py 06 --force    # regenerate even if the outputs already exist
 
 The prerequisite notebooks are executed in memory and are not modified. If the inputs are missing, the chapter's setup cell stops with a message pointing here (chapter 6: a comment in the setup cell, and a `SPICE` / file-not-found error).
 
+## Known limitations
+
+Library features the notebooks work around until they are added to Scarabaeus:
+
+- **`get_state` takes one epoch per call.** Accepting an `EpochArray` is the main missing feature; until then, state histories are built in a loop (chapters 1, 2, 4, 7, 8 and 9).
+- **Progress output.** The filters and measurement models print progress that cannot be switched off yet, so the cells that run them start with `%%capture`.
+- **Plotting functions.** `plotting_prototype.py` holds the plots of this series; they are planned to move into `scb.Plotting`.
+- **Results of earlier fits.** Reading `state_est` of a solution after a later fit of the same spacecraft returns the later fit's values, so the chapters read each solution right after its fit.
+
 ## Review notes
 
 While drafting, flag anything that needs revision with a colored note. The emoji and keyword matter: they keep the note readable where colors are stripped (GitHub) and let `review_notes.py` find it.

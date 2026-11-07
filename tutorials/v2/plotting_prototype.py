@@ -1,7 +1,7 @@
 """Prototype plots for the tutorials, to be upstreamed into ``scb.Plotting``.
 
-🔵 TODO: tutorial-side prototype (rule 3 in PLAN.md). Once the design settles, these functions
-move into ``scarabaeus.utils.Plotting`` and the notebooks call them from there.
+These functions are planned to move into ``scarabaeus.utils.Plotting``; the notebooks will then
+call them from there.
 
 Functions
 ---------
@@ -13,8 +13,8 @@ residuals_from_solution(solution, measurements, kind="postfit")
     The input of ``plot_residuals`` from an in-memory ``SolutionOD`` and its ``MeasurementSpec``
     (in-memory residuals carry no epochs; the saved JSON does).
 state_errors(solution, truth, epochs, ...)
-    Estimate minus truth and the covariance at any epochs, in the RTN axes of the truth's orbit
-    about a center (Earth by default: R is the line of sight, T and N span the plane of sky).
+    Estimate minus truth and the covariance at any epochs: along the line of sight from Earth and
+    across it, in the plane of sky (default), or in the RTN axes of the orbit about a body.
 plot_residual_summary(source, ...)
     One row per tracking pass: the mean (bias) and spread of its normalized residuals for each
     measurement type, against what white noise allows. Scales to campaigns with dozens of passes.
@@ -552,7 +552,28 @@ def plot_residuals(
 CHI2_3 = {"mean": 3.0, "95%": 7.815, "99.73%": 14.16}
 
 
-def state_errors(solution, truth, epochs, center="EARTH", frame="RTN", origin="SUN", **mapping):
+FRAMES = ("LOS", "RTN", "J2000")
+
+
+def _frame_axes(frame, center):
+    """Center of the rotation, axis labels and a description for a frame name.
+
+    ``"LOS"``: the line of sight from Earth and two axes spanning the plane of sky, built as the
+    RTN axes of the spacecraft's motion relative to Earth (PoS 1 along that motion, PoS 2 normal to
+    it). What Earth-based tracking measures and what it infers. ``"RTN"``: radial, transverse and
+    normal axes of the orbit about ``center`` (the Sun by default), the axes in which a trajectory
+    error evolves. ``"J2000"``: no rotation.
+    """
+    if frame == "LOS":
+        return "EARTH", ("LOS", "PoS 1", "PoS 2"), "line of sight (LOS) and plane of sky (PoS) from Earth"
+    if frame == "RTN":
+        return center, ("R", "T", "N"), f"RTN about the {center.title()}"
+    if frame == "J2000":
+        return None, ("x", "y", "z"), "J2000 axes"
+    raise ValueError(f"frame must be one of {FRAMES}, got {frame!r}")
+
+
+def state_errors(solution, truth, epochs, frame="LOS", center="SUN", origin="SUN", **mapping):
     """Estimate minus truth, and the estimate's covariance, at ``epochs``.
 
     Parameters
@@ -563,10 +584,12 @@ def state_errors(solution, truth, epochs, center="EARTH", frame="RTN", origin="S
         as the flight reconstruction).
     epochs : EpochArray
         Any epochs, inside or after the data arc.
+    frame : {"LOS", "RTN", "J2000"}
+        ``"LOS"`` (default): the line of sight from Earth and the plane of sky, what Earth-based
+        radiometric tracking does and does not measure. ``"RTN"``: the axes of the orbit about
+        ``center``, in which a trajectory error evolves (along-track drift, radial offsets).
     center : str
-        Center of the orbit that defines the RTN axes. ``"EARTH"`` makes R the line of sight and
-        T, N the plane of sky, the natural axes for Earth-based radiometric tracking.
-    frame : {"RTN", "J2000"}
+        Center of the orbit for ``frame="RTN"``. Defaults to the Sun.
     origin : str
         Origin of the solution's state (the central body of its propagation).
     **mapping
@@ -584,12 +607,13 @@ def state_errors(solution, truth, epochs, center="EARTH", frame="RTN", origin="S
     x = np.array([np.asarray(state.values0.values, dtype=float).ravel()[:6] for state, _ in pairs])
     P = np.array([np.asarray(C, dtype=float)[:6, :6] for _, C in pairs])
     t = np.asarray(epochs.times.values, dtype=float).ravel()
-    # 🔵 TODO: one query per epoch until get_state accepts an EpochArray (PLAN.md, API change 2)
+    # one query per epoch: get_state takes one epoch per call (EpochArray support is planned)
     x_true = np.array([truth.get_state(epochs[k], reference_frame="J2000", origin=origin).quantity.values
                        for k in range(t.size)], dtype=float)
     error = x - x_true
     axes = ("x", "y", "z")
-    if frame == "RTN":
+    center, axes, frame_text = _frame_axes(frame, center)
+    if center is not None:
         relative = np.array([truth.get_state(epochs[k], reference_frame="J2000", origin=center).quantity.values
                              for k in range(t.size)], dtype=float)
         for k in range(t.size):
@@ -597,9 +621,8 @@ def state_errors(solution, truth, epochs, center="EARTH", frame="RTN", origin="S
             R6 = np.kron(np.eye(2), A)  # components along the axes (no transport terms)
             error[k] = R6 @ error[k]
             P[k] = R6 @ P[k] @ R6.T
-        axes = ("R", "T", "N")
-    return {"t": t, "error": error, "covariance": P, "axes": axes, "center": center,
-            "measurement_epochs": np.asarray(solution.timestamps, dtype=float)}
+    return {"t": t, "error": error, "covariance": P, "axes": axes, "frame": frame, "center": center,
+            "frame_text": frame_text, "measurement_epochs": np.asarray(solution.timestamps, dtype=float)}
 
 
 def _length_unit(values_km, quantity):
@@ -789,8 +812,7 @@ def plot_consistency(errors, quantity="both", physical=True, style="line", time_
         hc.set_xlabel("histogram\n(curve: consistent)", fontsize=8, color="#555555")
 
         if title is None:
-            frame_text = (f"RTN axes of the orbit about {errors['center'].title()}: R = line of sight"
-                          if errors["axes"][0] == "R" else "J2000 axes")
+            frame_text = errors.get("frame_text", "J2000 axes")
             what = "State" if n_q > 1 else quantity.title()
             title = "  ·  ".join(([label] if label else []) + [f"{what} error vs. covariance", frame_text])
         top = 1.0 - 0.1 / height
@@ -959,8 +981,8 @@ def plot_residual_summary(source, kind="postfit", iteration="final", datasets=No
 # What the data taught the filter
 # ------------------------------------------------------------------------------------------------
 
-def _solution_at_epoch(record, frame="RTN", center="EARTH", origin="SUN", truth=None, truth_values=None):
-    """A priori and solution of a saved solution at its epoch, position and velocity optionally in RTN.
+def _solution_at_epoch(record, frame="LOS", center="SUN", origin="SUN", truth=None, truth_values=None):
+    """A priori and solution of a saved solution at its epoch, position and velocity in ``frame``.
 
     Returns a dict with ``prior_x``, ``prior_P``, ``post_x``, ``post_P``, ``true_x``, ``components``
     and ``axes`` (the labels of the position and velocity axes).
@@ -988,7 +1010,8 @@ def _solution_at_epoch(record, frame="RTN", center="EARTH", origin="SUN", truth=
                    index["velocity"]["index_start"]:index["velocity"]["index_end"]]
         if truth is not None:
             true_x[pv] = truth.get_state(epochs, reference_frame="J2000", origin=origin).quantity.values
-        if frame == "RTN":
+        center, frame_axes, _ = _frame_axes(frame, center)
+        if center is not None:
             center_state = scb.CelestialBody.from_constants(center).get_state(
                 epochs, reference_frame="J2000", origin=origin).quantity.values
             relative = post_x[pv] - center_state
@@ -1000,7 +1023,7 @@ def _solution_at_epoch(record, frame="RTN", center="EARTH", origin="SUN", truth=
             if truth is None:
                 true_x[pv] = np.nan
             prior_P, post_P = R @ prior_P @ R.T, R @ post_P @ R.T
-            axes = ("R", "T", "N")
+            axes = frame_axes
     for c in components:
         if c["name"] in (truth_values or {}):
             true_x[c["index_start"]:c["index_end"]] = np.atleast_1d(truth_values[c["name"]])
@@ -1051,13 +1074,13 @@ def _value_text(value, sigma, unit):
     return f"{value:.{digits}f} ± {sigma:.2g} {unit}".strip()
 
 
-def plot_parameter_learning(source, truth=None, truth_values=None, frame="RTN", center="EARTH", origin="SUN",
+def plot_parameter_learning(source, truth=None, truth_values=None, frame="LOS", center="SUN", origin="SUN",
                             components=None, title=None, width=11.0, row_height=0.32):
     """What did the data teach the filter?
 
     One row per estimated (or considered) quantity at the solution epoch, grouped by state
-    component. Position and velocity are shown in the RTN axes of the orbit about ``center``
-    (R is the line of sight from Earth), where what tracking determines and what it does not is
+    component. Position and velocity are shown along the line of sight from Earth and in the plane
+    of sky by default (``frame="LOS"``), where what tracking determines and what it does not is
     plain.
 
     - **Left: σ_post / σ_prior** on a log scale. Near 1, the data added nothing and the result is
@@ -1077,9 +1100,10 @@ def plot_parameter_learning(source, truth=None, truth_values=None, frame="RTN", 
         Body whose ephemeris gives the true position and velocity (simulations).
     truth_values : dict, optional
         ``{component name: true value(s)}`` for the parameters, e.g. ``{"eta_srp": 11 / 15}``.
-    frame : {"RTN", "J2000"}
+    frame : {"LOS", "RTN", "J2000"}
+        As in :func:`state_errors`.
     center, origin : str
-        Center of the RTN orbit, and origin of the solution's state.
+        Center of the orbit for ``frame="RTN"`` (the Sun by default), and origin of the solution's state.
     components : list of str, optional
         State components to show, in order. Default: all.
 
@@ -1173,7 +1197,7 @@ def plot_parameter_learning(source, truth=None, truth_values=None, frame="RTN", 
         ax_r.set_ylim(-0.7, n - 0.3 + 0.9)
 
         if title is None:
-            frame_text = f"position and velocity in RTN about {center.title()} (R = line of sight)" if frame == "RTN" else "J2000"
+            frame_text = "position and velocity: " + _frame_axes(frame, center)[2]
             title = f"What the data determined  ·  {frame_text}"
         top = 1.0 - 0.1 / height
         fig.suptitle(title, x=0.17, ha="left", y=top, fontsize=11)
@@ -1235,16 +1259,16 @@ def plot_covariance_shape(at_epoch, index=0, title=None, width=11.0):
     Earth-based radiometric tracking measures along the line of sight and infers the plane of sky
     through the dynamics, so the two differ by orders of magnitude and get their own panels:
 
-    - **left, plane of sky (T, N):** the 1σ (filled) and 3σ (dashed) ellipses of each solution,
+    - **left, plane of sky (PoS 1, PoS 2):** the 1σ (filled) and 3σ (dashed) ellipses of each solution,
       and its actual error (dot). The legend gives the 2-D χ² of the error (consistent: below 5.99
       for 95 %, 11.83 for 99.73 %);
-    - **right, line of sight (R):** position and velocity, ±1σ (dark) and ±3σ (light) per solution,
+    - **right, line of sight (LOS):** position and velocity, ±1σ (dark) and ±3σ (light) per solution,
       with the error. The line-of-sight velocity is what the first minutes of Doppler measure.
 
     Parameters
     ----------
     at_epoch : dict
-        ``{label: state_errors(...)}`` in RTN axes, all evaluated at the same epoch(s).
+        ``{label: state_errors(...)}`` in the default ``frame="LOS"``, all at the same epoch(s).
     index : int
         Which epoch of the ``state_errors`` output to use.
 
@@ -1258,8 +1282,8 @@ def plot_covariance_shape(at_epoch, index=0, title=None, width=11.0):
     errors = {lab: at_epoch[lab]["error"][index] for lab in labels}
     covs = {lab: at_epoch[lab]["covariance"][index] for lab in labels}
     axes_names = at_epoch[labels[0]]["axes"]
-    if axes_names[0] != "R":
-        raise ValueError("plot_covariance_shape needs state_errors(..., frame='RTN')")
+    if axes_names[0] != "LOS":
+        raise ValueError("plot_covariance_shape needs state_errors(..., frame='LOS')")
     t = at_epoch[labels[0]]["t"][index]
     shade = "#4d4d4d"
 
@@ -1354,7 +1378,7 @@ def plot_covariance_shape(at_epoch, index=0, title=None, width=11.0):
         except Exception:
             when = f"{t:.0f} s TDB"
         top = 1.0 - 0.1 / height
-        fig.suptitle(title or f"Covariance and error at {when}  ·  RTN about Earth (R = line of sight)",
+        fig.suptitle(title or f"Covariance and error at {when}  ·  line of sight and plane of sky from Earth",
                      x=0.125, ha="left", y=top, fontsize=11)
         fig.legend(handles=handles, loc="lower left", bbox_to_anchor=(0.12, -0.04), ncol=min(len(handles), 4),
                    handletextpad=0.4, columnspacing=1.5)
@@ -1375,10 +1399,10 @@ def _short_labels(components, axes):
     return labels, groups
 
 
-def plot_correlation(source, frame="RTN", center="EARTH", origin="SUN", annotate=None, title=None, size=None):
+def plot_correlation(source, frame="LOS", center="SUN", origin="SUN", annotate=None, title=None, size=None):
     """Correlation matrix of a saved solution at its epoch.
 
-    Position and velocity are in the RTN axes about ``center``. Only the lower triangle is drawn;
+    Position and velocity are in ``frame`` (as in :func:`state_errors`). Only the lower triangle is drawn;
     cells are annotated when the matrix is small enough to read. Correlations near ±1 mark
     quantities the data cannot separate: they constrain a combination of them, and the a priori
     decides how it is shared. With considered parameters, the consider covariance is used.
@@ -1437,7 +1461,7 @@ def plot_correlation(source, frame="RTN", center="EARTH", origin="SUN", annotate
         bar.outline.set_visible(False)
         consider = source["final"]["epoch_solution"].get("covariance_consider") is not None
         what = "consider covariance" if consider else "covariance"
-        frame_text = f"position and velocity in RTN about {center.title()}" if frame == "RTN" else "J2000"
+        frame_text = "position and velocity: " + _frame_axes(frame, center)[2]
         ax.set_title(title or f"Correlations of the solution ({what})\n{frame_text}", loc="left", fontsize=10.5,
                      color="#222222")
     return fig
@@ -1661,7 +1685,7 @@ def plot_tracking_timeline(stations, target, epochs, observations=None, elevatio
         ax = fig.add_subplot(grid[-1, 0])
 
         if geometry:
-            # 🔵 TODO: one query per epoch until get_state accepts an EpochArray (PLAN.md, API change 2)
+            # one query per epoch: get_state takes one epoch per call (EpochArray support is planned)
             sc = np.array([target.get_state(epochs[k], reference_frame="J2000", origin="EARTH").quantity.values[:3]
                            for k in range(t.size)], dtype=float)
             sun = np.array([scb.CelestialBody.from_constants("SUN").get_state(epochs[k], reference_frame="J2000",
@@ -1742,8 +1766,8 @@ def plot_tracking_timeline(stations, target, epochs, observations=None, elevatio
 def epochs_from_tracking_files(paths, blocks=(("2W_doppler", "Doppler"), ("2W_sranging", "ranging"))):
     """``{"DSS-nn <type>": TDB seconds}`` from converted tracking files (the JSON layout of chapter 9).
 
-    🔵 TODO: library gap: reading the epochs of a tracking file needs a measurement model today
-    (``observed_measurements``), which needs its auxiliary data. A file-level reader would do.
+    Reading the epochs of a tracking file through the library needs a measurement model
+    (``observed_measurements``), which needs its auxiliary data; this reads the file directly.
     """
     import scarabaeus as scb
 
@@ -1770,7 +1794,7 @@ def epochs_from_tracking_files(paths, blocks=(("2W_doppler", "Doppler"), ("2W_sr
 def _huber_mad_trend(editor, name, mad_scale):
     """Per-pass Huber trend and robust scale of one dataset, as ``MeasurementEditing`` computes them.
 
-    🔵 TODO: mirrors ``MeasurementEditing._huber_mad_evaluate``, which returns only the flags and the
+    Mirrors ``MeasurementEditing._huber_mad_evaluate``, which returns only the flags and the
     refit σ. Once it also returns the trend and the scale (PLAN.md), call it instead.
     """
     from scarabaeus import MeasurementEditing
@@ -1969,8 +1993,8 @@ def _display(component, label):
     return False, 1.0, unit
 
 
-def plot_prior_posterior(source, variables=None, truth=None, truth_values=None, view="posterior", frame="RTN",
-                         center="EARTH", origin="SUN", title=None, size=None):
+def plot_prior_posterior(source, variables=None, truth=None, truth_values=None, view="posterior", frame="LOS",
+                         center="SUN", origin="SUN", title=None, size=None):
     """Corner plot of the a priori and the posterior of a saved solution (Gaussian, no samples).
 
     Each pair of variables shows the a-priori 1σ and 3σ ellipses (gray, dashed for 3σ), the
@@ -1984,7 +2008,7 @@ def plot_prior_posterior(source, variables=None, truth=None, truth_values=None, 
     source : str, Path or dict
         A saved solution (Scarabaeus 2.0 JSON).
     variables : list of str, optional
-        Short labels to include (``"pos R"``, ``"vel T"``, ``"eta_srp"``, ...). Default: the
+        Short labels to include (``"pos LOS"``, ``"vel PoS 1"``, ``"eta_srp"``, ...; with ``frame="RTN"``, ``"pos R"``, ``"vel T"``). Default: the
         position axes and every parameter, at most 6.
     truth, truth_values
         As in :func:`plot_parameter_learning`.
@@ -2086,8 +2110,8 @@ def plot_prior_posterior(source, variables=None, truth=None, truth_values=None, 
         if np.any(np.isfinite(true_m)):
             handles.append(Line2D([], [], ls="", marker="*", ms=9, color=truth_color, label="truth"))
         fig.legend(handles=handles, loc="upper right", bbox_to_anchor=(0.97, 1.0 - 0.95 / side), fontsize=8)
-        frame_text = ("position, velocity in RTN about Earth (R = line of sight), relative to the "
-                      + ("estimate" if view == "posterior" else "a priori")) if frame == "RTN" else "J2000"
+        frame_text = ("position, velocity: " + _frame_axes(frame, center)[2] + ", relative to the "
+                      + ("estimate" if view == "posterior" else "a priori"))
         fig.suptitle(title or f"A priori and posterior  ·  {view} view", x=0.12, ha="left",
                      y=1.0 - 0.12 / side, fontsize=11)
         fig.text(0.12, 1.0 - 0.42 / side, frame_text, fontsize=8, color="#555555")
