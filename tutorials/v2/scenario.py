@@ -8,6 +8,9 @@ the a-priori state below need the leap-seconds kernel and the flight ephemeris. 
 loads the products of earlier chapters (truth SPK, tracking files) explicitly in its setup cell.
 """
 
+import shutil
+from pathlib import Path
+
 import scarabaeus as scb
 
 KERNELS = "orex_approach.tm"
@@ -40,7 +43,7 @@ x0_flight = orex_flight.get_state(epochs[0], reference_frame="J2000", origin="SU
 mass = scb.ArrayWUnits(1500.0, kg)
 area = scb.ArrayWUnits(11.0, m**2).convert_to(km**2)
 cr = scb.ArrayWUnits(1.2, None)
-planets = ["MERCURY", "VENUS", "EARTH", "MARS", "JUPITER", "SATURN"]
+planets = ["MERCURY", "VENUS", "EARTH", "MARS BARYCENTER", "JUPITER BARYCENTER", "SATURN BARYCENTER"]
 
 orex = scb.Spacecraft("OREx truth", -64000, mass, area, cr)  # propagated from x0_flight (ch. 2)
 
@@ -82,3 +85,12 @@ def reference_propagator(spacecraft=reference, state=apriori_state, cannonball_S
         force_models=scb.ForceModelTranslation(spacecraft, third_bodies=planets, cannonball_SRP=cannonball_SRP),
         display_progress=False,
     )
+
+
+# --- Chapter outputs ----------------------------------------------------------------------------
+def output_folder(chapter):
+    """Return ``outputs/<chapter>/``, emptied: each run of a chapter starts from a clean folder."""
+    folder = Path("outputs") / chapter
+    shutil.rmtree(folder, ignore_errors=True)
+    folder.mkdir(parents=True)
+    return folder

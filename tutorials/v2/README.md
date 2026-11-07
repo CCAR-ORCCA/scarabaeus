@@ -22,11 +22,13 @@ One scenario, start to finish: OSIRIS-REx on approach to Bennu, June 1–8, 2018
 ## Running
 
 0. The notebooks target **Scarabaeus 2.0** (on `main` since #10); they no longer run on 1.x. On recent macOS, build the Rust extension with `CARGO_PROFILE_RELEASE_STRIP=none` (see PLAN.md).
-1. Download the tutorial data once (the existing loader in `tutorials/supplementary` fetches the kernels):
+1. Download the SPICE kernels once, from this folder (`tutorials/v2/`):
    ```bash
-   cd tutorials && python -c "import supplementary as s; s.load_data()"
+   python get_data.py               # chapters 0–8: five kernels, about 41 MB
+   python get_data.py --real-data   # chapter 9 as well: about 1.7 GB more
    ```
-2. Run the notebooks **from this folder** (`tutorials/v2/`): the metakernel `orex_approach.tm` and `scenario.py` use paths relative to it.
+   The tracking and media-correction files for chapter 9 are in the repository. (`load_data()` in `tutorials/supplementary` fetches the data of every tutorial, 2.8 GB; the series does not need it.)
+2. Run the notebooks **from this folder** (`tutorials/v2/`): the metakernels `orex_approach.tm` (chapters 0–8) and `real_data.tm` (chapter 9) and `scenario.py` use paths relative to it.
 
 The objects chapters 1–5 build on the page (epochs, spacecraft, stations, measurement models, a-priori state and covariance) are collected in `scenario.py`. From chapter 2 on, setup cells import from it what earlier chapters built (chapters 2–5 still build their own new objects on the page; chapters 6–9 import everything they reuse). Keep the module in sync with the chapter code.
 
