@@ -1,6 +1,6 @@
-# Scarabaeus tutorials (v2 draft)
+# Scarabaeus tutorials (v2)
 
-> **Draft.** New tutorial series that will replace the notebooks in `tutorials/`. See [PLAN.md](PLAN.md) for the full structure, design rules and open questions.
+> New tutorial series that will replace the notebooks in `tutorials/`. Chapters 0–8 are ready; chapter 9 is a preview. See [PLAN.md](PLAN.md) for the full structure, design rules and open questions.
 
 ## Navigating OSIRIS-REx
 
@@ -8,16 +8,16 @@ One scenario, start to finish: OSIRIS-REx on approach to Bennu, June 1–8, 2018
 
 | # | Notebook | Status |
 |---|---|---|
-| 0 | [Quickstart](00_quickstart.ipynb) | draft |
-| 1 | [The scenario](01_scenario.ipynb) | draft |
-| 2 | [Truth: dynamics & propagation](02_truth_dynamics.ipynb) | draft |
-| 3 | [Tracking data I: simulating measurements](03_tracking_data.ipynb) | draft |
-| 4 | [The filter's dynamics model](04_filter_dynamics.ipynb) | draft |
-| 5 | [The filter's measurement model](05_filter_measurements.ipynb) | draft |
-| 6 | [First OD solution](06_first_od_solution.ipynb) | draft |
-| 7 | [Sequential filtering & process noise](07_sequential_filtering.ipynb) | draft |
-| 8 | [Estimating parameters: SRP scale factor & consider covariance](08_estimating_more.ipynb) | draft |
-| 9 | [Tracking data II: real DSN data](09_real_dsn_data.ipynb) | draft (ranging offset estimated, not explained; see chapter) |
+| 0 | [Quickstart](00_quickstart.ipynb) | ready |
+| 1 | [The scenario](01_scenario.ipynb) | ready |
+| 2 | [Truth: dynamics & propagation](02_truth_dynamics.ipynb) | ready |
+| 3 | [Tracking data I: simulating measurements](03_tracking_data.ipynb) | ready |
+| 4 | [The filter's dynamics model](04_filter_dynamics.ipynb) | ready |
+| 5 | [The filter's measurement model](05_filter_measurements.ipynb) | ready |
+| 6 | [First OD solution](06_first_od_solution.ipynb) | ready |
+| 7 | [Sequential filtering & process noise](07_sequential_filtering.ipynb) | ready |
+| 8 | [Estimating parameters: SRP scale factor & consider covariance](08_estimating_more.ipynb) | ready |
+| 9 | [Tracking data II: real DSN data](09_real_dsn_data.ipynb) | preview (ranging offset estimated, not explained; see chapter) |
 
 ## Running
 

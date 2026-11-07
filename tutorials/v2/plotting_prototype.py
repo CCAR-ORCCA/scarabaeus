@@ -42,12 +42,21 @@ plot_prior_posterior(source, ...)
 plot_monte_carlo(errors, covariances, ...)
     Corner plot of the errors of many fits (Monte Carlo over noise and a-priori draws) against the
     filter's covariance, with the NEES test of covariance realism and a bias test per axis.
+bplane_mapping(bplane, state, covariance, samples=0)
+    B-plane coordinates of a state and their covariance, mapped with the full Jacobian (position
+    and velocity), optionally with Monte Carlo samples mapped through the conic.
+plot_bplane(mappings, target=None, ...)
+    Overview of the flyby (body, impact radius, B-vectors), the aimpoint dispersion ellipses of
+    several solutions relative to the target, and the time of flight.
+interactive_legend(fig, on_toggle=None)
+    Click a legend entry to hide or show what it labels on every panel (interactive backends).
 plot_consistency(errors, ...)
     Is the error consistent with the covariance? Position and velocity errors inside ±3σ,
     normalized errors e/σ, and the Mahalanobis χ² against its bounds, with the tracking periods
     and the data cutoff marked.
 """
 
+import contextlib
 import json
 import re
 from pathlib import Path
@@ -85,6 +94,115 @@ STYLE = {
     "legend.frameon": False,
     "legend.fontsize": 8,
 }
+
+@contextlib.contextmanager
+def _styled():
+    """Apply STYLE for one figure and restore only those keys afterwards.
+
+    ``plt.rc_context`` restores every rcParam on exit, including ``interactive``, which the inline
+    backend turns on when the first figure of a session is created: inside an ``rc_context`` it is
+    switched off again on exit, and later figures are no longer displayed.
+    """
+    previous = {key: plt.rcParams[key] for key in STYLE}
+    plt.rcParams.update(STYLE)
+    try:
+        yield
+    finally:
+        plt.rcParams.update(previous)
+
+
+def _tag(artist, *keys):
+    """Register an artist under legend keys: it is shown only while none of its keys is toggled off."""
+    keys = set(getattr(artist, "_legend_keys", set())) | set(keys)
+    artist._legend_keys = keys
+    return artist
+
+
+def interactive_legend(fig, on_toggle=None):
+    """Click a legend entry to hide or show what it labels, on every panel, without replotting.
+
+    Works with every interactive backend. In a notebook, ``%matplotlib macosx`` (``qt`` on Linux and
+    Windows) opens the figure in its own window, in any editor; ``%matplotlib widget`` (ipympl) draws
+    it in the notebook in JupyterLab, but VS Code's Jupyter extension fails to load that widget and
+    shows nothing. Scripts use the Qt or macOS windows by default. With the inline backend the
+    figure is a static image and clicks do nothing (the figure is otherwise unchanged).
+
+    An entry controls the artists tagged with its label (the prototypes tag theirs); in any other
+    figure, it controls the artists whose ``label`` matches, so this also works on figures made
+    elsewhere (``interactive_legend(plt.gcf())``). Hidden entries are drawn faded.
+
+    Parameters
+    ----------
+    fig : matplotlib.figure.Figure
+    on_toggle : callable, optional
+        Called with the set of hidden labels after each click, before the redraw (e.g. to
+        recompute statistics or rescale axes from what is still visible).
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+        The same figure.
+    """
+    legends = list(fig.legends) + [ax.get_legend() for ax in fig.axes if ax.get_legend() is not None]
+    entries = {}  # legend artist -> label
+    faded = {}  # label -> [(handle, text)]
+    for legend in legends:
+        handles = getattr(legend, "legend_handles", None) or legend.legendHandles
+        for handle, text in zip(handles, legend.get_texts()):
+            label = text.get_text()
+            for artist in (handle, text):
+                artist.set_picker(True)
+                if hasattr(artist, "set_pickradius"):
+                    artist.set_pickradius(6)
+                entries[artist] = label
+            faded.setdefault(label, []).append((handle, text))
+    if not entries:
+        return fig
+    legend_artists = set(entries)
+
+    def members(label):
+        found = []
+        for ax in fig.axes:
+            for artist in ax.get_children():
+                if artist in legend_artists:
+                    continue
+                keys = getattr(artist, "_legend_keys", None)
+                if keys is not None:
+                    if label in keys:
+                        found.append(artist)
+                elif getattr(artist, "get_label", lambda: None)() == label:
+                    found.append(artist)
+        return found
+
+    hidden = set()
+    fig._legend_hidden = hidden
+
+    def on_pick(event):
+        label = entries.get(event.artist)
+        if label is None:
+            return
+        hidden.symmetric_difference_update({label})
+        for ax in fig.axes:
+            for artist in ax.get_children():
+                keys = getattr(artist, "_legend_keys", None)
+                if keys is not None:
+                    artist.set_visible(not (keys & hidden))
+        for artist in members(label):
+            if getattr(artist, "_legend_keys", None) is None:
+                artist.set_visible(label not in hidden)
+        for handle, text in faded[label]:
+            handle.set_alpha(0.25 if label in hidden else 1.0)
+            text.set_alpha(0.35 if label in hidden else 1.0)
+        if on_toggle is not None:
+            on_toggle(set(hidden))
+        fig.canvas.draw_idle()
+
+    previous = getattr(fig, "_legend_pick_cid", None)
+    if previous is not None:
+        fig.canvas.mpl_disconnect(previous)
+    fig._legend_pick_cid = fig.canvas.mpl_connect("pick_event", on_pick)
+    return fig
+
 
 # Measurement type -> (factor from the filter's units, display unit). Saved solutions do not
 # record measurement units, so they are inferred from the type.
@@ -256,6 +374,11 @@ def plot_residuals(
     title : str, optional
         Figure title. Default: the kind, iteration, number of observations and χ²/n.
 
+    Click a station in the legend to hide or show it on every row; the row statistics, the
+    histograms and the default title are recomputed from the stations still shown. The "beyond 3σ"
+    and "running median" entries toggle those layers. Needs an interactive backend
+    (``%matplotlib macosx`` or ``qt``); see :func:`interactive_legend`.
+
     Returns
     -------
     matplotlib.figure.Figure
@@ -273,12 +396,12 @@ def plot_residuals(
     shade = "#4d4d4d"
     any_outliers = False
 
-    with plt.rc_context(STYLE):
+    with _styled():
         height = 0.9 + row_height * len(rows)
         fig = plt.figure(figsize=(width, height))
         grid = fig.add_gridspec(len(rows), 2 if histogram else 1, width_ratios=[6, 1] if histogram else [1],
                                 wspace=0.02, hspace=0.6, top=1.0 - 0.95 / height)
-        axes, z_everything = [], []
+        axes, row_state = [], []
         for i, row in enumerate(rows):
             ax = fig.add_subplot(grid[i, 0], sharex=axes[0][0] if axes else None)
             hx = fig.add_subplot(grid[i, 1], sharey=ax) if histogram else None
@@ -288,7 +411,6 @@ def plot_residuals(
 
             z_row = np.concatenate([data[n][1] / data[n][2] for n in members])
             sigma_row = np.concatenate([data[n][2] * factor for n in members])
-            z_everything.append(z_row)
             rms_z = float(np.sqrt(np.mean(z_row**2)))
             noise_like = rms_z < 5.0  # residuals at the noise level: draw bands and outliers
             values = {n: ((data[n][0] - t0) / t_scale,
@@ -311,47 +433,35 @@ def plot_residuals(
                 x, y = values[n]
                 c = color[labels[n][1]]
                 inside = (y >= y_range[0]) & (y <= y_range[1])
-                ax.plot(x[inside], y[inside], "o", ms=2.6, mew=0, color=c, alpha=0.8 if not trend else 0.45, zorder=3)
+                who = labels[n][1]
+                _tag(ax.plot(x[inside], y[inside], "o", ms=2.6, mew=0, color=c, alpha=0.8 if not trend else 0.45,
+                             zorder=3)[0], who)
                 if noise_like:
                     outlier = inside & (np.abs(data[n][1] / data[n][2]) > 3)
                     any_outliers |= bool(outlier.any())
-                    ax.plot(x[outlier], y[outlier], "o", ms=6, mfc="none", mec="#D55E00", mew=0.9, zorder=4)
+                    _tag(ax.plot(x[outlier], y[outlier], "o", ms=6, mfc="none", mec="#D55E00", mew=0.9, zorder=4)[0],
+                         who, "beyond 3σ")
                     for edge, marker in [(y_range[1], "^"), (y_range[0], "v")]:
                         clip = (y > edge) if marker == "^" else (y < edge)
-                        ax.plot(x[clip], np.full(clip.sum(), 0.97 * edge), marker, ms=5, color=c, zorder=4)
+                        _tag(ax.plot(x[clip], np.full(clip.sum(), 0.97 * edge), marker, ms=5, color=c, zorder=4)[0],
+                             who)
                 if trend:
                     window = max(5, x.size // 15)
-                    ax.plot(*_running_median(x, y, window), color=c, lw=1.6, zorder=5)
+                    _tag(ax.plot(*_running_median(x, y, window), color=c, lw=1.6, zorder=5)[0], who, "running median")
             ax.set_ylim(*y_range)
             ax.set_ylabel(f"[{'σ' if normalized else unit}]" if (normalized or unit) else "")
             ax.margins(x=0.01)
             if i < len(rows) - 1:
                 plt.setp(ax.get_xticklabels(), visible=False)
 
-            # Row header: name on the left, statistics of the normalized residuals on the right
-            chi2 = float(np.mean(z_row**2))
-            stats = [f"n {z_row.size}", f"mean {'+' if np.mean(z_row) >= 0 else ''}{_fmt(float(np.mean(z_row)))}σ", f"RMS {_fmt(rms_z)}σ"]
-            if not normalized and unit:
-                stats.insert(1, f"RMS {np.sqrt(np.mean(y_all**2)):.3g} {unit}")
-            stats.append(f"χ²/n {_fmt(chi2)}" + (f" (white noise: 1 ± {np.sqrt(2 / z_row.size):.2f})"
-                                                  if noise_like else ""))
-            if noise_like:  # whiteness: χ²/n can be 1 while the residuals carry a signature
-                rho, pairs = _lag1([(data[n][0], data[n][1] / data[n][2]) for n in members])
-                if pairs >= 10:
-                    stats.append(f"lag-1 corr {rho:+.2f} (white: 0 ± {1 / np.sqrt(pairs):.2f})")
-            beyond = int(np.sum(np.abs(z_row) > 3))
-            if noise_like and beyond:
-                stats.append(f"{beyond} beyond 3σ")
             ax.set_title(row, loc="left", fontsize=10, color="#222222", pad=15)
-            ax.text(0, 1.02, "  ·  ".join(stats), transform=ax.transAxes, ha="left", va="bottom",
-                    fontsize=8, color="#555555")
+            header = ax.text(0, 1.02, "", transform=ax.transAxes, ha="left", va="bottom", fontsize=8, color="#555555")
+            row_state.append(dict(members=members, ax=ax, hx=hx, header=header, y_range=y_range, band=band,
+                                  noise_like=noise_like, unit=unit, values=values, bars=[]))
 
             if histogram and not noise_like:  # the distribution of a signal says nothing
                 hx.set_visible(False)
             elif histogram:
-                bins = np.linspace(*y_range, 41)
-                hx.hist(y_all, bins=bins, orientation="horizontal", density=True, color="#9a9a9a",
-                        alpha=0.6, lw=0)
                 if noise_like:
                     grid_y = np.linspace(*y_range, 300)
                     pdf = np.exp(-0.5 * (grid_y / band) ** 2) / (band * np.sqrt(2 * np.pi))
@@ -364,6 +474,50 @@ def plot_residuals(
                 hx.grid(False)
                 hx.spines["bottom"].set_visible(False)
 
+        def refresh(hidden):
+            """Row statistics, histograms and the title from the datasets still shown."""
+            shown_z = []
+            for r in row_state:
+                shown = [n for n in r["members"] if labels[n][1] not in hidden]
+                if r["bars"]:
+                    for bar in r["bars"]:
+                        bar.remove()
+                    r["bars"] = []
+                if not shown:
+                    r["header"].set_text("all datasets hidden")
+                    continue
+                z_row = np.concatenate([data[n][1] / data[n][2] for n in shown])
+                y_all = np.concatenate([r["values"][n][1] for n in shown])
+                shown_z.append(z_row)
+                rms_z = float(np.sqrt(np.mean(z_row**2)))
+                chi2 = float(np.mean(z_row**2))
+                stats = [f"n {z_row.size}", f"mean {'+' if np.mean(z_row) >= 0 else ''}{_fmt(float(np.mean(z_row)))}σ",
+                         f"RMS {_fmt(rms_z)}σ"]
+                if not normalized and r["unit"]:
+                    stats.insert(1, f"RMS {np.sqrt(np.mean(y_all**2)):.3g} {r['unit']}")
+                stats.append(f"χ²/n {_fmt(chi2)}" + (f" (white noise: 1 ± {np.sqrt(2 / z_row.size):.2f})"
+                                                      if r["noise_like"] else ""))
+                if r["noise_like"]:  # whiteness: χ²/n can be 1 while the residuals carry a signature
+                    rho, pairs = _lag1([(data[n][0], data[n][1] / data[n][2]) for n in shown])
+                    if pairs >= 10:
+                        stats.append(f"lag-1 corr {rho:+.2f} (white: 0 ± {1 / np.sqrt(pairs):.2f})")
+                beyond = int(np.sum(np.abs(z_row) > 3))
+                if r["noise_like"] and beyond:
+                    stats.append(f"{beyond} beyond 3σ")
+                if hidden & {labels[n][1] for n in r["members"]}:
+                    stats.append("shown datasets only")
+                r["header"].set_text("  ·  ".join(stats))
+                if histogram and r["noise_like"]:
+                    bins = np.linspace(*r["y_range"], 41)
+                    r["bars"] = list(r["hx"].hist(y_all, bins=bins, orientation="horizontal", density=True,
+                                                  color="#9a9a9a", alpha=0.6, lw=0)[2])
+                    r["hx"].relim()
+                    r["hx"].autoscale_view(scalex=True, scaley=False)
+            if auto_title is not None:
+                z = np.concatenate(shown_z) if shown_z else np.zeros(0)
+                fig._suptitle.set_text(auto_title(z))
+
+
         axes[-1][0].set_xlabel(t_label)
         if histogram:
             axes[-1][1].set_xlabel("histogram\n(curve: white noise)", fontsize=8, color="#555555")
@@ -373,15 +527,20 @@ def plot_residuals(
             handles.append(Line2D([], [], ls="", marker="o", ms=6, mfc="none", mec="#D55E00", label="beyond 3σ"))
         if trend:
             handles.append(Line2D([], [], color="#555555", lw=1.6, label="running median"))
-        z_all = np.concatenate(z_everything)
+        auto_title = None
         if title is None:
             what = {"postfit": "Post-fit residuals", "prefit": "Pre-fit residuals"}[kind]
-            title = "  ·  ".join([what] + ([iteration_label] if iteration_label else [])
-                                 + [f"{z_all.size} observations", f"χ²/n = {_fmt(float(np.mean(z_all**2)))}"])
+
+            def auto_title(z):
+                return "  ·  ".join([what] + ([iteration_label] if iteration_label else [])
+                                    + [f"{z.size} observations"]
+                                    + ([f"χ²/n = {_fmt(float(np.mean(z**2)))}"] if z.size else []))
         top = 1.0 - 0.1 / fig.get_figheight()
-        fig.suptitle(title, x=0.125, ha="left", y=top, fontsize=11)
+        fig.suptitle(title or "", x=0.125, ha="left", y=top, fontsize=11)
+        refresh(set())
         fig.legend(handles=handles, loc="upper right", bbox_to_anchor=(0.9, top + 0.005), ncol=len(handles),
                    handletextpad=0.2, columnspacing=1.2)
+        interactive_legend(fig, on_toggle=refresh)
     return fig
 
 
@@ -525,7 +684,7 @@ def plot_consistency(errors, quantity="both", physical=True, style="line", time_
             ax.axvline(cutoff, color="#333333", lw=0.9, ls="--", zorder=1)
 
     n_q = len(quantities)
-    with plt.rc_context(STYLE):
+    with _styled():
         heights = ([1.0] * n_q if physical else []) + [1.0] * n_q + [1.15]
         height = 0.9 + 2.0 * sum(heights)
         fig = plt.figure(figsize=(width, height))
@@ -715,7 +874,7 @@ def plot_residual_summary(source, kind="postfit", iteration="final", datasets=No
             if z.size:
                 stats[p, kind_label] = (float(np.mean(z)), float(np.std(z, ddof=1)) if z.size > 1 else np.nan, z.size)
 
-    with plt.rc_context(STYLE):
+    with _styled():
         n_rows = len(passes)
         height = 1.6 + row_height * n_rows
         fig = plt.figure(figsize=(width, height))
@@ -943,7 +1102,7 @@ def plot_parameter_learning(source, truth=None, truth_values=None, frame="RTN", 
     post_band = np.array([r["post_sigma"] / r["prior_sigma"] for r in rows])
     true_move = np.array([(r["truth"] - r["prior"]) / r["prior_sigma"] for r in rows])
 
-    with plt.rc_context(STYLE):
+    with _styled():
         height = 1.5 + row_height * n
         fig = plt.figure(figsize=(width, height))
         grid = fig.add_gridspec(1, 3, width_ratios=[1.0, 1.2, 1.35], wspace=0.05,
@@ -1108,7 +1267,7 @@ def plot_covariance_shape(at_epoch, index=0, title=None, width=11.0):
                    for lab in labels)
     f_sky, u_sky = _scale_unit(peak_sky, "position")
 
-    with plt.rc_context(STYLE):
+    with _styled():
         height = 5.0
         fig = plt.figure(figsize=(width, height))
         grid = fig.add_gridspec(2, 2, width_ratios=[1.0, 1.15], wspace=0.35, hspace=0.75,
@@ -1248,7 +1407,7 @@ def plot_correlation(source, frame="RTN", center="EARTH", origin="SUN", annotate
     shown = np.where(mask, np.nan, rho)
     annotate = n <= 16 if annotate is None else annotate
 
-    with plt.rc_context(STYLE):
+    with _styled():
         side = size or min(9.0, 2.2 + 0.42 * n)
         fig, ax = plt.subplots(figsize=(side + 1.0, side))
         image = ax.imshow(shown, cmap="RdBu_r", vmin=-1, vmax=1, interpolation="nearest")
@@ -1345,7 +1504,7 @@ def plot_convergence(source, by_dataset=True, title=None, width=11.0):
     converged = summary.get("converged", bool(records and records[-1].get("converged")))
     ok, bad, shade = "#009E73", "#D55E00", "#4d4d4d"
 
-    with plt.rc_context(STYLE):
+    with _styled():
         height = 0.9 + 2.6 + (2.1 if by_dataset else 0.0)
         fig = plt.figure(figsize=(width, height))
         outer = fig.add_gridspec(2 if by_dataset else 1, 1, hspace=0.65, top=1.0 - 0.95 / height,
@@ -1492,7 +1651,7 @@ def plot_tracking_timeline(stations, target, epochs, observations=None, elevatio
         mine = {n: v for n, v in observations.items() if classify(n)[1] == name.upper()}
         rows.append((name, elevation, mine))
 
-    with plt.rc_context(STYLE):
+    with _styled():
         row_h = 0.62
         height = 1.3 + (1.3 if geometry else 0.0) + row_h * len(rows)
         fig = plt.figure(figsize=(width, height))
@@ -1558,10 +1717,12 @@ def plot_tracking_timeline(stations, target, epochs, observations=None, elevatio
         ax.spines["left"].set_visible(False)
         ax.set_xlabel(t_label)
         ax.set_xlim(x.min(), x.max())
-        ax.set_title("Visibility and tracking", loc="left", fontsize=10, color="#222222", pad=15)
-        ax.text(0, 1.02, f"band: above the {elevation_mask:g}° mask, shaded by elevation  ·  gray line: above the horizon"
-                         "  ·  ticks: range (black, top), range-rate / Doppler (orange, bottom)",
-                transform=ax.transAxes, fontsize=8, color="#555555", va="bottom")
+        legend_text = f"band: above the {elevation_mask:g}° mask, shaded by elevation  ·  gray line: above the horizon"
+        if observations:
+            legend_text += "  ·  ticks: range (black, top), range-rate / Doppler (orange, bottom)"
+        ax.set_title("Visibility and tracking" if observations else "Visibility", loc="left", fontsize=10,
+                     color="#222222", pad=15)
+        ax.text(0, 1.02, legend_text, transform=ax.transAxes, fontsize=8, color="#555555", va="bottom")
 
         # Elevation color scale
         cax = fig.add_subplot(grid[-1, 1])
@@ -1691,7 +1852,7 @@ def plot_editing(editor, n_sigma=5.0, mad_scale=1.4826, dataset_names=None, unit
     t0, t_scale, t_label = _time_axis(np.concatenate([r[1] for r in rows]), "auto")
     shade, kept_color, flag_color, old_color = "#4d4d4d", "#0072B2", "#D55E00", "#9a9a9a"
 
-    with plt.rc_context(STYLE):
+    with _styled():
         height = 1.0 + 2.7 * len(rows)
         fig = plt.figure(figsize=(width, height))
         grid = fig.add_gridspec(len(rows), 2, width_ratios=[5, 1.2], wspace=0.08, hspace=0.75,
@@ -1877,7 +2038,7 @@ def plot_prior_posterior(source, variables=None, truth=None, truth_values=None, 
         lims = [(prior_m[a] - 3.5 * prior_s[a], prior_m[a] + 3.5 * prior_s[a]) for a in range(n)]
     post_color, prior_color, truth_color = "#0072B2", "#9a9a9a", "#D55E00"
 
-    with plt.rc_context(STYLE):
+    with _styled():
         side = size or min(10.0, 1.9 * n + 1.2)
         fig = plt.figure(figsize=(side, side))
         axes = _corner_axes(fig, n, top=1.0 - 0.9 / side, bottom=0.6 / side + 0.05, left=0.12)
@@ -1994,7 +2155,7 @@ def plot_monte_carlo(errors, covariances, labels=None, title=None, size=None):
     lims = [(min(-3.6 * s[a], E[:, a].min()) * 1.05, max(3.6 * s[a], E[:, a].max()) * 1.05) for a in range(d)]
     point_color, cov_color, flag = "#0072B2", "#222222", "#D55E00"
 
-    with plt.rc_context(STYLE):
+    with _styled():
         side = size or min(10.5, 1.6 * d + 1.6)
         fig = plt.figure(figsize=(side, side))
         axes = _corner_axes(fig, d, top=1.0 - 1.15 / side, bottom=0.6 / side + 0.05, left=0.12)
@@ -2044,4 +2205,254 @@ def plot_monte_carlo(errors, covariances, labels=None, title=None, size=None):
                    Line2D([], [], color=cov_color, lw=1.0, label="filter 1σ (3σ dashed)"),
                    Line2D([], [], ls="", marker="X", ms=7, color=point_color, label="sample mean")]
         fig.legend(handles=handles, loc="upper right", bbox_to_anchor=(0.97, 1.0 - 1.2 / side), fontsize=8)
+    return fig
+
+
+# ------------------------------------------------------------------------------------------------
+# B-plane
+# ------------------------------------------------------------------------------------------------
+
+_KM6 = None  # [km, km, km, km/s, km/s, km/s], built on first use (needs scarabaeus)
+
+
+def _state_units():
+    global _KM6
+    if _KM6 is None:
+        import scarabaeus as scb
+
+        km, sec = scb.Units.get_units(["km", "sec"])
+        _KM6 = [km, km, km, km / sec, km / sec, km / sec]
+    return _KM6
+
+
+def _bplane_of(bplane, state):
+    """[B·T, B·R, LTOF] of one (6,) state in km, km/s, one at a time.
+
+    ``compute_hyperbolic_parameters`` accepts (N, 6) arrays, but ``ArrayWUnits.convert_to``
+    truncates an (N, 6) array to (6, 6) once N >= 6, so batches are evaluated row by row.
+    """
+    import scarabaeus as scb
+
+    return np.asarray(bplane.compute_hyperbolic_parameters(scb.ArrayWUnits(np.asarray(state, float), _state_units()))
+                      .values, dtype=float)
+
+
+def bplane_mapping(bplane, state, covariance, samples=0, seed=0):
+    """Map a state and its covariance (relative to the flyby body, J2000, km and km/s) to the B-plane.
+
+    The covariance is mapped with the Jacobian of ``Bplane.compute_hyperbolic_parameters`` with
+    respect to the full state, by central differences. ``Bplane.target_covariance`` uses only the
+    rotated position covariance, which drops the velocity uncertainty (the dominant term far from
+    the body) and the B–LTOF correlation.
+
+    Parameters
+    ----------
+    bplane : scarabaeus.Bplane
+    state : array (6,)
+        Relative state of the spacecraft (sc − body), J2000, [km, km/s].
+    covariance : array (6, 6)
+        Its covariance (an ``ArrayWUnits`` or a plain array in km and km/s).
+    samples : int
+        Number of Gaussian draws to map nonlinearly (each through the full conic), to check the
+        linear ellipse. 0 skips them.
+
+    Returns
+    -------
+    dict
+        ``b`` (3,) [B·T km, B·R km, LTOF s], ``P`` (3, 3) its covariance, ``samples`` (n, 3) or None,
+        ``vinf`` [km/s], ``mu`` [km³/s²].
+    """
+    import scarabaeus as scb
+
+    x0 = np.asarray(getattr(state, "values", state), dtype=float)
+    P = np.asarray(getattr(covariance, "values", covariance), dtype=float)
+    b0 = _bplane_of(bplane, x0)
+    J = np.zeros((3, 6))
+    for i in range(6):
+        h = 1e-8 * max(np.linalg.norm(x0[:3] if i < 3 else x0[3:]), 1e-3)
+        plus, minus = x0.copy(), x0.copy()
+        plus[i] += h
+        minus[i] -= h
+        J[:, i] = (_bplane_of(bplane, plus) - _bplane_of(bplane, minus)) / (2 * h)
+    name = bplane.target_name.upper().replace("BARYCENTER", "").strip(" _")
+    mu = float(getattr(scb.constants, name).GM.values)
+    vinf = float(np.sqrt(np.dot(x0[3:], x0[3:]) - 2 * mu / np.linalg.norm(x0[:3])))
+    drawn = None
+    if samples:
+        rng = np.random.default_rng(seed)
+        L = np.linalg.cholesky(P + 1e-30 * np.eye(6))
+        drawn = np.array([_bplane_of(bplane, x0 + L @ rng.standard_normal(6)) for _ in range(samples)])
+    return {"b": b0, "P": J @ P @ J.T, "samples": drawn, "vinf": vinf, "mu": mu, "body": name}
+
+
+def _ellipse_axes(P2):
+    """1σ semi-major, semi-minor axes and the orientation of the major axis from T toward R [deg]."""
+    values, vectors = np.linalg.eigh(P2)
+    major = vectors[:, 1]
+    theta = np.degrees(np.arctan2(major[1], major[0]))
+    theta = (theta + 90) % 180 - 90  # an axis, not a direction
+    return np.sqrt(max(values[1], 0)), np.sqrt(max(values[0], 0)), theta
+
+
+def plot_bplane(mappings, target=None, body_radius=None, sigma=3, title=None, width=11.0):
+    """B-plane of one or several solutions: aimpoint, error ellipses, and the time of flight.
+
+    Three panels:
+
+    - **overview:** the flyby body (and its impact radius, the B magnitude below which the
+      trajectory hits it, b = R √(1 + 2μ / (R v∞²))), the B-vector of each solution and the
+      target. Ellipses smaller than the panel collapse to their dot;
+    - **zoom:** B·T, B·R relative to the target (or the first solution), with the 1σ (filled) and
+      ``sigma`` (dashed) ellipses, the mapped Monte Carlo samples if any, and the target;
+    - **LTOF:** linearized time of flight to the B-plane relative to the same reference,
+      ±1σ and ±``sigma``.
+
+    Click a legend entry to hide or show that solution (interactive backends only; the zoom panel
+    refits to what is shown). The legend gives each ellipse's 1σ semi-major and semi-minor axes, the orientation θ of the
+    major axis (from T toward R) and σ(LTOF); with a target, also the miss in units of the 2-D
+    covariance (√χ², 1 ≈ the 1σ ellipse). R points down, the usual B-plane convention.
+
+    Parameters
+    ----------
+    mappings : dict
+        ``{label: bplane_mapping(...)}``, e.g. one per data cutoff.
+    target : sequence, optional
+        Target ``(B·T, B·R)`` or ``(B·T, B·R, LTOF)`` [km, km, s].
+    body_radius : float, optional
+        Radius of the flyby body [km]. Default: the mean radius from ``scarabaeus.constants``.
+    sigma : float
+        The outer ellipse and interval.
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+    """
+    labels = list(mappings)
+    colors = {lab: PALETTE[i % len(PALETTE)] for i, lab in enumerate(labels)}
+    markers = {lab: MARKERS[i % len(MARKERS)] for i, lab in enumerate(labels)}
+    tags = {}  # label -> its legend text, which the clickable legend matches
+    extents = {}
+    first = mappings[labels[0]]
+    if body_radius is None:
+        try:
+            import scarabaeus as scb
+
+            body_radius = float(getattr(scb.constants, first["body"]).mean_radius.values)
+        except Exception:
+            body_radius = None
+    ref = np.asarray(target if target is not None else first["b"], dtype=float)
+    ref_ltof = ref[2] if ref.size > 2 else first["b"][2]
+    ref_name = "target" if target is not None else labels[0]
+    for lab in labels:  # legend text: the ellipse in numbers
+        m = mappings[lab]
+        d, P2 = m["b"][:2] - ref[:2], m["P"][:2, :2]
+        smaa, smia, theta = _ellipse_axes(P2)
+        text = f"{lab}   SMAA {smaa:.3g}, SMIA {smia:.3g} km, θ {theta:+.0f}°, σ LTOF {np.sqrt(m['P'][2, 2]):.3g} s"
+        if target is not None:
+            text += f"   miss {np.hypot(*d):.3g} km = {np.sqrt(d @ np.linalg.solve(P2, d)):.2g}σ"
+        tags[lab] = text
+    shade = "#4d4d4d"
+
+    with _styled():
+        height = 5.4
+        fig = plt.figure(figsize=(width, height))
+        grid = fig.add_gridspec(1, 3, width_ratios=[1.0, 1.25, 0.6], wspace=0.32,
+                                top=1.0 - 0.95 / height, bottom=1.2 / height)
+        ax_all, ax_zoom, ax_t = (fig.add_subplot(grid[0, k]) for k in range(3))
+
+        # Overview: body, impact radius, B-vectors
+        if body_radius:
+            ax_all.add_patch(plt.Circle((0, 0), body_radius, color="#9ab7d3", lw=0, zorder=1))
+            b_impact = body_radius * np.sqrt(1 + 2 * first["mu"] / (body_radius * first["vinf"] ** 2))
+            ax_all.add_patch(plt.Circle((0, 0), b_impact, fill=False, ec=shade, ls=":", lw=0.9, zorder=1))
+            ax_all.text(0, -b_impact, "impact radius", ha="center", va="bottom", fontsize=7, color="#555555")
+        for lab in labels:
+            bt, br = mappings[lab]["b"][:2]
+            _tag(ax_all.plot([0, bt], [0, br], color=colors[lab], lw=0.8, alpha=0.6)[0], tags[lab])
+            _tag(ax_all.plot(bt, br, markers[lab], ms=5, color=colors[lab], mec="white", mew=0.6, zorder=4)[0], tags[lab])
+        if target is not None:
+            _tag(ax_all.plot(ref[0], ref[1], "+", ms=11, mew=1.6, color="#222222", zorder=5)[0], "target")
+        ax_all.plot(0, 0, ".", color=shade, ms=3)
+        reach = max([np.hypot(*mappings[lab]["b"][:2]) for lab in labels] + [np.hypot(*ref[:2])]
+                    + ([b_impact] if body_radius else []))
+        ax_all.set_xlim(-1.15 * reach, 1.15 * reach)
+        ax_all.set_ylim(1.15 * reach, -1.15 * reach)  # R down
+        ax_all.set_aspect("equal")
+        ax_all.set_xlabel("B·T [km]")
+        ax_all.set_ylabel("B·R [km]")
+        ax_all.set_title(f"B-plane, {first['body'].title()}-centered", loc="left", fontsize=10, color="#222222", pad=15)
+        ax_all.text(0, 1.02, f"v∞ {first['vinf']:.2f} km/s  ·  R down", transform=ax_all.transAxes,
+                    fontsize=8, color="#555555", va="bottom")
+
+        # Zoom on the aimpoint
+        handles = []
+        for lab in labels:
+            m, c = mappings[lab], colors[lab]
+            d = m["b"][:2] - ref[:2]
+            P2 = m["P"][:2, :2]
+            one, outer = _ellipse(P2, 1) + d, _ellipse(P2, sigma) + d
+            text = tags[lab]
+            extents[lab] = float(np.max(np.abs(np.r_[outer.ravel(), d])))
+            if m["samples"] is not None:
+                s = m["samples"][:, :2] - ref[:2]
+                _tag(ax_zoom.plot(s[:, 0], s[:, 1], "o", ms=1.6, mew=0, color=c, alpha=0.35, zorder=2)[0], text)
+            _tag(ax_zoom.fill(one[:, 0], one[:, 1], color=c, alpha=0.15, lw=0, zorder=2)[0], text)
+            _tag(ax_zoom.plot(one[:, 0], one[:, 1], color=c, lw=1.4, zorder=3)[0], text)
+            _tag(ax_zoom.plot(outer[:, 0], outer[:, 1], color=c, lw=1.0, ls="--", zorder=3)[0], text)
+            _tag(ax_zoom.plot(*d, markers[lab], ms=7, color=c, mec="white", mew=0.8, zorder=5)[0], text)
+            handles.append(Line2D([], [], color=c, lw=1.4, marker=markers[lab], ms=6, mec="white", label=text))
+        if target is not None:
+            _tag(ax_zoom.plot(0, 0, "+", ms=13, mew=1.8, color="#222222", zorder=6)[0], "target")
+            handles.append(Line2D([], [], ls="", marker="+", ms=10, mew=1.6, color="#222222", label="target"))
+        ax_zoom.axhline(0, color=shade, lw=0.6)
+        ax_zoom.axvline(0, color=shade, lw=0.6)
+
+        def rescale(hidden):
+            """Fit the zoom panel to the solutions still shown."""
+            shown = [extents[lab] for lab in labels if tags[lab] not in hidden] or list(extents.values())
+            extent = max(shown)
+            ax_zoom.set_xlim(-1.08 * extent, 1.08 * extent)
+            ax_zoom.set_ylim(1.08 * extent, -1.08 * extent)
+
+        rescale(set())
+        ax_zoom.set_aspect("equal")
+        ax_zoom.set_xlabel(f"Δ B·T from {ref_name} [km]")
+        ax_zoom.set_ylabel(f"Δ B·R from {ref_name} [km]")
+        ax_zoom.set_title("Aimpoint dispersion", loc="left", fontsize=10, color="#222222", pad=15)
+        note = f"1σ filled, {sigma:g}σ dashed" + (", dots: mapped samples" if any(
+            mappings[lab]["samples"] is not None for lab in labels) else "")
+        ax_zoom.text(0, 1.02, note, transform=ax_zoom.transAxes, fontsize=8, color="#555555", va="bottom")
+
+        # Linearized time of flight
+        x = np.arange(len(labels))
+        dt = np.array([mappings[lab]["b"][2] - ref_ltof for lab in labels])
+        sig_t = np.array([np.sqrt(mappings[lab]["P"][2, 2]) for lab in labels])
+        for k, lab in enumerate(labels):
+            c = colors[lab]
+            _tag(ax_t.plot([k, k], [dt[k] - sigma * sig_t[k], dt[k] + sigma * sig_t[k]], color=c, lw=5, alpha=0.18,
+                           solid_capstyle="butt")[0], tags[lab])
+            _tag(ax_t.plot([k, k], [dt[k] - sig_t[k], dt[k] + sig_t[k]], color=c, lw=5, alpha=0.45,
+                           solid_capstyle="butt")[0], tags[lab])
+            _tag(ax_t.plot(k, dt[k], markers[lab], ms=6.5, color=c, mec="white", mew=0.8, zorder=4)[0], tags[lab])
+            if mappings[lab]["samples"] is not None:
+                spread = np.std(mappings[lab]["samples"][:, 2], ddof=1)
+                for edge in (dt[k] + spread, dt[k] - spread):
+                    _tag(ax_t.plot([k - 0.28, k + 0.28], [edge] * 2, color=c, lw=0.9)[0], tags[lab])
+        ax_t.axhline(0, color=shade, lw=0.6)
+        ax_t.set_xticks(x)
+        ax_t.set_xticklabels([f"{i + 1}" for i in x])
+        ax_t.set_xlim(-0.6, len(labels) - 0.4)
+        ax_t.grid(axis="x", visible=False)
+        ax_t.set_xlabel("solution (legend order)")
+        ax_t.set_ylabel(f"Δ LTOF from {ref_name} [s]")
+        ax_t.set_title("Time of flight", loc="left", fontsize=10, color="#222222", pad=15)
+        ax_t.text(0, 1.02, f"±1σ dark, ±{sigma:g}σ light" + (", ticks: sample σ" if any(
+            mappings[lab]["samples"] is not None for lab in labels) else ""), transform=ax_t.transAxes,
+                  fontsize=8, color="#555555", va="bottom")
+
+        top = 1.0 - 0.1 / height
+        fig.suptitle(title or "B-plane targeting uncertainty", x=0.125, ha="left", y=top, fontsize=11)
+        fig.legend(handles=handles, loc="lower left", bbox_to_anchor=(0.12, 0.0), ncol=1, handletextpad=0.5,
+                   fontsize=8)
+        interactive_legend(fig, on_toggle=rescale)
     return fig
