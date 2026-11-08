@@ -1019,9 +1019,9 @@ def _solution_at_epoch(record, frame="LOS", center="SUN", origin="SUN", truth=No
             R = np.eye(prior_x.size)
             R[np.ix_(pv, pv)] = np.kron(np.eye(2), A)
             # Rotate deviations about the a priori, so the a-priori value maps to itself
+            unknown = np.isnan(true_x)  # elements without a truth stay without one
             prior_x, post_x, true_x = R @ prior_x, R @ post_x, R @ np.nan_to_num(true_x, nan=0.0)
-            if truth is None:
-                true_x[pv] = np.nan
+            true_x[unknown] = np.nan
             prior_P, post_P = R @ prior_P @ R.T, R @ post_P @ R.T
             axes = frame_axes
     for c in components:

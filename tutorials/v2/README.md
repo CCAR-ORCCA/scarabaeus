@@ -1,10 +1,10 @@
 # Scarabaeus tutorials (v2)
 
-> New tutorial series that will replace the notebooks in `tutorials/`. Chapters 0–8 are ready; chapter 9 is a preview. See [PLAN.md](PLAN.md) for the full structure, design rules and open questions.
+> New tutorial series that will replace the notebooks in `tutorials/`. Chapters 0–8 are ready; chapters 9–11, on real data, are a first draft. See [PLAN.md](PLAN.md) for the full structure, design rules and open questions.
 
 ## Navigating OSIRIS-REx
 
-One scenario, start to finish: OSIRIS-REx on approach to Bennu, June 1–8, 2018.
+One scenario, start to finish: OSIRIS-REx on approach to Bennu, June 1–8, 2018, simulated (chapters 0–8), then the real DSN passes of June 7–8 (chapters 9–11).
 
 | # | Notebook | Status |
 |---|---|---|
@@ -17,7 +17,9 @@ One scenario, start to finish: OSIRIS-REx on approach to Bennu, June 1–8, 2018
 | 6 | [First OD solution](06_first_od_solution.ipynb) | ready |
 | 7 | [Sequential filtering & process noise](07_sequential_filtering.ipynb) | ready |
 | 8 | [Estimating parameters: SRP scale factor & consider covariance](08_estimating_more.ipynb) | ready |
-| 9 | [Tracking data II: real DSN data](09_real_dsn_data.ipynb) | preview (ranging offset estimated, not explained; see chapter) |
+| 9 | [Real data I: from tracking files to residuals](09_real_dsn_data.ipynb) | first draft |
+| 10 | [Real data II: a multi-pass fit](10_real_data_fit.ipynb) | first draft |
+| 11 | [Real data III: is the solution any good?](11_real_data_prediction.ipynb) | first draft |
 
 ## Running
 
@@ -25,18 +27,18 @@ One scenario, start to finish: OSIRIS-REx on approach to Bennu, June 1–8, 2018
 1. Download the SPICE kernels once, from this folder (`tutorials/v2/`):
    ```bash
    python get_data.py               # chapters 0–8: five kernels, about 41 MB
-   python get_data.py --real-data   # chapter 9 as well: about 1.7 GB more
+   python get_data.py --real-data   # chapters 9–11 as well: about 1.7 GB more
    ```
-   The tracking and media-correction files for chapter 9 are in the repository. (`load_data()` in `tutorials/supplementary` fetches the data of every tutorial, 2.8 GB; the series does not need it.)
-2. Run the notebooks **from this folder** (`tutorials/v2/`): the metakernels `orex_approach.tm` (chapters 0–8) and `real_data.tm` (chapter 9) and `scenario.py` use paths relative to it.
+   Of the 1.7 GB, almost all is the Jupiter and Saturn satellite ephemerides, which the real measurement models currently need for the ET − TAI time transformation; from the next Scarabaeus release, which uses the barycenters instead, they will not be needed. The tracking and media-correction files for chapters 9–11 are in the repository. (`load_data()` in `tutorials/supplementary` fetches the data of every tutorial, 2.8 GB; the series does not need it.)
+2. Run the notebooks **from this folder** (`tutorials/v2/`): the metakernels `orex_approach.tm` (all chapters) and `real_data.tm` (chapters 9–11) and `scenario.py` use paths relative to it.
 
-The objects chapters 1–5 build on the page (epochs, spacecraft, stations, measurement models, a-priori state and covariance) are collected in `scenario.py`. From chapter 2 on, setup cells import from it what earlier chapters built (chapters 2–5 still build their own new objects on the page; chapters 6–9 import everything they reuse). Keep the module in sync with the chapter code.
+The objects chapters 1–5 build on the page (epochs, spacecraft, stations, measurement models, a-priori state and covariance) are collected in `scenario.py`, and so are the real-data pieces of chapters 9 and 10 (`real_tracking`, `save_editing` / `load_editing`, `real_data_fit`). From chapter 2 on, setup cells import from it what earlier chapters built (chapters 2–5 still build their own new objects on the page; chapters 6–9 import everything they reuse). Keep the module in sync with the chapter code.
 
 Each notebook writes its products to `outputs/<notebook>/` (git-ignored).
 
 ### Starting at a later chapter
 
-Chapters 3–8 read files produced by earlier chapters (chapter 2's truth trajectory, chapter 3's tracking data, chapter 6's batch solution). To start at a later chapter, generate those inputs first:
+Chapters 3–8, 10 and 11 read files produced by earlier chapters (chapter 2's truth trajectory, chapter 3's tracking data, chapter 6's batch solution, chapter 9's editing of the real passes). To start at a later chapter, generate those inputs first:
 
 ```bash
 python prepare.py 06            # runs chapters 2 and 3 headlessly (about 15 s)
@@ -49,10 +51,12 @@ The prerequisite notebooks are executed in memory and are not modified. If the i
 
 Library features the notebooks work around until they are added to Scarabaeus:
 
-- **`get_state` takes one epoch per call.** Accepting an `EpochArray` is the main missing feature; until then, state histories are built in a loop (chapters 1, 2, 4, 7, 8 and 9).
+- **`get_state` takes one epoch per call.** Accepting an `EpochArray` is the main missing feature; until then, state histories are built in a loop (chapters 1, 2, 4, 7 and 8).
 - **Progress output.** The filters and measurement models print progress that cannot be switched off yet, so the cells that run them start with `%%capture`.
 - **Plotting functions.** `plotting_prototype.py` holds the plots of this series; they are planned to move into `scb.Plotting`.
+- **Satellite ephemerides for real data.** The real measurement models evaluate ET − TAI with the Jupiter and Saturn centers, so chapters 9–11 load `jup310.bsp` and `sat360.bsp` (1.7 GB). The next release uses the barycenters, which `de424.bsp` covers; `real_data.tm` then shrinks to the stations' topocentric frames.
 - **Results of earlier fits.** Reading `state_est` of a solution after a later fit of the same spacecraft returns the later fit's values, so the chapters read each solution right after its fit.
+- **Real-data workflow.** No file format for an edited, weighted measurement set (chapter 9 saves flags and weights to JSON for chapter 10); no one-call prediction of a new pass (chapter 11 propagates the estimate to its own SPK and computes h P hᵀ from the model partials).
 
 ## Review notes
 

@@ -1,14 +1,14 @@
 """Download the SPICE kernels the "Navigating OSIRIS-REx" series needs.
 
 The series loads only the kernels listed in its metakernels: ``orex_approach.tm``
-(chapters 0-8, about 41 MB) and ``real_data.tm`` (chapter 9 adds about 1.7 GB).
+(all chapters, about 41 MB) and ``real_data.tm`` (chapters 9-11 add about 1.7 GB).
 This script downloads the ones that are missing, from the links registered in
 ``tutorials/supplementary`` (the loader of the earlier notebooks, whose
 ``load_data()`` fetches every tutorial's data, 2.8 GB).
 
 Usage (from tutorials/v2/):
     python get_data.py               # chapters 0-8
-    python get_data.py --real-data   # also chapter 9
+    python get_data.py --real-data   # also chapters 9-11
 """
 
 import argparse
@@ -30,7 +30,7 @@ def kernels(metakernel):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--real-data", action="store_true", help="also download the chapter 9 kernels (about 1.7 GB)")
+    parser.add_argument("--real-data", action="store_true", help="also download the kernels of chapters 9-11 (about 1.7 GB)")
     args = parser.parse_args()
 
     wanted = kernels("orex_approach.tm") + (kernels("real_data.tm") if args.real_data else [])

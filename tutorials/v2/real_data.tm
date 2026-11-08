@@ -1,6 +1,6 @@
 KPL/MK
 
-   Additional kernels for chapter 9 (real DSN data), loaded on top of
+   Additional kernels for chapters 9-11 (real DSN data), loaded on top of
    orex_approach.tm.
 
    - earth_topo_201023.tf: topocentric frames of the DSN stations, which
@@ -10,6 +10,10 @@ KPL/MK
      Saturn centers, which only the satellite ephemerides provide.
      They are large (about 1.7 GB together):
      `python get_data.py --real-data` downloads them.
+     The next Scarabaeus release evaluates ET - TAI with the Jupiter
+     and Saturn barycenters, which de424.bsp (orex_approach.tm) already
+     provides; these two kernels can then be dropped, and
+     earth_topo_201023.tf moved into orex_approach.tm.
 
 \begindata
 

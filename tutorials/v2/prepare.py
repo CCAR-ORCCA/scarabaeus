@@ -1,8 +1,9 @@
 """Generate the inputs a chapter needs from earlier chapters.
 
 Chapters hand data to each other through files in ``outputs/``: chapter 2 writes
-the truth trajectory, chapter 3 the simulated tracking data, and later chapters
-read them. To start at a later chapter without running the earlier notebooks by
+the truth trajectory, chapter 3 the simulated tracking data, chapter 6 the batch
+solution (the a priori of the real-data fit), chapter 9 the editing of the real
+passes, and later chapters read them. To start at a later chapter without running the earlier notebooks by
 hand, run this script first.
 
 Usage (from tutorials/v2/):
@@ -28,6 +29,7 @@ PRODUCTS = {
         for kind in ("range", "range-rate")
     ],
     "06_first_od_solution.ipynb": ["outputs/06_first_od_solution/solution.json"],
+    "09_real_dsn_data.ipynb": ["outputs/09_real_dsn_data/editing.json"],
 }
 
 # Chapter -> notebooks whose products it reads, in the order they must run.
@@ -38,6 +40,8 @@ REQUIRES = {
     "06": ["02_truth_dynamics.ipynb", "03_tracking_data.ipynb"],
     "07": ["02_truth_dynamics.ipynb", "03_tracking_data.ipynb", "06_first_od_solution.ipynb"],
     "08": ["02_truth_dynamics.ipynb", "03_tracking_data.ipynb"],
+    "10": ["02_truth_dynamics.ipynb", "03_tracking_data.ipynb", "06_first_od_solution.ipynb", "09_real_dsn_data.ipynb"],
+    "11": ["02_truth_dynamics.ipynb", "03_tracking_data.ipynb", "06_first_od_solution.ipynb", "09_real_dsn_data.ipynb"],
 }
 
 

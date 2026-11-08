@@ -76,6 +76,8 @@ Expected lengths after the merges: chapters 1–5 about 120–160 lines of code 
 
 ## The real-data chapters (proposed)
 
+> **Drafted (2026-11-07) as chapters 9–11, without merging chapters 0–8.** `09_real_dsn_data.ipynb` (Real data I), `10_real_data_fit.ipynb` (Real data II), `11_real_data_prediction.ipynb` (Real data III); shared code in `scenario.py` (`real_tracking`, `save_editing` / `load_editing`, `real_data_fit`). Decisions: the a priori is chapter 6's batch solution on June 7, 17:30 UTC, its covariance inflated by 1 km and 1 mm/s per axis (its line-of-sight σ was 0.35 m against a 96 m difference from OD044); one range bias per station, 5 m a priori at DSS-35 (where the transponder delay was calibrated) and 100 m at DSS-65 (offset unexplained). Results: DSS-65 bias +61.5 ± 5 m, line of sight 9 m below OD044, η_SRP 1.09 ± 0.17; held-out pass at +0.3 m (ranging) and +1.3 mHz (Doppler) against the prediction, inside a conservative σ; the PFOGM sweep cannot reject "no PFOGM" over three days. Not yet done from the outline below: `plot_prior_posterior` for the bias–line-of-sight pair (chapter 10 prints the correlations instead), the causal `lookback_s` products (a batch prediction after the last measurement is causal already), and the editing of the held-out pass inside chapter 11 (it reuses chapter 9's flags).
+
 Sources: the current chapter 9, the 2.0 notebook `advanced_RealMSR_OSIRIS_REx_OD` (sections 2–10), and the plot prototypes. Each chapter writes what the next one reads.
 
 ### 6. Real data I: from tracking files to residuals
@@ -129,10 +131,13 @@ Each is a notebook workaround today (rule 3):
 
 ## Open checks
 
-- 🟠 **CHECK: per-station ranging offsets.** With the station and transponder delays modelled, the June ranging residuals against OD044 average −64.9 RU (−9.2 m one-way) at DSS-35 and +366 RU (+51.7 m) at DSS-65, the same on both DSS-65 passes; the July DSS-35 passes (2.0 notebook) give −2.4 to −2.6 m. The transponder delay was calibrated on DSS-35, so a DSS-65 station-delay difference is the first suspect. Explain it before chapter 6 builds on it, or present it as the reason for per-station biases.
+- 🟠 **CHECK: per-station ranging offsets.** *(2026-11-07: chapters 9–11 model them with one bias per station; still unexplained.)* With the station and transponder delays modelled, the June ranging residuals against OD044 average −64.9 RU (−9.2 m one-way) at DSS-35 and +366 RU (+51.7 m) at DSS-65, the same on both DSS-65 passes; the July DSS-35 passes (2.0 notebook) give −2.4 to −2.6 m. The transponder delay was calibrated on DSS-35, so a DSS-65 station-delay difference is the first suspect. Explain it before chapter 6 builds on it, or present it as the reason for per-station biases.
 - 🟠 **CHECK: edited Doppler counts.** The Huber/MAD editor flags 28 and 33 of 189 and 206 Doppler points on the DSS-65 passes (19 of 217 at DSS-35). Look at them with `plot_editing` before deciding the weights.
 - 🟠 **CHECK: docs audience (added 2026-11-07).** `docs/.../user_guide/what_is_scb.rst` says "No prior OD experience is assumed for the tutorial series", which contradicts this plan's audience. Change the sentence when the series replaces the old notebooks.
-- **Fit feasibility.** The two fitted passes are 11 hours apart; the 2.0 notebook's two were 2 days apart. Probe that η_SRP and two PFOGM batches are not over-parametrized on this arc (if they are: fix η, or one PFOGM batch).
+- **Fit feasibility.** *(2026-11-07: fine. The two-pass SRIFB with η_SRP, 11 PFOGM batches and two biases converges in 2 iterations; η_SRP = 1.09 ± 0.17, PFOGM σ stay at 0.87–0.96 of their a priori.)* The two fitted passes are 11 hours apart; the 2.0 notebook's two were 2 days apart. Probe that η_SRP and two PFOGM batches are not over-parametrized on this arc (if they are: fix η, or one PFOGM batch).
+
+- 🟠 **CHECK: Doppler position partials (added 2026-11-07).** Chapter 9's finite-difference check: ranging partials agree to 2e-7, Doppler velocity partials to 2.5e-5, Doppler position partials only to 0.5%. Find out whether that is the finite-difference step or the analytical partials.
+- 🟠 **CHECK: early Doppler outliers (added 2026-11-07).** The first 15–24 Doppler points of every June pass are flagged (kHz to 10⁸ Hz off), although the ramp table covers them.
 
 ## Open questions
 
@@ -147,7 +152,7 @@ Each is a notebook workaround today (rule 3):
 |---|---|
 | Quickstart, 1–9 (current numbering) | drafts, ported to 2.0, execute without errors |
 | Merges (proposed 1, 3, 5) | proposed; the v3 prototype of chapter 5 exists |
-| Real-data chapters 6–8 | proposed; June loading checked |
+| Real-data chapters (drafted as 9–11) | first draft, executes in about 90 s with the outputs of chapters 6 and 9 |
 | Plot prototypes | `plotting_prototype.py`, `plotting_prototype_demo.ipynb` |
 | Fundamentals, catalogs, how-tos | planned |
 
